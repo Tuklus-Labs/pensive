@@ -7,7 +7,8 @@ Pensive builds a sparse entity graph from your documents using regex-based extra
 ## Install
 
 ```bash
-pip install pensive
+pip install pypensive            # Core SA engine (numpy + scipy only)
+pip install pypensive[full]      # + L2 semantic search, BM25, hybrid retrieval
 ```
 
 ## Quickstart
@@ -94,6 +95,49 @@ results = sa.query(
     context=["GPU", "training run"]  # Disambiguates toward GPU temp, not weather
 )
 ```
+
+## Hybrid Retrieval (`pypensive[full]`)
+
+SA is fast but misses semantic queries. L2 (sentence-transformers + FAISS) catches those but is slower and misses exact identifiers. Run both in parallel and boost results where they agree:
+
+```python
+from pensive import SpreadingActivation
+from pensive.l2 import L2Handler
+from pensive.parallel_hybrid import ParallelHybrid
+
+sa = SpreadingActivation()
+sa.build(documents)
+
+l2 = L2Handler()  # defaults to all-MiniLM-L6-v2
+l2.add_documents(documents)
+
+hybrid = ParallelHybrid(spreading_activation=sa, l2_handler=l2)
+results = hybrid.query("What was the P99 latency on 2025-07-16?")
+
+for r in results:
+    print(f"{r.doc_id}: {r.summary} (score={r.score:.1f}, source={r.source})")
+```
+
+### BM25 Sparse Search
+
+For keyword/identifier matching without embeddings:
+
+```python
+from pensive.hybrid_search import BM25Index
+
+idx = BM25Index()
+idx.add_documents(documents)
+results = idx.search("error 0x4F2A")  # Exact identifier matching
+```
+
+### What `[full]` adds
+
+| Component | Purpose | Dependency |
+|-----------|---------|------------|
+| L2Handler | Semantic vector search | sentence-transformers, faiss-cpu |
+| BM25Index | Sparse keyword matching | rank-bm25 |
+| ParallelHybrid | SA + L2 agreement boosting | (uses both above) |
+| Cross-encoder reranking | Optional reranker | sentence-transformers |
 
 ## Scale Characteristics
 
