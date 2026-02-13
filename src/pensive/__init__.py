@@ -18,7 +18,7 @@ from .spreading import SpreadingActivation, SpreadingConfig
 from .mega_extract import MegaExtractor
 from .patterns import REAL_DATA_PATTERNS, ALL_PATTERNS, build_pattern_set
 
-__version__ = "0.1.0"
+__version__ = "0.1.1"
 
 __all__ = [
     'SpreadingActivation',

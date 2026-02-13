@@ -1,0 +1,239 @@
+"""L2 embedding-based retrieval using sentence-transformers and FAISS.
+
+Provides semantic search that complements SA's entity-graph retrieval.
+SA catches exact entities (7/19 query types), L2 catches semantic meaning
+(the other 12/19). Together they hit 100%.
+
+Requires: pip install pypensive[full]
+"""
+import logging
+import time
+import threading
+import numpy as np
+from dataclasses import dataclass, field
+from typing import Dict, List, Any, Optional, Tuple
+
+logger = logging.getLogger(__name__)
+
+
+@dataclass
+class L2Config:
+    """Configuration for L2 retrieval."""
+    embedding_model: str = "all-MiniLM-L6-v2"
+    max_results: int = 10
+    batch_size: int = 256
+    normalize: bool = True
+    use_ivf: bool = False
+    ivf_nprobe: int = 10
+    ivf_train_threshold: int = 10_000
+
+
+@dataclass
+class L2Result:
+    """A result from L2 retrieval."""
+    document_id: str
+    content: str
+    score: float
+    rank: int = 0
+    metadata: Dict[str, Any] = field(default_factory=dict)
+
+
+class L2Handler:
+    """Lightweight L2 retrieval with FAISS and sentence-transformers.
+
+    Embeds documents using a sentence transformer model and indexes them
+    in FAISS for fast approximate nearest neighbor search.
+
+    Usage:
+        from pensive.l2 import L2Handler
+
+        l2 = L2Handler()
+        l2.add_documents([
+            {'id': 'doc1', 'content': 'The server latency was 42ms'},
+            {'id': 'doc2', 'content': 'GPU temperature reached 82C'},
+        ])
+        results = l2.query("What was the latency?")
+    """
+
+    def __init__(self, config: Optional[L2Config] = None):
+        self.config = config or L2Config()
+        self._lock = threading.RLock()
+
+        # Lazy imports for optional deps
+        try:
+            from sentence_transformers import SentenceTransformer
+            self._model = SentenceTransformer(self.config.embedding_model)
+            self._dim = self._model.get_sentence_embedding_dimension()
+            logger.info("Loaded embedding model: %s (dim=%d)",
+                        self.config.embedding_model, self._dim)
+        except ImportError:
+            raise ImportError(
+                "sentence-transformers is required for L2 retrieval. "
+                "Install with: pip install pypensive[full]"
+            )
+
+        try:
+            import faiss
+            self._faiss = faiss
+        except ImportError:
+            raise ImportError(
+                "faiss-cpu is required for L2 retrieval. "
+                "Install with: pip install pypensive[full]"
+            )
+
+        # FAISS index
+        self._index = self._faiss.IndexFlatIP(self._dim)
+        self._id_map = self._faiss.IndexIDMap2(self._index)
+
+        # Document storage
+        self._docs: Dict[int, Dict[str, Any]] = {}
+        self._doc_id_to_faiss_id: Dict[str, int] = {}
+        self._next_id: int = 0
+
+        # IVF state (for large corpora)
+        self._ivf_trained = False
+        self._buffer_embeddings: List[np.ndarray] = []
+        self._buffer_ids: List[int] = []
+
+    def _encode(self, texts: List[str]) -> np.ndarray:
+        """Encode texts to embeddings."""
+        embeddings = self._model.encode(texts, batch_size=self.config.batch_size,
+                                         show_progress_bar=False)
+        if self.config.normalize:
+            norms = np.linalg.norm(embeddings, axis=1, keepdims=True)
+            norms[norms == 0] = 1
+            embeddings = embeddings / norms
+        return embeddings.astype(np.float32)
+
+    def add_documents(self, documents: List[Dict[str, Any]],
+                      id_field: str = 'id',
+                      content_field: str = 'content') -> int:
+        """Add documents to the index.
+
+        Args:
+            documents: List of dicts with at minimum id and content fields.
+            id_field: Field name for document ID.
+            content_field: Field name for text content to embed.
+
+        Returns:
+            Number of documents added.
+        """
+        with self._lock:
+            new_docs = []
+            new_texts = []
+            new_ids = []
+
+            for doc in documents:
+                doc_id = str(doc.get(id_field, ''))
+                if doc_id in self._doc_id_to_faiss_id:
+                    continue
+
+                faiss_id = self._next_id
+                self._next_id += 1
+
+                self._doc_id_to_faiss_id[doc_id] = faiss_id
+                self._docs[faiss_id] = doc
+
+                new_texts.append(doc.get(content_field, ''))
+                new_ids.append(faiss_id)
+                new_docs.append(doc)
+
+            if not new_texts:
+                return 0
+
+            embeddings = self._encode(new_texts)
+            faiss_ids = np.array(new_ids, dtype=np.int64)
+
+            if self.config.use_ivf and not self._ivf_trained:
+                # Buffer until we have enough for IVF training
+                self._buffer_embeddings.append(embeddings)
+                self._buffer_ids.extend(new_ids)
+                total_buffered = sum(e.shape[0] for e in self._buffer_embeddings)
+
+                if total_buffered >= self.config.ivf_train_threshold:
+                    self._train_ivf()
+                else:
+                    return len(new_texts)
+
+            self._id_map.add_with_ids(embeddings, faiss_ids)
+            return len(new_texts)
+
+    def _train_ivf(self):
+        """Train IVF index from buffered embeddings."""
+        all_embeddings = np.vstack(self._buffer_embeddings)
+        all_ids = np.array(self._buffer_ids, dtype=np.int64)
+        n = all_embeddings.shape[0]
+
+        nlist = min(int(np.sqrt(n)), 256)
+        quantizer = self._faiss.IndexFlatIP(self._dim)
+        ivf_index = self._faiss.IndexIVFFlat(quantizer, self._dim, nlist,
+                                              self._faiss.METRIC_INNER_PRODUCT)
+        ivf_index.train(all_embeddings)
+        ivf_index.nprobe = self.config.ivf_nprobe
+
+        self._index = ivf_index
+        self._id_map = self._faiss.IndexIDMap2(ivf_index)
+        self._id_map.add_with_ids(all_embeddings, all_ids)
+
+        self._ivf_trained = True
+        self._buffer_embeddings = []
+        self._buffer_ids = []
+        logger.info("IVF index trained: %d vectors, %d centroids", n, nlist)
+
+    def query(self, query_text: str, top_k: Optional[int] = None) -> List[L2Result]:
+        """Search for documents similar to the query.
+
+        Args:
+            query_text: Natural language query.
+            top_k: Number of results to return.
+
+        Returns:
+            List of L2Result ordered by similarity score.
+        """
+        top_k = top_k or self.config.max_results
+
+        with self._lock:
+            if self._id_map.ntotal == 0:
+                return []
+
+            query_emb = self._encode([query_text])
+            k = min(top_k, self._id_map.ntotal)
+            scores, ids = self._id_map.search(query_emb, k)
+
+            results = []
+            for rank, (score, faiss_id) in enumerate(zip(scores[0], ids[0])):
+                if faiss_id == -1:
+                    continue
+                doc = self._docs.get(int(faiss_id), {})
+                results.append(L2Result(
+                    document_id=str(doc.get('id', doc.get('hash', faiss_id))),
+                    content=doc.get('content', doc.get('summary', '')),
+                    score=float(score),
+                    rank=rank,
+                    metadata=doc,
+                ))
+
+            return results
+
+    def _query_sync(self, query_text: str, top_k: Optional[int] = None) -> List[L2Result]:
+        """Sync query interface for ParallelHybrid compatibility."""
+        return self.query(query_text, top_k)
+
+    @property
+    def size(self) -> int:
+        """Number of indexed documents."""
+        buffered = len(self._buffer_ids)
+        indexed = self._id_map.ntotal if self._id_map else 0
+        return buffered + indexed
+
+    def clear(self):
+        """Clear all indexed documents."""
+        with self._lock:
+            self._index = self._faiss.IndexFlatIP(self._dim)
+            self._id_map = self._faiss.IndexIDMap2(self._index)
+            self._docs.clear()
+            self._doc_id_to_faiss_id.clear()
+            self._next_id = 0
+            self._ivf_trained = False
+            self._buffer_embeddings = []
+            self._buffer_ids = []
