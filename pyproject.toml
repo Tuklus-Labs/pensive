@@ -1,0 +1,21 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "pensive"
+version = "0.1.0"
+description = "Spreading activation retrieval for document collections"
+readme = "README.md"
+license = "MIT"
+requires-python = ">=3.10"
+dependencies = ["numpy", "scipy"]
+
+[project.optional-dependencies]
+dev = ["pytest"]
+
+[project.scripts]
+pensive = "pensive.ingestion.cli:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/pensive"]
