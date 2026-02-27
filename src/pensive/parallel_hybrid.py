@@ -1,7 +1,12 @@
-"""Parallel hybrid retrieval.
+"""Hybrid retrieval across L1 spreading activation and L2 semantic search.
 
-Fire SA and L2 in parallel, agreement boosting where both find the same
-document. Optional cross-encoder reranking and adaptive pattern learning.
+Default mode is two-stage:
+1) L1 spreading activation candidate generation
+2) L2 FAISS rerank on those L1 hits
+
+A legacy mode keeps SA and global L2 fully parallel.
+Agreement boosting promotes results found by both.
+Optional cross-encoder reranking and adaptive pattern learning are supported.
 
 Usage:
     from pensive import SpreadingActivation
@@ -49,10 +54,10 @@ class HybridResult:
 
 
 class ParallelHybrid:
-    """Parallel SA + L2 with agreement boosting.
+    """SA + L2 with agreement boosting.
 
-    The insight: if both SA (graph-based) and L2 (semantic)
-    find the same document, it's probably the right answer.
+    Default mode: L2 runs on SA-selected candidates.
+    Optional legacy mode runs SA and global L2 in parallel.
     """
 
     def __init__(
@@ -61,11 +66,15 @@ class ParallelHybrid:
         l2_handler=None,
         use_cross_encoder: bool = False,
         cross_encoder_model: str = 'cross-encoder/ms-marco-MiniLM-L-6-v2',
+        l2_on_sa_hits: bool = True,
+        l2_fallback_global: bool = True,
         enable_pattern_learning: bool = True,
         pattern_learner: Optional[PatternLearner] = None,
     ):
         self.sa = spreading_activation
         self.l2 = l2_handler
+        self.l2_on_sa_hits = l2_on_sa_hits
+        self.l2_fallback_global = l2_fallback_global
         self._executor = ThreadPoolExecutor(max_workers=4)
 
         self.cross_encoder = None
@@ -102,16 +111,33 @@ class ParallelHybrid:
         """
         t0 = time.perf_counter()
 
-        # Fire both in parallel
-        sa_future = self._executor.submit(self._query_sa, query, sa_top_k, context)
-        l2_future = self._executor.submit(self._query_l2, query, l2_top_k)
+        if self.l2_on_sa_hits:
+            # L2 runs on L1 candidates first. This is the default production path.
+            sa_results = self._query_sa(query, sa_top_k, context)
+            candidate_ids = [r['doc_id'] for r in sa_results]
+            l2_results = self._query_l2_on_candidates(query, candidate_ids, l2_top_k)
 
-        sa_results = sa_future.result()
-        l2_results = l2_future.result()
+            if not l2_results and self.l2_fallback_global:
+                l2_results = self._query_l2(query, l2_top_k)
 
-        parallel_ms = (time.perf_counter() - t0) * 1000
-        logger.info("Parallel: SA=%d, L2=%d in %.0fms",
-                     len(sa_results), len(l2_results), parallel_ms)
+            stage_ms = (time.perf_counter() - t0) * 1000
+            logger.info(
+                "Two-stage: SA=%d, L2=%d in %.0fms",
+                len(sa_results), len(l2_results), stage_ms,
+            )
+        else:
+            # Legacy mode: fire SA and global L2 in parallel.
+            sa_future = self._executor.submit(self._query_sa, query, sa_top_k, context)
+            l2_future = self._executor.submit(self._query_l2, query, l2_top_k)
+
+            sa_results = sa_future.result()
+            l2_results = l2_future.result()
+
+            parallel_ms = (time.perf_counter() - t0) * 1000
+            logger.info(
+                "Parallel: SA=%d, L2=%d in %.0fms",
+                len(sa_results), len(l2_results), parallel_ms,
+            )
 
         # Build lookup tables
         sa_by_id = {r['doc_id']: r for r in sa_results}
@@ -226,19 +252,42 @@ class ParallelHybrid:
             else:
                 results = self.l2.query(query, top_k=top_k)
 
-            return [
-                {
-                    'doc_id': r.document_id if hasattr(r, 'document_id') else r.get('document_id', ''),
-                    'content': r.content if hasattr(r, 'content') else r.get('content', ''),
-                    'summary': (r.content if hasattr(r, 'content') else r.get('content', ''))[:500],
-                    'l2_score': r.score if hasattr(r, 'score') else r.get('score', 0),
-                    'rank': i,
-                }
-                for i, r in enumerate(results)
-            ]
+            return self._normalize_l2_results(results)
         except Exception as e:
             logger.warning("L2 query failed: %s", e)
             return []
+
+    def _query_l2_on_candidates(
+        self, query: str, candidate_doc_ids: List[str], top_k: int
+    ) -> List[Dict[str, Any]]:
+        """Query L2 over L1-selected candidates."""
+        if not self.l2 or not candidate_doc_ids:
+            return []
+
+        try:
+            if hasattr(self.l2, 'query_candidates'):
+                results = self.l2.query_candidates(query, candidate_doc_ids, top_k=top_k)
+            else:
+                # Compatibility fallback for older L2 handlers.
+                results = self.l2.query(query, top_k=top_k)
+            return self._normalize_l2_results(results)
+        except Exception as e:
+            logger.warning("Candidate L2 query failed: %s", e)
+            return []
+
+    @staticmethod
+    def _normalize_l2_results(results: List[Any]) -> List[Dict[str, Any]]:
+        """Normalize L2 result objects/dicts to the hybrid schema."""
+        return [
+            {
+                'doc_id': r.document_id if hasattr(r, 'document_id') else r.get('document_id', ''),
+                'content': r.content if hasattr(r, 'content') else r.get('content', ''),
+                'summary': (r.content if hasattr(r, 'content') else r.get('content', ''))[:500],
+                'l2_score': r.score if hasattr(r, 'score') else r.get('score', 0),
+                'rank': i,
+            }
+            for i, r in enumerate(results)
+        ]
 
     def _rerank_with_cross_encoder(
         self, query: str, candidates: List[Dict[str, Any]]

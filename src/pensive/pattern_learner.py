@@ -239,18 +239,28 @@ def integrate_with_sa(sa, learner: PatternLearner):
 
         logger.info(f"Building index for learned term: '{term}'")
         matches = []
-        for node in sa.graph.nodes():
-            node_data = sa.graph.nodes[node]
-            if node_data.get('type') == 'value':
-                label = node_data.get('label', '').lower()
+        if hasattr(sa, '_idx_to_node') and hasattr(sa, '_node_type'):
+            # Sparse graph implementation.
+            for idx, node_id in enumerate(sa._idx_to_node):
+                if sa._node_type[idx] != 1:
+                    continue
+                label = sa._node_label[idx].lower()
                 if term in label:
-                    matches.append(node)
+                    matches.append(node_id)
+        elif hasattr(sa, 'graph'):
+            # Legacy networkx implementation.
+            for node in sa.graph.nodes():
+                node_data = sa.graph.nodes[node]
+                if node_data.get('type') == 'value':
+                    label = node_data.get('label', '').lower()
+                    if term in label:
+                        matches.append(node)
 
         _learned_term_index[term] = matches
         logger.info(f"Indexed '{term}': {len(matches)} matching documents")
         return matches
 
-    def patched_seed(words: List[str]) -> Dict[str, float]:
+    def patched_seed(words: List[str]) -> Dict[int, float]:
         # Clear direct seeds from previous query
         _direct_value_seeds.clear()
 
@@ -286,7 +296,13 @@ def integrate_with_sa(sa, learner: PatternLearner):
                                          key=lambda x: -x[1]):
                 doc_id = node_id[2:] if node_id.startswith('v:') else node_id
                 if doc_id not in result_ids:
-                    label = sa.graph.nodes[node_id].get('label', '')
+                    if hasattr(sa, '_node_to_idx') and hasattr(sa, '_node_label'):
+                        idx = sa._node_to_idx.get(node_id)
+                        if idx is None:
+                            continue
+                        label = sa._node_label[idx]
+                    else:
+                        label = sa.graph.nodes[node_id].get('label', '')
                     additional.append((doc_id, label, score))
 
             if additional:

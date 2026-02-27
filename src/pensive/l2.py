@@ -7,11 +7,10 @@ SA catches exact entities (7/19 query types), L2 catches semantic meaning
 Requires: pip install pypensive[full]
 """
 import logging
-import time
 import threading
 import numpy as np
 from dataclasses import dataclass, field
-from typing import Dict, List, Any, Optional, Tuple
+from typing import Dict, List, Any, Optional
 
 logger = logging.getLogger(__name__)
 
@@ -88,6 +87,7 @@ class L2Handler:
         # Document storage
         self._docs: Dict[int, Dict[str, Any]] = {}
         self._doc_id_to_faiss_id: Dict[str, int] = {}
+        self._embeddings: Dict[int, np.ndarray] = {}
         self._next_id: int = 0
 
         # IVF state (for large corpora)
@@ -119,7 +119,6 @@ class L2Handler:
             Number of documents added.
         """
         with self._lock:
-            new_docs = []
             new_texts = []
             new_ids = []
 
@@ -136,12 +135,13 @@ class L2Handler:
 
                 new_texts.append(doc.get(content_field, ''))
                 new_ids.append(faiss_id)
-                new_docs.append(doc)
 
             if not new_texts:
                 return 0
 
             embeddings = self._encode(new_texts)
+            for faiss_id, emb in zip(new_ids, embeddings):
+                self._embeddings[faiss_id] = emb
             faiss_ids = np.array(new_ids, dtype=np.int64)
 
             if self.config.use_ivf and not self._ivf_trained:
@@ -193,27 +193,86 @@ class L2Handler:
         top_k = top_k or self.config.max_results
 
         with self._lock:
-            if self._id_map.ntotal == 0:
+            if self._id_map.ntotal == 0 and not self._buffer_embeddings:
                 return []
 
             query_emb = self._encode([query_text])
+            if self._id_map.ntotal == 0 and self._buffer_embeddings:
+                # IVF warmup mode: query buffered vectors before training threshold.
+                all_embeddings = np.vstack(self._buffer_embeddings)
+                scores = all_embeddings @ query_emb[0]
+                k = min(top_k, scores.shape[0])
+                top_indices = np.argsort(scores)[::-1][:k]
+                ids = [self._buffer_ids[i] for i in top_indices]
+                return self._results_from_ids(ids, scores[top_indices])
+
             k = min(top_k, self._id_map.ntotal)
             scores, ids = self._id_map.search(query_emb, k)
+            return self._results_from_ids(ids[0], scores[0])
 
-            results = []
-            for rank, (score, faiss_id) in enumerate(zip(scores[0], ids[0])):
-                if faiss_id == -1:
+    def query_candidates(
+        self,
+        query_text: str,
+        candidate_doc_ids: List[str],
+        top_k: Optional[int] = None,
+    ) -> List[L2Result]:
+        """Run FAISS search over a candidate subset (typically L1 hits)."""
+        top_k = top_k or self.config.max_results
+        if not candidate_doc_ids:
+            return []
+
+        with self._lock:
+            unique_doc_ids = list(dict.fromkeys(str(doc_id) for doc_id in candidate_doc_ids))
+            faiss_ids = []
+            embs = []
+
+            for doc_id in unique_doc_ids:
+                faiss_id = self._doc_id_to_faiss_id.get(doc_id)
+                if faiss_id is None:
                     continue
-                doc = self._docs.get(int(faiss_id), {})
-                results.append(L2Result(
-                    document_id=str(doc.get('id', doc.get('hash', faiss_id))),
-                    content=doc.get('content', doc.get('summary', '')),
-                    score=float(score),
-                    rank=rank,
-                    metadata=doc,
-                ))
 
-            return results
+                emb = self._embeddings.get(faiss_id)
+                if emb is None:
+                    doc = self._docs.get(faiss_id, {})
+                    content = doc.get('content', doc.get('summary', ''))
+                    if not content:
+                        continue
+                    emb = self._encode([content])[0]
+                    self._embeddings[faiss_id] = emb
+
+                faiss_ids.append(faiss_id)
+                embs.append(emb)
+
+            if not faiss_ids:
+                return []
+
+            query_emb = self._encode([query_text])
+            local = self._faiss.IndexFlatIP(self._dim)
+            local_id_map = self._faiss.IndexIDMap2(local)
+            local_id_map.add_with_ids(
+                np.vstack(embs).astype(np.float32),
+                np.array(faiss_ids, dtype=np.int64),
+            )
+
+            k = min(top_k, len(faiss_ids))
+            scores, ids = local_id_map.search(query_emb, k)
+            return self._results_from_ids(ids[0], scores[0])
+
+    def _results_from_ids(self, ids, scores) -> List[L2Result]:
+        """Convert FAISS IDs and scores to typed result objects."""
+        results = []
+        for rank, (score, faiss_id) in enumerate(zip(scores, ids)):
+            if int(faiss_id) == -1:
+                continue
+            doc = self._docs.get(int(faiss_id), {})
+            results.append(L2Result(
+                document_id=str(doc.get('id', doc.get('hash', faiss_id))),
+                content=doc.get('content', doc.get('summary', '')),
+                score=float(score),
+                rank=rank,
+                metadata=doc,
+            ))
+        return results
 
     def _query_sync(self, query_text: str, top_k: Optional[int] = None) -> List[L2Result]:
         """Sync query interface for ParallelHybrid compatibility."""
@@ -233,6 +292,7 @@ class L2Handler:
             self._id_map = self._faiss.IndexIDMap2(self._index)
             self._docs.clear()
             self._doc_id_to_faiss_id.clear()
+            self._embeddings.clear()
             self._next_id = 0
             self._ivf_trained = False
             self._buffer_embeddings = []

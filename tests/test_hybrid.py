@@ -1,17 +1,19 @@
 """Tests for hybrid retrieval stack (requires pypensive[full])."""
+import importlib.util
 import pytest
 
-# Skip all tests if full deps not available
-try:
-    from pensive.l2 import L2Handler, L2Config, L2Result
-    from pensive.hybrid_search import (
-        BM25Index, HybridSearcher, SearchResult,
-        reciprocal_rank_fusion, extract_identifiers, boost_identifier_matches,
-    )
-    from pensive.parallel_hybrid import ParallelHybrid, HybridResult
-    FULL_AVAILABLE = True
-except ImportError:
-    FULL_AVAILABLE = False
+# Skip all tests if optional runtime deps are unavailable
+FULL_AVAILABLE = all(
+    importlib.util.find_spec(mod) is not None
+    for mod in ("sentence_transformers", "faiss", "rank_bm25")
+)
+
+from pensive.l2 import L2Handler, L2Config, L2Result
+from pensive.hybrid_search import (
+    BM25Index, HybridSearcher, SearchResult,
+    reciprocal_rank_fusion, extract_identifiers, boost_identifier_matches,
+)
+from pensive.parallel_hybrid import ParallelHybrid, HybridResult
 
 pytestmark = pytest.mark.skipif(not FULL_AVAILABLE, reason="pypensive[full] not installed")
 

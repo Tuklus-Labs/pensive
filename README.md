@@ -98,7 +98,11 @@ results = sa.query(
 
 ## Hybrid Retrieval (`pypensive[full]`)
 
-SA is fast but misses semantic queries. L2 (sentence-transformers + FAISS) catches those but is slower and misses exact identifiers. Run both in parallel and boost results where they agree:
+Default flow is two-stage retrieval:
+1. L1 SA generates fast candidate IDs.
+2. L2 FAISS reranks those L1 hits semantically.
+
+If L1 returns nothing, hybrid can fall back to global L2 search.
 
 ```python
 from pensive import SpreadingActivation
@@ -111,7 +115,12 @@ sa.build(documents)
 l2 = L2Handler()  # defaults to all-MiniLM-L6-v2
 l2.add_documents(documents)
 
-hybrid = ParallelHybrid(spreading_activation=sa, l2_handler=l2)
+hybrid = ParallelHybrid(
+    spreading_activation=sa,
+    l2_handler=l2,
+    l2_on_sa_hits=True,       # default
+    l2_fallback_global=True,  # default
+)
 results = hybrid.query("What was the P99 latency on 2025-07-16?")
 
 for r in results:

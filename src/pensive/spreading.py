@@ -13,7 +13,7 @@ Usage:
 """
 from collections import defaultdict
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, Iterable, List, Optional, Tuple
 
 from .mega_extract import MegaExtractor
 from .patterns import REAL_DATA_PATTERNS, SYNTHETIC_PATTERNS
@@ -117,11 +117,15 @@ class SpreadingActivation:
         self._edge_src: List[int] = []
         self._edge_dst: List[int] = []
         self._edge_weight: List[float] = []
+        self._entity_edge_positions: Dict[int, List[int]] = defaultdict(list)
         self._adj: Optional[scipy.sparse.csr_matrix] = None
         self._dirty = True
 
         self.entity_freq: Dict[str, int] = defaultdict(int)
         self._entity_index: Dict[str, List[str]] = defaultdict(list)
+        self._exact_entities = set()
+        self._entity_terms: List[str] = []
+        self._substr_match_cache: Dict[str, List[str]] = {}
         self._built = False
         self._context_provider = None
         self._extractor = MegaExtractor(self.patterns)
@@ -143,9 +147,12 @@ class SpreadingActivation:
 
     def _add_edge(self, src_idx: int, dst_idx: int, weight: float) -> None:
         """Add an edge (COO format). Marks graph as dirty."""
+        pos = len(self._edge_src)
         self._edge_src.append(src_idx)
         self._edge_dst.append(dst_idx)
         self._edge_weight.append(weight)
+        if self._node_type[src_idx] == _ENTITY_TYPE:
+            self._entity_edge_positions[src_idx].append(pos)
         self._dirty = True
 
     def _compile(self) -> None:
@@ -163,6 +170,101 @@ class SpreadingActivation:
                 shape=(n, n),
             )
         self._dirty = False
+
+    def _reset_graph_state(self) -> None:
+        """Reset graph state before a full rebuild."""
+        self._node_to_idx = {}
+        self._idx_to_node = []
+        self._node_type = []
+        self._node_label = []
+        self._node_specificity = []
+        self._edge_src = []
+        self._edge_dst = []
+        self._edge_weight = []
+        self._entity_edge_positions = defaultdict(list)
+        self._adj = None
+        self._dirty = True
+        self.entity_freq = defaultdict(int)
+        self._entity_index = defaultdict(list)
+        self._exact_entities = set()
+        self._entity_terms = []
+        self._substr_match_cache = {}
+
+    def _index_entity_node(self, entity: str, node_id: str) -> None:
+        """Index a new entity node for exact, partial, and substring seeding."""
+        self._entity_index[entity].append(node_id)
+
+        if entity not in self._exact_entities:
+            self._exact_entities.add(entity)
+            self._entity_terms.append(entity)
+            self._substr_match_cache.clear()
+
+        for word in entity.split():
+            if word != entity and word not in _STOPWORDS:
+                self._entity_index[word].append(node_id)
+
+    def _refresh_specificity_for_entities(self, entities: Iterable[str]) -> None:
+        """Recompute specificity and edge weights for entities whose freq changed."""
+        touched = set(entities)
+        if not touched:
+            return
+
+        for entity in touched:
+            freq = self.entity_freq.get(entity, 0)
+            if freq <= 0:
+                continue
+            specificity = 1.0 / (freq ** self.config.spec_power)
+            weight = specificity * self.config.edge_weight
+
+            for node_id in self._entity_index.get(entity, []):
+                idx = self._node_to_idx.get(node_id)
+                if idx is None or self._node_type[idx] != _ENTITY_TYPE:
+                    continue
+                self._node_specificity[idx] = specificity
+                for edge_pos in self._entity_edge_positions.get(idx, []):
+                    self._edge_weight[edge_pos] = weight
+
+        # If we touched existing edges, the CSR matrix must be rebuilt.
+        self._dirty = True
+
+    def _ensure_mutable_edges(self) -> None:
+        """Materialize COO edge lists from CSR if this graph was loaded from disk."""
+        if self._edge_src:
+            return
+        if self._adj is None or self._adj.nnz == 0:
+            return
+        if self._dirty:
+            return
+
+        coo = self._adj.tocoo(copy=True)
+        self._edge_src = coo.row.astype(np.int32).tolist()
+        self._edge_dst = coo.col.astype(np.int32).tolist()
+        self._edge_weight = coo.data.astype(np.float32).tolist()
+        self._entity_edge_positions = defaultdict(list)
+
+        for pos, src_idx in enumerate(self._edge_src):
+            if self._node_type[src_idx] == _ENTITY_TYPE:
+                self._entity_edge_positions[src_idx].append(pos)
+
+    def _substring_seed_nodes(self, word: str) -> List[str]:
+        """Return entity node IDs whose exact labels contain the query term."""
+        cached = self._substr_match_cache.get(word)
+        if cached is not None:
+            return cached
+
+        matches = []
+        seen = set()
+        for entity in self._entity_terms:
+            if word == entity or word not in entity:
+                continue
+            for node_id in self._entity_index.get(entity, []):
+                if node_id in seen:
+                    continue
+                seen.add(node_id)
+                matches.append(node_id)
+
+        self._substr_match_cache[word] = matches
+        return matches
 
     def set_context_provider(self, provider):
         """Set a callable that provides context entities for each query.
@@ -185,18 +287,7 @@ class SpreadingActivation:
         - 'value': str - The answer/value to retrieve
         - 'query': str (optional) - Query text to include in entity extraction
         """
-        self._node_to_idx = {}
-        self._idx_to_node = []
-        self._node_type = []
-        self._node_label = []
-        self._node_specificity = []
-        self._edge_src = []
-        self._edge_dst = []
-        self._edge_weight = []
-        self._adj = None
-        self._dirty = True
-        self.entity_freq = defaultdict(int)
-        self._entity_index = defaultdict(list)
+        self._reset_graph_state()
 
         # Single extraction pass
         extracted = []
@@ -233,10 +324,7 @@ class SpreadingActivation:
                 )
 
                 if is_new:
-                    self._entity_index[entity].append(node_id)
-                    for word in entity.split():
-                        if word != entity and word not in _STOPWORDS:
-                            self._entity_index[word].append(node_id)
+                    self._index_entity_node(entity, node_id)
 
                 self._add_edge(
                     ent_idx, ans_idx,
@@ -248,48 +336,68 @@ class SpreadingActivation:
 
     def add_document(self, doc: Dict) -> None:
         """Incrementally add a single document to the graph."""
-        text = doc['content']
-        if 'query' in doc:
-            text = f"{text} {doc['query']}"
-
-        doc_entities = {}
-        for entity, etype in self._extractor.extract(text):
-            if len(entity) < 2:
-                continue
-            self.entity_freq[entity] += 1
-            node_id = f"e:{etype}:{entity}"
-            doc_entities[node_id] = (entity, etype)
-
-        answer_node = f"v:{doc['id']}"
-        ans_idx = self._get_or_add_node(
-            answer_node, _VALUE_TYPE, doc['value'], 0.0
-        )
-
-        for node_id, (entity, etype) in doc_entities.items():
-            specificity = 1.0 / (self.entity_freq[entity] ** self.config.spec_power)
-
-            is_new = node_id not in self._node_to_idx
-            ent_idx = self._get_or_add_node(
-                node_id, _ENTITY_TYPE, entity, specificity
-            )
-
-            if is_new:
-                self._entity_index[entity].append(node_id)
-                for word in entity.split():
-                    if word != entity and word not in _STOPWORDS:
-                        self._entity_index[word].append(node_id)
-
-            self._add_edge(
-                ent_idx, ans_idx,
-                specificity * self.config.edge_weight
-            )
-
-        self._built = True
+        self.add_documents([doc])
 
     def add_documents(self, documents: List[Dict]) -> None:
-        """Incrementally add multiple documents to the graph."""
+        """Incrementally add multiple documents to the graph.
+
+        Uses a two-pass update to keep specificity weights stable:
+        1) count all entity-frequency deltas in the incoming batch
+        2) update existing entity weights once
+        3) add batch edges with post-update specificity
+        """
+        if not documents:
+            return
+
+        self._ensure_mutable_edges()
+
+        extracted = []
+        batch_counts: Dict[str, int] = defaultdict(int)
         for doc in documents:
-            self.add_document(doc)
+            text = doc['content']
+            if 'query' in doc:
+                text = f"{text} {doc['query']}"
+            entities = self._extractor.extract(text)
+            extracted.append((doc, entities))
+            for entity, _ in entities:
+                if len(entity) >= 2:
+                    batch_counts[entity] += 1
+
+        for entity, count in batch_counts.items():
+            self.entity_freq[entity] += count
+
+        # Keep old edges consistent with the updated frequencies.
+        self._refresh_specificity_for_entities(batch_counts.keys())
+
+        for doc, entities in extracted:
+            answer_node = f"v:{doc['id']}"
+            ans_idx = self._get_or_add_node(
+                answer_node, _VALUE_TYPE, doc['value'], 0.0
+            )
+
+            doc_entities = {}
+            for entity, etype in entities:
+                if len(entity) < 2:
+                    continue
+                node_id = f"e:{etype}:{entity}"
+                specificity = 1.0 / (self.entity_freq[entity] ** self.config.spec_power)
+                doc_entities[node_id] = (entity, etype, specificity)
+
+            for node_id, (entity, etype, specificity) in doc_entities.items():
+                is_new = node_id not in self._node_to_idx
+                ent_idx = self._get_or_add_node(
+                    node_id, _ENTITY_TYPE, entity, specificity
+                )
+
+                if is_new:
+                    self._index_entity_node(entity, node_id)
+
+                self._add_edge(
+                    ent_idx, ans_idx,
+                    specificity * self.config.edge_weight
+                )
+
+        self._built = True
 
     def build_parallel(self, documents: List[Dict],
                        workers: Optional[int] = None) -> 'SpreadingActivation':
@@ -312,18 +420,7 @@ class SpreadingActivation:
             return self.build(documents)
 
         # Reset
-        self._node_to_idx = {}
-        self._idx_to_node = []
-        self._node_type = []
-        self._node_label = []
-        self._node_specificity = []
-        self._edge_src = []
-        self._edge_dst = []
-        self._edge_weight = []
-        self._adj = None
-        self._dirty = True
-        self.entity_freq = defaultdict(int)
-        self._entity_index = defaultdict(list)
+        self._reset_graph_state()
 
         # Chunk documents for workers
         chunk_size = max(1000, len(documents) // workers)
@@ -363,10 +460,7 @@ class SpreadingActivation:
                 )
 
                 if is_new:
-                    self._entity_index[entity].append(node_id)
-                    for word in entity.split():
-                        if word != entity and word not in _STOPWORDS:
-                            self._entity_index[word].append(node_id)
+                    self._index_entity_node(entity, node_id)
 
                 self._add_edge(
                     ent_idx, ans_idx,
@@ -379,9 +473,9 @@ class SpreadingActivation:
     def _seed_from_words(self, words: List[str]) -> Dict[int, float]:
         """Seed activation from a list of lowercase words."""
         activations: Dict[int, float] = {}
-        do_substr = len(self._entity_index) <= 10_000
+        do_substr = len(self._entity_terms) <= 10_000
 
-        for word in words:
+        for word in dict.fromkeys(words):
             if word in _STOPWORDS:
                 continue
             for node_id in self._entity_index.get(word, []):
@@ -402,18 +496,17 @@ class SpreadingActivation:
                     )
 
             if do_substr and len(word) >= 4:
-                for label, node_ids in self._entity_index.items():
-                    if word != label and word in label:
-                        for node_id in node_ids:
-                            idx = self._node_to_idx.get(node_id)
-                            if idx is None:
-                                continue
-                            if idx not in activations:
-                                spec = self._node_specificity[idx]
-                                activations[idx] = max(
-                                    activations.get(idx, 0),
-                                    self.config.substr_boost * spec
-                                )
+                for node_id in self._substring_seed_nodes(word):
+                    idx = self._node_to_idx.get(node_id)
+                    if idx is None:
+                        continue
+                    if idx in activations:
+                        continue
+                    spec = self._node_specificity[idx]
+                    activations[idx] = max(
+                        activations.get(idx, 0),
+                        self.config.substr_boost * spec
+                    )
         return activations
 
     def _spread(self, activations: Dict[int, float],
@@ -630,10 +723,14 @@ class SpreadingActivation:
         sa._edge_src = []
         sa._edge_dst = []
         sa._edge_weight = []
+        sa._entity_edge_positions = defaultdict(list)
         sa._dirty = False
 
         sa.entity_freq = defaultdict(int, data.get('entity_freq', {}))
         sa._entity_index = defaultdict(list, data.get('entity_index', {}))
+        sa._exact_entities = set(sa.entity_freq.keys())
+        sa._entity_terms = list(sa._exact_entities)
+        sa._substr_match_cache = {}
         sa._built = True
         return sa
 
@@ -658,14 +755,14 @@ class SpreadingActivation:
             src_idx = sa._node_to_idx[src]
             dst_idx = sa._node_to_idx[dst]
             weight = ed.get('weight', 1.0)
-            sa._edge_src.append(src_idx)
-            sa._edge_dst.append(dst_idx)
-            sa._edge_weight.append(weight)
+            sa._add_edge(src_idx, dst_idx, weight)
 
-        sa._dirty = True
         sa._compile()
 
         sa.entity_freq = defaultdict(int, data.get('entity_freq', {}))
         sa._entity_index = defaultdict(list, data.get('entity_index', {}))
+        sa._exact_entities = set(sa.entity_freq.keys())
+        sa._entity_terms = list(sa._exact_entities)
+        sa._substr_match_cache = {}
         sa._built = True
         return sa
