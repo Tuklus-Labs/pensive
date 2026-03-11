@@ -71,6 +71,29 @@ class MegaExtractor:
                         break
         return results
 
+    def extract_with_spans(self, text: str) -> List[Tuple[int, int, str, str]]:
+        """Extract entities with character-level span positions.
+
+        Returns:
+            List of (start_char, end_char, entity_lowercase, entity_type) tuples,
+            sorted by start position. Includes all occurrences of each entity.
+        """
+        results = []
+        for regex, etype_map in ((self._ci_regex, self._ci_etype_map),
+                                  (self._cs_regex, self._cs_etype_map)):
+            if regex is None:
+                continue
+            for m in regex.finditer(text):
+                groups = m.groups()
+                for i, g in enumerate(groups):
+                    if g is not None:
+                        start = m.start(i + 1)
+                        end = m.end(i + 1)
+                        results.append((start, end, g.lower(), etype_map[i]))
+                        break
+        results.sort(key=lambda r: r[0])
+        return results
+
 
 def _build_mega(
     patterns: List[Tuple[str, str]],
