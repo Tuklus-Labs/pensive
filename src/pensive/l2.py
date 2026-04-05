@@ -202,7 +202,11 @@ class L2Handler:
                 all_embeddings = np.vstack(self._buffer_embeddings)
                 scores = all_embeddings @ query_emb[0]
                 k = min(top_k, scores.shape[0])
-                top_indices = np.argsort(scores)[::-1][:k]
+                if k >= len(scores):
+                    top_indices = np.argsort(scores)[::-1]
+                else:
+                    top_indices = np.argpartition(scores, -k)[-k:]
+                    top_indices = top_indices[np.argsort(scores[top_indices])[::-1]]
                 ids = [self._buffer_ids[i] for i in top_indices]
                 return self._results_from_ids(ids, scores[top_indices])
 
