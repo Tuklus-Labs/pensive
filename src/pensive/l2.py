@@ -87,7 +87,8 @@ class L2Handler:
         # Document storage
         self._docs: Dict[int, Dict[str, Any]] = {}
         self._doc_id_to_faiss_id: Dict[str, int] = {}
-        self._embeddings: Dict[int, np.ndarray] = {}
+        self._emb_array: np.ndarray = np.empty((0, self._dim), dtype=np.float32)
+        self._emb_capacity: int = 0
         self._next_id: int = 0
 
         # IVF state (for large corpora)
@@ -108,6 +109,25 @@ class L2Handler:
         self._query_cache_text = text
         self._query_cache_emb = emb
         return emb
+
+    def _store_embeddings(self, ids: List[int], embeddings: np.ndarray):
+        """Store embeddings in the contiguous array, growing as needed."""
+        max_id = max(ids) + 1
+        if max_id > self._emb_capacity:
+            new_cap = max(max_id, self._emb_capacity * 2, 256)
+            new_arr = np.empty((new_cap, self._dim), dtype=np.float32)
+            if self._emb_array.shape[0] > 0:
+                new_arr[:self._emb_array.shape[0]] = self._emb_array
+            self._emb_array = new_arr
+            self._emb_capacity = new_cap
+        for i, fid in enumerate(ids):
+            self._emb_array[fid] = embeddings[i]
+
+    def _get_embedding(self, faiss_id: int) -> Optional[np.ndarray]:
+        """Get an embedding by faiss ID, or None if not stored."""
+        if faiss_id < self._emb_array.shape[0]:
+            return self._emb_array[faiss_id]
+        return None
 
     def _encode(self, texts: List[str]) -> np.ndarray:
         """Encode texts to embeddings."""
@@ -154,8 +174,7 @@ class L2Handler:
                 return 0
 
             embeddings = self._encode(new_texts)
-            for faiss_id, emb in zip(new_ids, embeddings):
-                self._embeddings[faiss_id] = emb
+            self._store_embeddings(new_ids, embeddings)
             faiss_ids = np.array(new_ids, dtype=np.int64)
 
             if self.config.use_ivf and not self._ivf_trained:
@@ -247,24 +266,22 @@ class L2Handler:
         with self._lock:
             unique_doc_ids = list(dict.fromkeys(str(doc_id) for doc_id in candidate_doc_ids))
             faiss_ids = []
-            embs = []
 
             for doc_id in unique_doc_ids:
                 faiss_id = self._doc_id_to_faiss_id.get(doc_id)
                 if faiss_id is None:
                     continue
 
-                emb = self._embeddings.get(faiss_id)
+                emb = self._get_embedding(faiss_id)
                 if emb is None:
                     doc = self._docs.get(faiss_id, {})
                     content = doc.get('content', doc.get('summary', ''))
                     if not content:
                         continue
-                    emb = self._encode([content])[0]
-                    self._embeddings[faiss_id] = emb
+                    enc = self._encode([content])[0]
+                    self._store_embeddings([faiss_id], enc.reshape(1, -1))
 
                 faiss_ids.append(faiss_id)
-                embs.append(emb)
 
             if not faiss_ids:
                 return []
@@ -274,7 +291,8 @@ class L2Handler:
             # For small candidate sets, numpy dot product beats FAISS
             # index creation overhead. Threshold at 1000 candidates.
             if len(faiss_ids) < 1000:
-                emb_matrix = np.vstack(embs).astype(np.float32)
+                fid_arr = np.array(faiss_ids, dtype=np.int64)
+                emb_matrix = self._emb_array[fid_arr]
                 scores = emb_matrix @ query_emb
                 k = min(top_k, len(faiss_ids))
                 if k >= len(scores):
@@ -289,9 +307,10 @@ class L2Handler:
             # For large candidate sets, use FAISS
             local = self._faiss.IndexFlatIP(self._dim)
             local_id_map = self._faiss.IndexIDMap2(local)
+            fid_arr = np.array(faiss_ids, dtype=np.int64)
             local_id_map.add_with_ids(
-                np.vstack(embs).astype(np.float32),
-                np.array(faiss_ids, dtype=np.int64),
+                self._emb_array[fid_arr],
+                fid_arr,
             )
 
             k = min(top_k, len(faiss_ids))
@@ -332,7 +351,8 @@ class L2Handler:
             self._id_map = self._faiss.IndexIDMap2(self._index)
             self._docs.clear()
             self._doc_id_to_faiss_id.clear()
-            self._embeddings.clear()
+            self._emb_array = np.empty((0, self._dim), dtype=np.float32)
+            self._emb_capacity = 0
             self._next_id = 0
             self._ivf_trained = False
             self._buffer_embeddings = []

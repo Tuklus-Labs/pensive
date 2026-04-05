@@ -7,6 +7,8 @@ import re
 from typing import List
 
 
+_WORD_RE = re.compile(r'[A-Za-z0-9]+')
+
 STOPWORDS = {
     'the', 'a', 'an', 'is', 'are', 'was', 'were', 'be', 'been',
     'have', 'has', 'had', 'do', 'does', 'did', 'will', 'would',
@@ -63,7 +65,7 @@ class QueryGenerator:
         - +3 if the word starts with a capital letter (proper nouns, acronyms)
         - +2 if the word contains any digit (versions, IDs, dates)
         """
-        words = re.findall(r'[A-Za-z0-9]+', text)
+        words = _WORD_RE.findall(text)
         # Filter: 4+ chars, not a stopword
         candidates = [w for w in words if len(w) >= 4 and w.lower() not in STOPWORDS]
 

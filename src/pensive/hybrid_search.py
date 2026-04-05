@@ -109,6 +109,7 @@ class BM25Index:
 
         self.tokenizer = tokenizer or self._default_tokenizer
         self.bm25 = None
+        self._bm25_dirty = False
         self.documents: List[Dict[str, Any]] = []
         self.doc_id_to_idx: Dict[str, int] = {}
         self._corpus_tokens: List[List[str]] = []
@@ -137,10 +138,17 @@ class BM25Index:
             self._corpus_tokens.append(self.tokenizer(content))
 
         if self._corpus_tokens:
+            self._bm25_dirty = True
+
+    def _ensure_bm25(self):
+        """Rebuild BM25 index if dirty (deferred from add_documents)."""
+        if self._bm25_dirty and self._corpus_tokens:
             self.bm25 = BM25Plus(self._corpus_tokens)
+            self._bm25_dirty = False
 
     def search(self, query: str, top_k: int = 10) -> List[SearchResult]:
         """Search the BM25 index."""
+        self._ensure_bm25()
         if self.bm25 is None or not self.documents:
             return []
 
@@ -180,6 +188,7 @@ class BM25Index:
 
     def clear(self):
         self.bm25 = None
+        self._bm25_dirty = False
         self.documents = []
         self.doc_id_to_idx = {}
         self._corpus_tokens = []

@@ -165,8 +165,12 @@ class PatternLearner:
         return candidates
 
     def get_learned_terms(self) -> Set[str]:
-        """Get all learned entity terms."""
-        return set(self.learned_entities.keys())
+        """Get all learned entity terms.
+
+        Returns a view-like set backed by dict keys. Callers should not
+        mutate the returned set.
+        """
+        return self.learned_entities.keys()
 
     def add_manual(self, term: str, source: str = 'manual'):
         """Manually add a learned entity."""

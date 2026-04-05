@@ -3,6 +3,9 @@ import re
 from typing import List
 
 
+_SENTENCE_RE = re.compile(r'(?<=[.!?])\s+|\n{2,}')
+
+
 class SentenceAwareChunker:
     """Split text into chunks on sentence boundaries with overlap."""
 
@@ -24,7 +27,7 @@ class SentenceAwareChunker:
         if len(text) <= self.target_size:
             return [text]
 
-        sentences = re.split(r'(?<=[.!?])\s+|\n{2,}', text)
+        sentences = _SENTENCE_RE.split(text)
         # Drop empty fragments from the split
         sentences = [s for s in sentences if s.strip()]
 
