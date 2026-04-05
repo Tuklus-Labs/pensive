@@ -572,38 +572,46 @@ class SpreadingActivation:
         """Seed activation from a list of lowercase words."""
         activations: Dict[int, float] = {}
         do_substr = self._do_substr
+        entity_index = self._entity_index
+        node_to_idx = self._node_to_idx
+        node_specificity = self._node_specificity
+        node_label = self._node_label
+        exact_boost = self.config.exact_boost
+        partial_boost = self.config.partial_boost
+        substr_boost = self.config.substr_boost
 
         for word in dict.fromkeys(words):
             if word in _STOPWORDS:
                 continue
-            for node_id in self._entity_index.get(word, []):
-                idx = self._node_to_idx.get(node_id)
-                if idx is None:
-                    continue
-                spec = self._node_specificity[idx]
-                label = self._node_label[idx]
-                if word == label:
-                    activations[idx] = max(
-                        activations.get(idx, 0),
-                        self.config.exact_boost * spec
-                    )
-                else:
-                    activations[idx] = max(
-                        activations.get(idx, 0),
-                        self.config.partial_boost * spec
-                    )
+            node_ids = entity_index.get(word)
+            if node_ids:
+                for node_id in node_ids:
+                    idx = node_to_idx.get(node_id)
+                    if idx is None:
+                        continue
+                    spec = node_specificity[idx]
+                    if word == node_label[idx]:
+                        activations[idx] = max(
+                            activations.get(idx, 0),
+                            exact_boost * spec
+                        )
+                    else:
+                        activations[idx] = max(
+                            activations.get(idx, 0),
+                            partial_boost * spec
+                        )
 
             if do_substr and len(word) >= 4:
                 for node_id in self._substring_seed_nodes(word):
-                    idx = self._node_to_idx.get(node_id)
+                    idx = node_to_idx.get(node_id)
                     if idx is None:
                         continue
                     if idx in activations:
                         continue
-                    spec = self._node_specificity[idx]
+                    spec = node_specificity[idx]
                     activations[idx] = max(
                         activations.get(idx, 0),
-                        self.config.substr_boost * spec
+                        substr_boost * spec
                     )
         return activations
 
