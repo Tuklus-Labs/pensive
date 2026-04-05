@@ -11,6 +11,7 @@ Usage:
     sa.build(documents)  # List of dicts with 'content', 'id', 'value' keys
     results = sa.query("What was the P99 latency on 2025-10-08?")
 """
+import array
 import heapq
 from collections import defaultdict
 from dataclasses import dataclass, field
@@ -115,9 +116,10 @@ class SpreadingActivation:
         self._node_specificity: List[float] = []
 
         # Edge storage (COO during build, CSR for queries)
-        self._edge_src: List[int] = []
-        self._edge_dst: List[int] = []
-        self._edge_weight: List[float] = []
+        # array.array enables zero-copy np.frombuffer in _compile()
+        self._edge_src = array.array('i')
+        self._edge_dst = array.array('i')
+        self._edge_weight = array.array('f')
         self._entity_edge_positions: Dict[int, List[int]] = defaultdict(list)
         self._adj: Optional[scipy.sparse.csr_matrix] = None
         self._dirty = True
@@ -158,18 +160,22 @@ class SpreadingActivation:
         self._dirty = True
 
     def _compile(self) -> None:
-        """Convert COO edge lists to CSR matrix for fast neighbor iteration."""
+        """Convert COO edge lists to CSR matrix for fast neighbor iteration.
+
+        Uses np.frombuffer for zero-copy views of the array.array buffers.
+        scipy internally copies during CSR construction so the view is safe.
+        """
         if not self._dirty:
             return
         n = len(self._idx_to_node)
         if not self._edge_src:
             self._adj = scipy.sparse.csr_matrix((n, n), dtype=np.float32)
         else:
+            weights = np.frombuffer(self._edge_weight, dtype=np.float32)
+            rows = np.frombuffer(self._edge_src, dtype=np.int32)
+            cols = np.frombuffer(self._edge_dst, dtype=np.int32)
             self._adj = scipy.sparse.csr_matrix(
-                (np.array(self._edge_weight, dtype=np.float32),
-                 (np.array(self._edge_src, dtype=np.int32),
-                  np.array(self._edge_dst, dtype=np.int32))),
-                shape=(n, n),
+                (weights, (rows, cols)), shape=(n, n),
             )
         self._dirty = False
 
@@ -180,9 +186,9 @@ class SpreadingActivation:
         self._node_type = []
         self._node_label = []
         self._node_specificity = []
-        self._edge_src = []
-        self._edge_dst = []
-        self._edge_weight = []
+        self._edge_src = array.array('i')    # int32 COO row indices
+        self._edge_dst = array.array('i')    # int32 COO col indices
+        self._edge_weight = array.array('f') # float32 COO values
         self._entity_edge_positions = defaultdict(list)
         self._adj = None
         self._dirty = True
@@ -240,9 +246,9 @@ class SpreadingActivation:
             return
 
         coo = self._adj.tocoo(copy=True)
-        self._edge_src = coo.row.astype(np.int32).tolist()
-        self._edge_dst = coo.col.astype(np.int32).tolist()
-        self._edge_weight = coo.data.astype(np.float32).tolist()
+        self._edge_src = array.array('i', coo.row.astype(np.int32))
+        self._edge_dst = array.array('i', coo.col.astype(np.int32))
+        self._edge_weight = array.array('f', coo.data.astype(np.float32))
         self._entity_edge_positions = defaultdict(list)
 
         for pos, src_idx in enumerate(self._edge_src):
@@ -812,9 +818,9 @@ class SpreadingActivation:
             (data['adj_data'], data['adj_indices'], data['adj_indptr']),
             shape=data['adj_shape'],
         )
-        sa._edge_src = []
-        sa._edge_dst = []
-        sa._edge_weight = []
+        sa._edge_src = array.array('i')
+        sa._edge_dst = array.array('i')
+        sa._edge_weight = array.array('f')
         sa._entity_edge_positions = defaultdict(list)
         sa._dirty = False
 
