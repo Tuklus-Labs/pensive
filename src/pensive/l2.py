@@ -95,6 +95,20 @@ class L2Handler:
         self._buffer_embeddings: List[np.ndarray] = []
         self._buffer_ids: List[int] = []
 
+        # Single-slot query embedding cache: avoids re-encoding when the
+        # same query text hits both query() and query_candidates().
+        self._query_cache_text: Optional[str] = None
+        self._query_cache_emb: Optional[np.ndarray] = None
+
+    def _encode_query(self, text: str) -> np.ndarray:
+        """Encode a single query string, with single-slot cache."""
+        if self._query_cache_text == text and self._query_cache_emb is not None:
+            return self._query_cache_emb
+        emb = self._encode([text])[0]
+        self._query_cache_text = text
+        self._query_cache_emb = emb
+        return emb
+
     def _encode(self, texts: List[str]) -> np.ndarray:
         """Encode texts to embeddings."""
         embeddings = self._model.encode(texts, batch_size=self.config.batch_size,
@@ -196,11 +210,11 @@ class L2Handler:
             if self._id_map.ntotal == 0 and not self._buffer_embeddings:
                 return []
 
-            query_emb = self._encode([query_text])
+            query_vec = self._encode_query(query_text)
             if self._id_map.ntotal == 0 and self._buffer_embeddings:
                 # IVF warmup mode: query buffered vectors before training threshold.
                 all_embeddings = np.vstack(self._buffer_embeddings)
-                scores = all_embeddings @ query_emb[0]
+                scores = all_embeddings @ query_vec
                 k = min(top_k, scores.shape[0])
                 if k >= len(scores):
                     top_indices = np.argsort(scores)[::-1]
@@ -211,7 +225,7 @@ class L2Handler:
                 return self._results_from_ids(ids, scores[top_indices])
 
             k = min(top_k, self._id_map.ntotal)
-            scores, ids = self._id_map.search(query_emb, k)
+            scores, ids = self._id_map.search(query_vec.reshape(1, -1), k)
             return self._results_from_ids(ids[0], scores[0])
 
     def query_candidates(
@@ -255,7 +269,7 @@ class L2Handler:
             if not faiss_ids:
                 return []
 
-            query_emb = self._encode([query_text])[0]
+            query_emb = self._encode_query(query_text)
 
             # For small candidate sets, numpy dot product beats FAISS
             # index creation overhead. Threshold at 1000 candidates.

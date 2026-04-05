@@ -10,6 +10,7 @@ Sources of context:
 2. Entity index (recently accessed entities)
 3. Memory graph neighbors (entities associated with query terms)
 """
+import itertools
 import re
 from collections import defaultdict
 from typing import List, Optional, Protocol, runtime_checkable
@@ -160,12 +161,11 @@ class L1ContextBridge:
 
     def _from_entity_index(self) -> List[str]:
         """Get recently active entities from L1's entity index."""
-        entities = []
         try:
-            # Entity index: entity_name -> [summaries]
-            # We want entities with recent activity
-            for entity_name in self.l1.entity_index:
-                entities.append(str(entity_name).lower())
+            # Cap iteration to max_entities -- no point collecting more
+            # than we'll ever use (they get capped in get_context anyway).
+            return [str(e).lower()
+                    for e in itertools.islice(self.l1.entity_index,
+                                              self.max_entities)]
         except (AttributeError, TypeError):
-            pass
-        return entities
+            return []

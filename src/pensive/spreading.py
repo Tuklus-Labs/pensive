@@ -265,6 +265,16 @@ class SpreadingActivation:
             if word != entity and word not in _STOPWORDS:
                 self._entity_index[word].append(node_id)
 
+    def _rebuild_token_index(self) -> None:
+        """Rebuild the token-level inverted index from _entity_terms."""
+        idx = defaultdict(list)
+        for entity in self._entity_terms:
+            for tok in _TOKEN_RE.findall(entity):
+                tok_lower = tok.lower()
+                if tok_lower != entity and len(tok_lower) >= 2:
+                    idx[tok_lower].append(entity)
+        self._token_index = idx
+
     def _refresh_specificity_for_entities(self, entities: Iterable[str]) -> None:
         """Recompute specificity and edge weights for entities whose freq changed."""
         touched = set(entities)
@@ -1004,12 +1014,7 @@ class SpreadingActivation:
         sa._exact_entities = set(sa.entity_freq.keys())
         sa._entity_terms = list(sa._exact_entities)
         sa._substr_match_cache = {}
-        sa._token_index = defaultdict(list)
-        for entity in sa._entity_terms:
-            for tok in _TOKEN_RE.findall(entity):
-                tok_lower = tok.lower()
-                if tok_lower != entity and len(tok_lower) >= 2:
-                    sa._token_index[tok_lower].append(entity)
+        sa._rebuild_token_index()
         sa._is_bipartite = data.get('is_bipartite', True)
         sa._built = True
         return sa
@@ -1044,12 +1049,7 @@ class SpreadingActivation:
         sa._exact_entities = set(sa.entity_freq.keys())
         sa._entity_terms = list(sa._exact_entities)
         sa._substr_match_cache = {}
-        sa._token_index = defaultdict(list)
-        for entity in sa._entity_terms:
-            for tok in _TOKEN_RE.findall(entity):
-                tok_lower = tok.lower()
-                if tok_lower != entity and len(tok_lower) >= 2:
-                    sa._token_index[tok_lower].append(entity)
+        sa._rebuild_token_index()
         # Legacy networkx graphs may not be bipartite -- check
         sa._is_bipartite = all(
             sa._adj.indptr[idx] == sa._adj.indptr[idx + 1]
