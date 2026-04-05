@@ -320,4 +320,5 @@ class ParallelHybrid:
 
     def shutdown(self):
         """Shutdown thread pool."""
-        self._executor.shutdown(wait=False)
+        if self._executor is not None:
+            self._executor.shutdown(wait=False)
