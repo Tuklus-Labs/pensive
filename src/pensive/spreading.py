@@ -110,20 +110,17 @@ if _HAS_NUMBA:
                 nbr = indices[j]
                 if val > result[nbr]:
                     result[nbr] = val
-        # Collect value nodes above threshold in one pass
-        count = 0
-        for i in range(n):
-            if result[i] >= threshold and node_type_arr[i] == value_type:
-                count += 1
-        nz_idx = np.empty(count, dtype=np.int64)
-        nz_scores = np.empty(count, dtype=np.float32)
+        # Single-pass collect: pre-allocate max-size buffer to avoid
+        # a counting pass over all n nodes (eliminates second O(n) scan).
+        nz_idx = np.empty(n, dtype=np.int64)
+        nz_scores = np.empty(n, dtype=np.float32)
         pos = 0
         for i in range(n):
             if result[i] >= threshold and node_type_arr[i] == value_type:
                 nz_idx[pos] = i
                 nz_scores[pos] = result[i]
                 pos += 1
-        return nz_idx, nz_scores
+        return nz_idx[:pos], nz_scores[:pos]
 else:
     _numba_spread_bipartite = None
     _numba_spread_and_collect = None
