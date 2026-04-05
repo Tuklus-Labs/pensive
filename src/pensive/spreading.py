@@ -790,6 +790,11 @@ class SpreadingActivation:
         Uses pre-computed _value_indices to skip entity nodes without
         scanning the full array.
         """
+        # Fast exit: if result is all-zero (query matched no entities),
+        # skip the expensive fancy index into value nodes.
+        if not result.any():
+            return []
+
         vi = self._value_indices
         scores = result[vi]
 
@@ -814,6 +819,9 @@ class SpreadingActivation:
     def _collect_from_array_with_ids(self, result: np.ndarray, top_k: int
                                       ) -> List[Tuple[str, str, float]]:
         """Like _collect_from_array but returns (doc_id, value, score)."""
+        if not result.any():
+            return []
+
         vi = self._value_indices
         scores = result[vi]
 
