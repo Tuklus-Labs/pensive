@@ -51,8 +51,8 @@ def _build_graph(num_docs: int, seed: int = 42) -> SpreadingActivation:
 class TestQueryPerformance:
     """Verify query latency stays within bounds at various scales."""
 
-    def test_query_10k_under_500us(self):
-        """At 10K docs, per-query mean should be under 500us."""
+    def test_query_10k_under_100us(self):
+        """At 10K docs, per-query mean should be under 100us."""
         sa = _build_graph(10_000)
         # JIT warmup
         sa.query('warmup query', top_k=10)
@@ -66,10 +66,10 @@ class TestQueryPerformance:
             times.append(time.perf_counter_ns() - t0)
 
         per_query_us = sum(times) / len(times) / len(QUERIES) / 1000
-        assert per_query_us < 500, f"mean query latency {per_query_us:.0f}us > 500us at 10K docs"
+        assert per_query_us < 100, f"mean query latency {per_query_us:.0f}us > 100us at 10K docs"
 
-    def test_query_50k_under_1ms(self):
-        """At 50K docs, per-query mean should be under 1ms."""
+    def test_query_50k_under_200us(self):
+        """At 50K docs, per-query mean should be under 200us."""
         sa = _build_graph(50_000)
         sa.query('warmup query', top_k=10)
 
@@ -82,7 +82,7 @@ class TestQueryPerformance:
             times.append(time.perf_counter_ns() - t0)
 
         per_query_us = sum(times) / len(times) / len(QUERIES) / 1000
-        assert per_query_us < 1000, f"mean query latency {per_query_us:.0f}us > 1000us at 50K docs"
+        assert per_query_us < 200, f"mean query latency {per_query_us:.0f}us > 200us at 50K docs"
 
     def test_query_with_doc_ids_10k(self):
         """query_with_doc_ids should be within 2x of query() latency."""
@@ -127,8 +127,8 @@ class TestBuildPerformance:
 
         assert elapsed < 5.0, f"build took {elapsed:.1f}s > 5s at 10K docs"
 
-    def test_query_200k_under_2ms(self):
-        """At 200K docs, per-query mean should be under 2ms."""
+    def test_query_200k_under_500us(self):
+        """At 200K docs, per-query mean should be under 500us."""
         sa = _build_graph(200_000)
         sa.query('warmup query', top_k=10)
 
@@ -141,7 +141,23 @@ class TestBuildPerformance:
             times.append(time.perf_counter_ns() - t0)
 
         per_query_us = sum(times) / len(times) / len(QUERIES) / 1000
-        assert per_query_us < 2000, f"mean query latency {per_query_us:.0f}us > 2000us at 200K docs"
+        assert per_query_us < 500, f"mean query latency {per_query_us:.0f}us > 500us at 200K docs"
+
+    def test_query_500k_under_1ms(self):
+        """At 500K docs, per-query mean should be under 1ms."""
+        sa = _build_graph(500_000)
+        sa.query('warmup query', top_k=10)
+
+        times = []
+        for _ in range(10):
+            sa._substr_match_cache.clear()
+            t0 = time.perf_counter_ns()
+            for q in QUERIES:
+                sa.query(q, top_k=10)
+            times.append(time.perf_counter_ns() - t0)
+
+        per_query_us = sum(times) / len(times) / len(QUERIES) / 1000
+        assert per_query_us < 1000, f"mean query latency {per_query_us:.0f}us > 1000us at 500K docs"
 
     def test_serialization_round_trip_fast(self):
         """Save/load at 10K should complete in under 2 seconds total."""
