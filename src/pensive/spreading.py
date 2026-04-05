@@ -200,6 +200,12 @@ class SpreadingActivation:
             self._entity_edge_positions[src_idx].append(pos)
         self._dirty = True
 
+    def _add_edge_fast(self, src_idx: int, dst_idx: int, weight: float) -> None:
+        """Add an edge during initial build (skips position tracking)."""
+        self._edge_src.append(src_idx)
+        self._edge_dst.append(dst_idx)
+        self._edge_weight.append(weight)
+
     def _compile(self) -> None:
         """Convert COO edge lists to CSR matrix for fast neighbor iteration.
 
@@ -409,11 +415,12 @@ class SpreadingActivation:
                 if is_new:
                     self._index_entity_node(entity, node_id)
 
-                self._add_edge(
+                self._add_edge_fast(
                     ent_idx, ans_idx,
                     specificity * edge_weight
                 )
 
+        self._dirty = True
         self._built = True
         return self
 
@@ -552,11 +559,12 @@ class SpreadingActivation:
                 if is_new:
                     self._index_entity_node(entity, node_id)
 
-                self._add_edge(
+                self._add_edge_fast(
                     ent_idx, ans_idx,
                     specificity * self.config.edge_weight
                 )
 
+        self._dirty = True
         self._built = True
         return self
 
