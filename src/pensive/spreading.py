@@ -1038,10 +1038,21 @@ class SpreadingActivation:
                  if len(w) >= 2]
         query_act = self._seed_from_words(words)
 
-        # Fast path: bipartite without context uses combined kernel
-        if self._is_bipartite and not context and self.config.max_hops >= 1:
+        # Fast path: bipartite graphs use vectorized numpy kernels
+        if self._is_bipartite and self.config.max_hops >= 1:
             self._compile()
-            return self._spread_and_collect_bipartite(query_act, top_k)
+            if not context:
+                return self._spread_and_collect_bipartite(query_act, top_k)
+            # Context + bipartite: spread both on numpy arrays, intersect
+            query_arr = self._spread_bipartite_raw(query_act)
+            ctx_words = [w.lower().strip('?.,') for w in context
+                         if len(w) > 1]
+            ctx_act = self._seed_from_words(ctx_words)
+            ctx_arr = self._spread_bipartite_raw(ctx_act)
+            # Boost query scores where context also activated
+            ctx_mask = ctx_arr > 0
+            query_arr[ctx_mask] *= (1.0 + ctx_arr[ctx_mask])
+            return self._collect_from_array(query_arr, top_k)
 
         query_act = self._spread(query_act)
 
@@ -1080,10 +1091,20 @@ class SpreadingActivation:
                  if len(w) >= 2]
         query_act = self._seed_from_words(words)
 
-        # Fast path: bipartite without context uses combined kernel
-        if self._is_bipartite and not context and self.config.max_hops >= 1:
+        # Fast path: bipartite graphs use vectorized numpy kernels
+        if self._is_bipartite and self.config.max_hops >= 1:
             self._compile()
-            return self._spread_and_collect_bipartite_with_ids(query_act, top_k)
+            if not context:
+                return self._spread_and_collect_bipartite_with_ids(query_act, top_k)
+            # Context + bipartite: spread both on numpy arrays, intersect
+            query_arr = self._spread_bipartite_raw(query_act)
+            ctx_words = [w.lower().strip('?.,') for w in context
+                         if len(w) > 1]
+            ctx_act = self._seed_from_words(ctx_words)
+            ctx_arr = self._spread_bipartite_raw(ctx_act)
+            ctx_mask = ctx_arr > 0
+            query_arr[ctx_mask] *= (1.0 + ctx_arr[ctx_mask])
+            return self._collect_from_array_with_ids(query_arr, top_k)
 
         query_act = self._spread(query_act)
 
