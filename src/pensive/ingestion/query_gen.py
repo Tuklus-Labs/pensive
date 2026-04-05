@@ -9,7 +9,7 @@ from typing import List
 
 _WORD_RE = re.compile(r'[A-Za-z0-9]+')
 
-STOPWORDS = {
+STOPWORDS = frozenset({
     'the', 'a', 'an', 'is', 'are', 'was', 'were', 'be', 'been',
     'have', 'has', 'had', 'do', 'does', 'did', 'will', 'would',
     'could', 'should', 'may', 'might', 'can', 'shall', 'must', 'need',
@@ -21,7 +21,7 @@ STOPWORDS = {
     'which', 'while', 'because', 'since', 'until', 'like', 'your',
     'their', 'they', 'them', 'said', 'says', 'went', 'been', 'being',
     'back', 'over', 'most', 'much', 'many', 'made', 'make', 'know',
-}
+})
 
 
 class QueryGenerator:
@@ -78,13 +78,18 @@ class QueryGenerator:
                 seen.add(low)
                 unique.append(w)
 
-        def score(word: str) -> float:
-            s = len(word)
-            if word[0].isupper():
-                s += 3
-            if any(c.isdigit() for c in word):
-                s += 2
-            return s
-
-        unique.sort(key=score, reverse=True)
+        unique.sort(key=_score_term, reverse=True)
         return unique[:max_terms]
+
+
+def _score_term(word: str) -> int:
+    """Score a word for distinctiveness. Module-level to avoid closure per call."""
+    s = len(word)
+    if word[0].isupper():
+        s += 3
+    # Single-pass digit check without generator overhead
+    for c in word:
+        if '0' <= c <= '9':
+            s += 2
+            break
+    return s
