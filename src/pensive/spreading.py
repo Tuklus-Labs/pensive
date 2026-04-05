@@ -273,9 +273,12 @@ class SpreadingActivation:
                 if tok_lower != entity and len(tok_lower) >= 2:
                     self._token_index[tok_lower].append(entity)
 
-        for word in entity.split():
-            if word != entity and word not in _STOPWORDS:
-                self._entity_index[word].append(node_id)
+        # Multi-word entities get word-level indexing for partial matching.
+        # Single-word entities skip: split returns [entity] and word==entity filters it.
+        if ' ' in entity:
+            for word in entity.split():
+                if word not in _STOPWORDS:
+                    self._entity_index[word].append(node_id)
 
     def _rebuild_token_index(self) -> None:
         """Rebuild the token-level inverted index from _entity_terms."""

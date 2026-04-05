@@ -13,6 +13,7 @@ Rank Learning Methods" (Cormack et al., 2009)
 
 Requires: pip install pypensive[full]
 """
+import heapq
 import logging
 import re
 from typing import Dict, List, Any, Optional, Set
@@ -43,12 +44,16 @@ class SearchResult:
 def reciprocal_rank_fusion(
     ranked_lists: List[List[SearchResult]],
     k: int = 60,
-    weights: Optional[List[float]] = None
+    weights: Optional[List[float]] = None,
+    top_k: int = 0,
 ) -> List[SearchResult]:
     """Combine multiple ranked result lists using Reciprocal Rank Fusion.
 
     RRF score for document d:
         RRF(d) = sum_{r in rankings} weight_r / (k + rank_r(d))
+
+    Args:
+        top_k: If > 0, use heapq.nlargest for O(n log k) instead of full sort.
     """
     if not ranked_lists:
         return []
@@ -71,15 +76,20 @@ def reciprocal_rank_fusion(
             doc_id = result.document_id
             rrf_scores[doc_id] += weight / (k + rank)
 
-            if doc_id not in doc_results:
+            existing = doc_results.get(doc_id)
+            if existing is None:
                 doc_results[doc_id] = result
-            elif result.source == 'dense' and doc_results[doc_id].source != 'dense':
+            elif result.source == 'dense' and existing.source != 'dense':
                 doc_results[doc_id] = result
 
-    sorted_docs = sorted(rrf_scores.items(), key=lambda x: x[1], reverse=True)
+    # Use heapq.nlargest when top_k is specified - O(n log k) vs O(n log n)
+    if top_k > 0 and top_k < len(rrf_scores):
+        top_items = heapq.nlargest(top_k, rrf_scores.items(), key=lambda x: x[1])
+    else:
+        top_items = sorted(rrf_scores.items(), key=lambda x: x[1], reverse=True)
 
     final_results = []
-    for new_rank, (doc_id, rrf_score) in enumerate(sorted_docs, start=1):
+    for new_rank, (doc_id, rrf_score) in enumerate(top_items, start=1):
         result = doc_results[doc_id]
         final_results.append(SearchResult(
             document_id=result.document_id,
@@ -234,7 +244,7 @@ class HybridSearcher:
             ranked_lists.append(sparse_results)
             weights.append(self.sparse_weight)
 
-        return reciprocal_rank_fusion(ranked_lists, k=self.rrf_k, weights=weights)[:top_k]
+        return reciprocal_rank_fusion(ranked_lists, k=self.rrf_k, weights=weights, top_k=top_k)
 
     @property
     def bm25_size(self) -> int:
