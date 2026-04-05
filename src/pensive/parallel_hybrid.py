@@ -75,7 +75,7 @@ class ParallelHybrid:
         self.l2 = l2_handler
         self.l2_on_sa_hits = l2_on_sa_hits
         self.l2_fallback_global = l2_fallback_global
-        self._executor = ThreadPoolExecutor(max_workers=4)
+        self._executor = None  # lazy-init only for legacy parallel mode
 
         self.cross_encoder = None
         if use_cross_encoder and CROSS_ENCODER_AVAILABLE:
@@ -127,6 +127,8 @@ class ParallelHybrid:
             )
         else:
             # Legacy mode: fire SA and global L2 in parallel.
+            if self._executor is None:
+                self._executor = ThreadPoolExecutor(max_workers=4)
             sa_future = self._executor.submit(self._query_sa, query, sa_top_k, context)
             l2_future = self._executor.submit(self._query_l2, query, l2_top_k)
 

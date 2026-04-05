@@ -128,9 +128,11 @@ class L1ContextBridge:
         entities = []
         try:
             recent = self.l1.recent_queries
-            # OrderedDict - iterate in reverse (most recent first)
-            items = list(recent.values())[-self.recent_window:]
-            for entry in reversed(items):
+            # Take the last N values without materializing all values.
+            # collections.deque with maxlen consumes the iterator keeping only the tail.
+            from collections import deque
+            tail = deque(recent.values(), maxlen=self.recent_window)
+            for entry in reversed(tail):
                 response_text = ''
                 if isinstance(entry, dict):
                     response_text = entry.get('response', '')

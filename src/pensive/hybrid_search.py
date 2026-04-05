@@ -93,6 +93,9 @@ def reciprocal_rank_fusion(
     return final_results
 
 
+_BM25_TOKEN_RE = re.compile(r'0x[0-9a-f]+|[\w]+(?:[-.][\w]+)*')
+
+
 class BM25Index:
     """Sparse retrieval index using BM25.
 
@@ -118,9 +121,7 @@ class BM25Index:
         """Tokenizer that preserves numeric identifiers and codes."""
         if not text:
             return []
-        text = text.lower()
-        pattern = r'0x[0-9a-f]+|[\w]+(?:[-.][\w]+)*'
-        return re.findall(pattern, text)
+        return _BM25_TOKEN_RE.findall(text.lower())
 
     def add_documents(self, documents: List[Dict[str, Any]], id_field: str = 'id',
                       content_field: str = 'content'):
