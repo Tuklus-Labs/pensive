@@ -199,6 +199,7 @@ class SpreadingActivation:
 
         Uses np.frombuffer for zero-copy views of the array.array buffers.
         scipy internally copies during CSR construction so the view is safe.
+        Also caches numpy arrays for node_type and node_specificity.
         """
         if not self._dirty:
             return
@@ -212,6 +213,8 @@ class SpreadingActivation:
             self._adj = scipy.sparse.csr_matrix(
                 (weights, (rows, cols)), shape=(n, n),
             )
+        # Cache numpy arrays for vectorized operations in _collect_results
+        self._node_type_arr = np.array(self._node_type, dtype=np.int8)
         self._dirty = False
 
     def _reset_graph_state(self) -> None:
@@ -714,6 +717,94 @@ class SpreadingActivation:
             results.append((doc_id, self._node_label[idx], score))
         return results
 
+    def _spread_bipartite_raw(self, activations: Dict[int, float]) -> np.ndarray:
+        """Like _spread_bipartite but returns raw numpy array instead of dict.
+
+        Avoids the array->dict->array round-trip when collecting results.
+        """
+        indptr = self._adj.indptr
+        indices = self._adj.indices
+        data = self._adj.data
+        decay = self.config.decay
+        threshold = self.config.threshold
+        n = len(self._idx_to_node)
+
+        act_indices = np.array(list(activations.keys()), dtype=np.int64)
+        act_scores = np.array(list(activations.values()), dtype=np.float32)
+
+        if _numba_spread_bipartite is not None:
+            return _numba_spread_bipartite(
+                act_indices, act_scores, indptr, indices, data,
+                np.float32(decay), np.float32(threshold), n,
+            )
+
+        result = np.zeros(n, dtype=np.float32)
+        for idx, score in activations.items():
+            decayed = score * decay
+            if decayed > result[idx]:
+                result[idx] = decayed
+            if score < threshold:
+                continue
+            row_start = indptr[idx]
+            row_end = indptr[idx + 1]
+            if row_start == row_end:
+                continue
+            nbrs = indices[row_start:row_end]
+            weights = data[row_start:row_end]
+            np.maximum.at(result, nbrs, score * decay * weights)
+        return result
+
+    def _collect_from_array(self, result: np.ndarray, top_k: int
+                            ) -> List[Tuple[str, float]]:
+        """Collect top-k value nodes directly from a numpy score array.
+
+        Avoids the dict intermediate used by _collect_results.
+        """
+        # Zero out entity nodes so only value nodes survive top-k
+        value_mask = self._node_type_arr == _VALUE_TYPE
+        masked = np.where(value_mask, result, 0.0)
+
+        # Find non-zero value indices
+        nz = np.flatnonzero(masked >= self.config.threshold)
+        if len(nz) == 0:
+            return []
+
+        scores = masked[nz]
+        k = min(top_k, len(nz))
+        if k >= len(nz):
+            top_idx = np.argsort(scores)[::-1]
+        else:
+            top_idx = np.argpartition(scores, -k)[-k:]
+            top_idx = top_idx[np.argsort(scores[top_idx])[::-1]]
+
+        return [(self._node_label[nz[i]], float(scores[i])) for i in top_idx]
+
+    def _collect_from_array_with_ids(self, result: np.ndarray, top_k: int
+                                      ) -> List[Tuple[str, str, float]]:
+        """Like _collect_from_array but returns (doc_id, value, score)."""
+        value_mask = self._node_type_arr == _VALUE_TYPE
+        masked = np.where(value_mask, result, 0.0)
+
+        nz = np.flatnonzero(masked >= self.config.threshold)
+        if len(nz) == 0:
+            return []
+
+        scores = masked[nz]
+        k = min(top_k, len(nz))
+        if k >= len(nz):
+            top_idx = np.argsort(scores)[::-1]
+        else:
+            top_idx = np.argpartition(scores, -k)[-k:]
+            top_idx = top_idx[np.argsort(scores[top_idx])[::-1]]
+
+        results = []
+        for i in top_idx:
+            idx = nz[i]
+            node_id = self._idx_to_node[idx]
+            doc_id = node_id[2:] if node_id.startswith('v:') else node_id
+            results.append((doc_id, self._node_label[idx], float(scores[i])))
+        return results
+
     def query(self, query_text: str, top_k: int = 10,
               context: Optional[List[str]] = None) -> List[Tuple[str, float]]:
         """
@@ -741,6 +832,13 @@ class SpreadingActivation:
         words = [w.lower().strip('?.,') for w in query_text.split()
                  if len(w) >= 2]
         query_act = self._seed_from_words(words)
+
+        # Fast path: bipartite without context skips dict round-trip
+        if self._is_bipartite and not context and self.config.max_hops >= 1:
+            self._compile()
+            result_arr = self._spread_bipartite_raw(query_act)
+            return self._collect_from_array(result_arr, top_k)
+
         query_act = self._spread(query_act)
 
         if not context:
@@ -777,6 +875,13 @@ class SpreadingActivation:
         words = [w.lower().strip('?.,') for w in query_text.split()
                  if len(w) >= 2]
         query_act = self._seed_from_words(words)
+
+        # Fast path: bipartite without context skips dict round-trip
+        if self._is_bipartite and not context and self.config.max_hops >= 1:
+            self._compile()
+            result_arr = self._spread_bipartite_raw(query_act)
+            return self._collect_from_array_with_ids(result_arr, top_k)
+
         query_act = self._spread(query_act)
 
         if not context:
@@ -866,6 +971,7 @@ class SpreadingActivation:
         sa._edge_weight = array.array('f')
         sa._entity_edge_positions = defaultdict(list)
         sa._dirty = False
+        sa._node_type_arr = np.array(sa._node_type, dtype=np.int8)
 
         sa.entity_freq = defaultdict(int, data.get('entity_freq', {}))
         sa._entity_index = defaultdict(list, data.get('entity_index', {}))
