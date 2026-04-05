@@ -371,6 +371,8 @@ class SpreadingActivation:
             if self._node_type[src_idx] == _ENTITY_TYPE:
                 self._entity_edge_positions[src_idx].append(pos)
 
+    _SUBSTR_CACHE_MAX = 10_000
+
     def _substring_seed_nodes(self, word: str) -> List[str]:
         """Return entity node IDs whose exact labels contain the query term.
 
@@ -379,6 +381,9 @@ class SpreadingActivation:
         components, name parts, compound terms). True arbitrary
         substring matches (e.g. "loss" in "dataloss") are not indexed
         but are rare in practice.
+
+        Cache is evicted when it exceeds _SUBSTR_CACHE_MAX entries to
+        prevent unbounded memory growth in long-running sessions.
         """
         cached = self._substr_match_cache.get(word)
         if cached is not None:
@@ -389,6 +394,8 @@ class SpreadingActivation:
             node_ids.update(self._entity_index.get(entity, ()))
 
         matches = list(node_ids)
+        if len(self._substr_match_cache) >= self._SUBSTR_CACHE_MAX:
+            self._substr_match_cache.clear()
         self._substr_match_cache[word] = matches
         return matches
 
