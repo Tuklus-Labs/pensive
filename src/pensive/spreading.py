@@ -789,27 +789,26 @@ class SpreadingActivation:
                             ) -> List[Tuple[str, float]]:
         """Collect top-k value nodes directly from a numpy score array.
 
-        Uses pre-computed _value_indices to skip entity nodes without
-        scanning the full array.
+        Operates on the sparse non-zero entries of the result array
+        rather than indexing all value nodes. Since spreading produces
+        sparse results (~0.5-1% density), this avoids O(n) fancy
+        indexing on the full value node array.
         """
-        # Fast exit: if result is all-zero (query matched no entities),
-        # skip the expensive fancy index into value nodes.
-        if not result.any():
+        # Find all non-zero entries above threshold (sparse)
+        nz_all = np.flatnonzero(result >= self.config.threshold)
+        if len(nz_all) == 0:
             return []
 
-        vi = self._value_indices
-        scores = result[vi]
-
-        # Combined threshold + nonzero filter (skip intermediate bool mask)
-        nz_local = np.flatnonzero(scores >= self.config.threshold)
-        if len(nz_local) == 0:
+        # Filter to value nodes only
+        is_value = self._node_type_arr[nz_all] == _VALUE_TYPE
+        nz_global = nz_all[is_value]
+        if len(nz_global) == 0:
             return []
 
-        nz_scores = scores[nz_local]
-        nz_global = vi[nz_local]
+        nz_scores = result[nz_global]
 
-        k = min(top_k, len(nz_local))
-        if k >= len(nz_local):
+        k = min(top_k, len(nz_global))
+        if k >= len(nz_global):
             top_idx = np.argsort(nz_scores)[::-1]
         else:
             top_idx = np.argpartition(nz_scores, -k)[-k:]
@@ -820,21 +819,19 @@ class SpreadingActivation:
     def _collect_from_array_with_ids(self, result: np.ndarray, top_k: int
                                       ) -> List[Tuple[str, str, float]]:
         """Like _collect_from_array but returns (doc_id, value, score)."""
-        if not result.any():
+        nz_all = np.flatnonzero(result >= self.config.threshold)
+        if len(nz_all) == 0:
             return []
 
-        vi = self._value_indices
-        scores = result[vi]
-
-        nz_local = np.flatnonzero(scores >= self.config.threshold)
-        if len(nz_local) == 0:
+        is_value = self._node_type_arr[nz_all] == _VALUE_TYPE
+        nz_global = nz_all[is_value]
+        if len(nz_global) == 0:
             return []
 
-        nz_scores = scores[nz_local]
-        nz_global = vi[nz_local]
+        nz_scores = result[nz_global]
 
-        k = min(top_k, len(nz_local))
-        if k >= len(nz_local):
+        k = min(top_k, len(nz_global))
+        if k >= len(nz_global):
             top_idx = np.argsort(nz_scores)[::-1]
         else:
             top_idx = np.argpartition(nz_scores, -k)[-k:]
