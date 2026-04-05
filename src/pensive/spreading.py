@@ -255,7 +255,8 @@ class SpreadingActivation:
         if entity not in self._exact_entities:
             self._exact_entities.add(entity)
             self._entity_terms.append(entity)
-            self._substr_match_cache.clear()
+            if self._substr_match_cache:
+                self._substr_match_cache.clear()
 
             # Build token-level index for fast substring matching.
             # Tokens are alphanumeric runs from the entity label.
@@ -1021,6 +1022,7 @@ class SpreadingActivation:
         sa._exact_entities = set(sa.entity_freq.keys())
         sa._entity_terms = list(sa._exact_entities)
         sa._substr_match_cache = {}
+        sa._do_substr = len(sa._entity_terms) <= 10_000
         sa._rebuild_token_index()
         sa._is_bipartite = data.get('is_bipartite', True)
         sa._built = True
@@ -1056,6 +1058,7 @@ class SpreadingActivation:
         sa._exact_entities = set(sa.entity_freq.keys())
         sa._entity_terms = list(sa._exact_entities)
         sa._substr_match_cache = {}
+        sa._do_substr = len(sa._entity_terms) <= 10_000
         sa._rebuild_token_index()
         # Legacy networkx graphs may not be bipartite -- check
         sa._is_bipartite = all(
