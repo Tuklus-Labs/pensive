@@ -979,8 +979,12 @@ class SpreadingActivation:
     def stats(self) -> Dict:
         """Return graph statistics."""
         n_nodes = len(self._idx_to_node)
-        n_entity = sum(1 for t in self._node_type if t == _ENTITY_TYPE)
-        n_value = n_nodes - n_entity
+        # Use cached _value_indices if compiled, otherwise count from list
+        if hasattr(self, '_value_indices') and not self._dirty:
+            n_value = len(self._value_indices)
+        else:
+            n_value = sum(1 for t in self._node_type if t == _VALUE_TYPE)
+        n_entity = n_nodes - n_value
         if self._dirty or self._adj is None:
             n_edges = len(self._edge_src)
         else:
@@ -1009,6 +1013,7 @@ class SpreadingActivation:
             'adj_shape': self._adj.shape,
             'entity_freq': dict(self.entity_freq),
             'entity_index': dict(self._entity_index),
+            'token_index': dict(self._token_index),
             'is_bipartite': self._is_bipartite,
             'config': self.config,
             'patterns': self.patterns,
@@ -1056,7 +1061,12 @@ class SpreadingActivation:
         sa._entity_terms = list(sa._exact_entities)
         sa._substr_match_cache = {}
         sa._do_substr = len(sa._entity_terms) <= 10_000
-        sa._rebuild_token_index()
+        # Use serialized token index if available (avoids O(n) rebuild)
+        saved_token_idx = data.get('token_index')
+        if saved_token_idx is not None:
+            sa._token_index = defaultdict(list, saved_token_idx)
+        else:
+            sa._rebuild_token_index()
         sa._is_bipartite = data.get('is_bipartite', True)
         sa._built = True
         return sa
