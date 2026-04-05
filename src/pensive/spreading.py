@@ -13,6 +13,7 @@ Usage:
 """
 import array
 import heapq
+import re
 from collections import defaultdict
 from dataclasses import dataclass, field
 from typing import Dict, Iterable, List, Optional, Tuple
@@ -58,6 +59,9 @@ _STOPWORDS = frozenset({
     'pay', 'meet', 'include', 'continue', 'end', 'start', 'turn', 'help',
     'way', 'yes', 'using', 'going', 'able', 'may', 'might',
 })
+
+# Split entity labels into tokens on non-alphanumeric boundaries
+_TOKEN_RE = re.compile(r'[a-z0-9]+', re.IGNORECASE)
 
 
 # Numba-JIT spread kernel: eliminates Python loop overhead for ~38x speedup.
@@ -163,6 +167,7 @@ class SpreadingActivation:
         self._entity_index: Dict[str, List[str]] = defaultdict(list)
         self._exact_entities = set()
         self._entity_terms: List[str] = []
+        self._token_index: Dict[str, List[str]] = defaultdict(list)  # token -> entity labels
         self._substr_match_cache: Dict[str, List[str]] = {}
         self._built = False
         self._is_bipartite = True  # True until proven otherwise
@@ -238,6 +243,7 @@ class SpreadingActivation:
         self._exact_entities = set()
         self._entity_terms = []
         self._substr_match_cache = {}
+        self._token_index = defaultdict(list)
 
     def _index_entity_node(self, entity: str, node_id: str) -> None:
         """Index a new entity node for exact, partial, and substring seeding."""
@@ -247,6 +253,13 @@ class SpreadingActivation:
             self._exact_entities.add(entity)
             self._entity_terms.append(entity)
             self._substr_match_cache.clear()
+
+            # Build token-level index for fast substring matching.
+            # Tokens are alphanumeric runs from the entity label.
+            for tok in _TOKEN_RE.findall(entity):
+                tok_lower = tok.lower()
+                if tok_lower != entity and len(tok_lower) >= 2:
+                    self._token_index[tok_lower].append(entity)
 
         for word in entity.split():
             if word != entity and word not in _STOPWORDS:
@@ -296,21 +309,25 @@ class SpreadingActivation:
                 self._entity_edge_positions[src_idx].append(pos)
 
     def _substring_seed_nodes(self, word: str) -> List[str]:
-        """Return entity node IDs whose exact labels contain the query term."""
+        """Return entity node IDs whose exact labels contain the query term.
+
+        Uses token index for O(1) lookup of word-boundary matches.
+        This covers the vast majority of useful substring hits (date
+        components, name parts, compound terms). True arbitrary
+        substring matches (e.g. "loss" in "dataloss") are not indexed
+        but are rare in practice.
+        """
         cached = self._substr_match_cache.get(word)
         if cached is not None:
             return cached
 
         matches = []
         seen = set()
-        for entity in self._entity_terms:
-            if word == entity or word not in entity:
-                continue
+        for entity in self._token_index.get(word, []):
             for node_id in self._entity_index.get(entity, []):
-                if node_id in seen:
-                    continue
-                seen.add(node_id)
-                matches.append(node_id)
+                if node_id not in seen:
+                    seen.add(node_id)
+                    matches.append(node_id)
 
         self._substr_match_cache[word] = matches
         return matches
@@ -987,6 +1004,12 @@ class SpreadingActivation:
         sa._exact_entities = set(sa.entity_freq.keys())
         sa._entity_terms = list(sa._exact_entities)
         sa._substr_match_cache = {}
+        sa._token_index = defaultdict(list)
+        for entity in sa._entity_terms:
+            for tok in _TOKEN_RE.findall(entity):
+                tok_lower = tok.lower()
+                if tok_lower != entity and len(tok_lower) >= 2:
+                    sa._token_index[tok_lower].append(entity)
         sa._is_bipartite = data.get('is_bipartite', True)
         sa._built = True
         return sa
@@ -1021,6 +1044,12 @@ class SpreadingActivation:
         sa._exact_entities = set(sa.entity_freq.keys())
         sa._entity_terms = list(sa._exact_entities)
         sa._substr_match_cache = {}
+        sa._token_index = defaultdict(list)
+        for entity in sa._entity_terms:
+            for tok in _TOKEN_RE.findall(entity):
+                tok_lower = tok.lower()
+                if tok_lower != entity and len(tok_lower) >= 2:
+                    sa._token_index[tok_lower].append(entity)
         # Legacy networkx graphs may not be bipartite -- check
         sa._is_bipartite = all(
             sa._adj.indptr[idx] == sa._adj.indptr[idx + 1]
