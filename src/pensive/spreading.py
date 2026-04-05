@@ -88,8 +88,45 @@ if _HAS_NUMBA:
                 if val > result[nbr]:
                     result[nbr] = val
         return result
+
+    @numba.njit(cache=True)
+    def _numba_spread_and_collect(act_indices, act_scores, indptr, indices,
+                                   data, decay, threshold, n, node_type_arr,
+                                   value_type):
+        """Spread + collect value nodes in one kernel (avoids numpy round-trip)."""
+        result = np.zeros(n, dtype=np.float32)
+        for k in range(len(act_indices)):
+            idx = act_indices[k]
+            score = act_scores[k]
+            decayed = score * decay
+            if decayed > result[idx]:
+                result[idx] = decayed
+            if score < threshold:
+                continue
+            row_start = indptr[idx]
+            row_end = indptr[idx + 1]
+            for j in range(row_start, row_end):
+                val = score * decay * data[j]
+                nbr = indices[j]
+                if val > result[nbr]:
+                    result[nbr] = val
+        # Collect value nodes above threshold in one pass
+        count = 0
+        for i in range(n):
+            if result[i] >= threshold and node_type_arr[i] == value_type:
+                count += 1
+        nz_idx = np.empty(count, dtype=np.int64)
+        nz_scores = np.empty(count, dtype=np.float32)
+        pos = 0
+        for i in range(n):
+            if result[i] >= threshold and node_type_arr[i] == value_type:
+                nz_idx[pos] = i
+                nz_scores[pos] = result[i]
+                pos += 1
+        return nz_idx, nz_scores
 else:
     _numba_spread_bipartite = None
+    _numba_spread_and_collect = None
 
 
 @dataclass
@@ -821,6 +858,101 @@ class SpreadingActivation:
             np.maximum.at(result, nbrs, score * decay * weights)
         return result
 
+    def _spread_and_collect_bipartite(self, activations: Dict[int, float],
+                                       top_k: int) -> List[Tuple[str, float]]:
+        """Combined spread + collect for bipartite graphs.
+
+        When numba is available, runs the spread and value-node collection
+        in a single JIT kernel, avoiding the numpy round-trip (~20% faster).
+        """
+        indptr = self._adj.indptr
+        indices = self._adj.indices
+        data = self._adj.data
+        decay = self.config.decay
+        threshold = self.config.threshold
+        n = len(self._idx_to_node)
+
+        if _numba_spread_and_collect is not None:
+            n_act = len(activations)
+            act_indices = np.fromiter(activations.keys(), dtype=np.int64, count=n_act)
+            act_scores = np.fromiter(activations.values(), dtype=np.float32, count=n_act)
+            nz_global, nz_scores = _numba_spread_and_collect(
+                act_indices, act_scores, indptr, indices, data,
+                np.float32(decay), np.float32(threshold), n,
+                self._node_type_arr, np.int8(_VALUE_TYPE),
+            )
+        else:
+            result = self._spread_bipartite_raw(activations)
+            nz_all = np.flatnonzero(result >= threshold)
+            if len(nz_all) == 0:
+                return []
+            is_value = self._node_type_arr[nz_all] == _VALUE_TYPE
+            nz_global = nz_all[is_value]
+            if len(nz_global) == 0:
+                return []
+            nz_scores = result[nz_global]
+
+        if len(nz_global) == 0:
+            return []
+
+        k = min(top_k, len(nz_global))
+        if k >= len(nz_global):
+            top_idx = np.argsort(nz_scores)[::-1]
+        else:
+            top_idx = np.argpartition(nz_scores, -k)[-k:]
+            top_idx = top_idx[np.argsort(nz_scores[top_idx])[::-1]]
+
+        return [(self._node_label[nz_global[i]], float(nz_scores[i])) for i in top_idx]
+
+    def _spread_and_collect_bipartite_with_ids(
+        self, activations: Dict[int, float], top_k: int
+    ) -> List[Tuple[str, str, float]]:
+        """Like _spread_and_collect_bipartite but returns (doc_id, value, score)."""
+        indptr = self._adj.indptr
+        indices = self._adj.indices
+        data = self._adj.data
+        decay = self.config.decay
+        threshold = self.config.threshold
+        n = len(self._idx_to_node)
+
+        if _numba_spread_and_collect is not None:
+            n_act = len(activations)
+            act_indices = np.fromiter(activations.keys(), dtype=np.int64, count=n_act)
+            act_scores = np.fromiter(activations.values(), dtype=np.float32, count=n_act)
+            nz_global, nz_scores = _numba_spread_and_collect(
+                act_indices, act_scores, indptr, indices, data,
+                np.float32(decay), np.float32(threshold), n,
+                self._node_type_arr, np.int8(_VALUE_TYPE),
+            )
+        else:
+            result = self._spread_bipartite_raw(activations)
+            nz_all = np.flatnonzero(result >= threshold)
+            if len(nz_all) == 0:
+                return []
+            is_value = self._node_type_arr[nz_all] == _VALUE_TYPE
+            nz_global = nz_all[is_value]
+            if len(nz_global) == 0:
+                return []
+            nz_scores = result[nz_global]
+
+        if len(nz_global) == 0:
+            return []
+
+        k = min(top_k, len(nz_global))
+        if k >= len(nz_global):
+            top_idx = np.argsort(nz_scores)[::-1]
+        else:
+            top_idx = np.argpartition(nz_scores, -k)[-k:]
+            top_idx = top_idx[np.argsort(nz_scores[top_idx])[::-1]]
+
+        results = []
+        for i in top_idx:
+            idx = nz_global[i]
+            node_id = self._idx_to_node[idx]
+            doc_id = node_id[2:] if node_id.startswith('v:') else node_id
+            results.append((doc_id, self._node_label[idx], float(nz_scores[i])))
+        return results
+
     def _collect_from_array(self, result: np.ndarray, top_k: int
                             ) -> List[Tuple[str, float]]:
         """Collect top-k value nodes directly from a numpy score array.
@@ -909,11 +1041,10 @@ class SpreadingActivation:
                  if len(w) >= 2]
         query_act = self._seed_from_words(words)
 
-        # Fast path: bipartite without context skips dict round-trip
+        # Fast path: bipartite without context uses combined kernel
         if self._is_bipartite and not context and self.config.max_hops >= 1:
             self._compile()
-            result_arr = self._spread_bipartite_raw(query_act)
-            return self._collect_from_array(result_arr, top_k)
+            return self._spread_and_collect_bipartite(query_act, top_k)
 
         query_act = self._spread(query_act)
 
@@ -952,11 +1083,10 @@ class SpreadingActivation:
                  if len(w) >= 2]
         query_act = self._seed_from_words(words)
 
-        # Fast path: bipartite without context skips dict round-trip
+        # Fast path: bipartite without context uses combined kernel
         if self._is_bipartite and not context and self.config.max_hops >= 1:
             self._compile()
-            result_arr = self._spread_bipartite_raw(query_act)
-            return self._collect_from_array_with_ids(result_arr, top_k)
+            return self._spread_and_collect_bipartite_with_ids(query_act, top_k)
 
         query_act = self._spread(query_act)
 
