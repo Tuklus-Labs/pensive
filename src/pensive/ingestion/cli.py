@@ -40,6 +40,7 @@ def cmd_build(args):
         YouTubeCommentsParser,
         GoogleMapsParser,
     )
+    from .parsers.email import EmailJSONLParser
 
     chunker = SentenceAwareChunker(target_size=args.chunk_size)
     parsers = []
@@ -47,11 +48,14 @@ def cmd_build(args):
     if args.chatgpt:
         parsers.append(ChatGPTParser(args.chatgpt, chunker=chunker))
     if args.facebook:
-        parsers.append(FacebookParser(args.facebook, chunker=chunker))
+        for fb_dir in args.facebook:
+            parsers.append(FacebookParser(fb_dir, chunker=chunker))
     if args.google:
         parsers.append(GoogleCalendarParser(args.google))
         parsers.append(YouTubeCommentsParser(args.google))
         parsers.append(GoogleMapsParser(args.google))
+    if args.email:
+        parsers.append(EmailJSONLParser(args.email, chunker=chunker))
 
     if not parsers:
         print("No data sources specified. Use --chatgpt, --facebook, or --google.")
@@ -129,8 +133,9 @@ def main():
     # build
     build_p = sub.add_parser('build', help='Build SA graph from data sources')
     build_p.add_argument('--chatgpt', help='Path to chatgpt-export/ directory')
-    build_p.add_argument('--facebook', help='Path to Facebook export directory')
+    build_p.add_argument('--facebook', action='append', help='Path to Facebook export directory (can specify multiple)')
     build_p.add_argument('--google', help='Path to Google Takeout/ directory')
+    build_p.add_argument('--email', help='Path to email JSONL file or directory')
     build_p.add_argument('-o', '--output', required=True,
                         help='Output graph pickle path')
     build_p.add_argument('--chunk-size', type=int, default=800,

@@ -149,7 +149,14 @@ class BM25Index:
             return []
 
         scores = self.bm25.get_scores(query_tokens)
-        top_indices = np.argsort(scores)[::-1][:top_k]
+
+        # Use argpartition for O(n) partial sort when top_k << n
+        n = len(scores)
+        if top_k < n:
+            part_idx = np.argpartition(scores, -top_k)[-top_k:]
+            top_indices = part_idx[np.argsort(scores[part_idx])[::-1]]
+        else:
+            top_indices = np.argsort(scores)[::-1]
 
         results = []
         for rank, idx in enumerate(top_indices, start=1):
@@ -224,18 +231,25 @@ class HybridSearcher:
         return self.bm25_index.size
 
 
+_ID_HEX = re.compile(r'0x[0-9a-f]+')
+_ID_SUBSYSTEM = re.compile(r'(?:subsystem|system|unit|module|sector|node)\s*[#]?(\d+)')
+_ID_ERROR = re.compile(r'(?:error|err|fault|code)\s*[#:-]?\s*([0-9a-fx]+)')
+_ID_NUMERIC = re.compile(r'\b\d{3,}\b')
+_ID_VERSION = re.compile(r'v\d+(?:\.\d+)+')
+
+
 def extract_identifiers(text: str) -> Set[str]:
     """Extract potential identifiers (hex codes, subsystem refs, error codes, versions)."""
     identifiers = set()
     text_lower = text.lower()
 
-    identifiers.update(re.findall(r'0x[0-9a-f]+', text_lower))
-    for match in re.findall(r'(?:subsystem|system|unit|module|sector|node)\s*[#]?(\d+)', text_lower):
+    identifiers.update(_ID_HEX.findall(text_lower))
+    for match in _ID_SUBSYSTEM.findall(text_lower):
         identifiers.add(match)
-    for match in re.findall(r'(?:error|err|fault|code)\s*[#:-]?\s*([0-9a-fx]+)', text_lower):
+    for match in _ID_ERROR.findall(text_lower):
         identifiers.add(match)
-    identifiers.update(re.findall(r'\b\d{3,}\b', text_lower))
-    identifiers.update(re.findall(r'v\d+(?:\.\d+)+', text_lower))
+    identifiers.update(_ID_NUMERIC.findall(text_lower))
+    identifiers.update(_ID_VERSION.findall(text_lower))
 
     return identifiers
 
