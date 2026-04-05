@@ -145,8 +145,8 @@ class ParallelHybrid:
         sa_by_id = {r['doc_id']: r for r in sa_results}
         l2_by_id = {r['doc_id']: r for r in l2_results}
 
-        # Merge with agreement boosting
-        all_ids = set(sa_by_id.keys()) | set(l2_by_id.keys())
+        # Merge with agreement boosting (dict_keys supports | natively)
+        all_ids = sa_by_id.keys() | l2_by_id.keys()
 
         candidates = []
         for doc_id in all_ids:

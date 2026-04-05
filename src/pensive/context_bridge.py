@@ -12,7 +12,7 @@ Sources of context:
 """
 import itertools
 import re
-from collections import defaultdict
+from collections import defaultdict, deque
 from typing import List, Optional, Protocol, runtime_checkable
 
 try:
@@ -129,8 +129,7 @@ class L1ContextBridge:
         try:
             recent = self.l1.recent_queries
             # Take the last N values without materializing all values.
-            # collections.deque with maxlen consumes the iterator keeping only the tail.
-            from collections import deque
+            # deque with maxlen consumes the iterator keeping only the tail.
             tail = deque(recent.values(), maxlen=self.recent_window)
             for entry in reversed(tail):
                 response_text = ''

@@ -644,9 +644,11 @@ class SpreadingActivation:
         n = len(self._idx_to_node)
 
         if _numba_spread_bipartite is not None:
-            # Convert activations dict to arrays for the JIT kernel
-            act_indices = np.array(list(activations.keys()), dtype=np.int64)
-            act_scores = np.array(list(activations.values()), dtype=np.float32)
+            # Convert activations dict to arrays for the JIT kernel.
+            # np.fromiter with count avoids intermediate Python list objects.
+            n_act = len(activations)
+            act_indices = np.fromiter(activations.keys(), dtype=np.int64, count=n_act)
+            act_scores = np.fromiter(activations.values(), dtype=np.float32, count=n_act)
             result = _numba_spread_bipartite(
                 act_indices, act_scores, indptr, indices, data,
                 np.float32(decay), np.float32(threshold), n,
@@ -770,8 +772,9 @@ class SpreadingActivation:
         n = len(self._idx_to_node)
 
         if _numba_spread_bipartite is not None:
-            act_indices = np.array(list(activations.keys()), dtype=np.int64)
-            act_scores = np.array(list(activations.values()), dtype=np.float32)
+            n_act = len(activations)
+            act_indices = np.fromiter(activations.keys(), dtype=np.int64, count=n_act)
+            act_scores = np.fromiter(activations.values(), dtype=np.float32, count=n_act)
             return _numba_spread_bipartite(
                 act_indices, act_scores, indptr, indices, data,
                 np.float32(decay), np.float32(threshold), n,
