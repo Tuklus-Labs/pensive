@@ -60,23 +60,21 @@ class MegaExtractor:
         """
         results = []
 
-        # Fast path: literal word lookups (case-insensitive)
+        # Fast path: literal word lookups (single scan for both CI and CS)
         ci_literals = self._ci_literal_words
-        if ci_literals:
-            for m in _WORD_RE.finditer(text):
-                wl = m.group().lower()
-                etype = ci_literals.get(wl)
-                if etype is not None:
-                    results.append((wl, etype))
-
-        # Fast path: literal word lookups (case-sensitive)
         cs_literals = self._cs_literal_words
-        if cs_literals:
+        if ci_literals or cs_literals:
             for m in _WORD_RE.finditer(text):
                 w = m.group()
-                etype = cs_literals.get(w)
-                if etype is not None:
-                    results.append((w.lower(), etype))
+                wl = w.lower()
+                if ci_literals:
+                    etype = ci_literals.get(wl)
+                    if etype is not None:
+                        results.append((wl, etype))
+                if cs_literals:
+                    etype = cs_literals.get(w)
+                    if etype is not None:
+                        results.append((wl, etype))
 
         # Regex path for complex patterns
         ci_regex = self._ci_regex
@@ -104,20 +102,19 @@ class MegaExtractor:
         results = []
 
         ci_literals = self._ci_literal_words
-        if ci_literals:
-            for m in _WORD_RE.finditer(text):
-                w = m.group()
-                etype = ci_literals.get(w.lower())
-                if etype is not None:
-                    results.append((w.lower(), etype, w))
-
         cs_literals = self._cs_literal_words
-        if cs_literals:
+        if ci_literals or cs_literals:
             for m in _WORD_RE.finditer(text):
                 w = m.group()
-                etype = cs_literals.get(w)
-                if etype is not None:
-                    results.append((w.lower(), etype, w))
+                wl = w.lower()
+                if ci_literals:
+                    etype = ci_literals.get(wl)
+                    if etype is not None:
+                        results.append((wl, etype, w))
+                if cs_literals:
+                    etype = cs_literals.get(w)
+                    if etype is not None:
+                        results.append((wl, etype, w))
 
         for regex, etype_map in ((self._ci_regex, self._ci_etype_map),
                                   (self._cs_regex, self._cs_etype_map)):
@@ -140,20 +137,21 @@ class MegaExtractor:
         all_spans = []
 
         ci_literals = self._ci_literal_words
-        if ci_literals:
-            for m in _WORD_RE.finditer(text):
-                w = m.group()
-                etype = ci_literals.get(w.lower())
-                if etype is not None:
-                    all_spans.append((m.start(), m.end(), w.lower(), etype))
-
         cs_literals = self._cs_literal_words
-        if cs_literals:
+        if ci_literals or cs_literals:
             for m in _WORD_RE.finditer(text):
                 w = m.group()
-                etype = cs_literals.get(w)
-                if etype is not None:
-                    all_spans.append((m.start(), m.end(), w.lower(), etype))
+                wl = w.lower()
+                start = m.start()
+                end = m.end()
+                if ci_literals:
+                    etype = ci_literals.get(wl)
+                    if etype is not None:
+                        all_spans.append((start, end, wl, etype))
+                if cs_literals:
+                    etype = cs_literals.get(w)
+                    if etype is not None:
+                        all_spans.append((start, end, wl, etype))
 
         # finditer returns matches in text order, so each list is pre-sorted.
         # Merge two sorted lists in O(n) instead of sorting O(n log n).

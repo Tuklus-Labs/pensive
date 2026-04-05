@@ -109,9 +109,16 @@ class PatternLearner:
             text = getattr(result, 'summary', str(result))
             result_terms = self._extract_candidates(text)
             # Terms that appear in both query and results are good candidates
-            for term in candidates:
-                if term in result_terms or any(term in rt for rt in result_terms):
-                    self.candidate_counts[term] += 1
+            # Fast path: exact set intersection covers most matches
+            exact_hits = candidates & result_terms
+            for term in exact_hits:
+                self.candidate_counts[term] += 1
+            # Slow path: substring check only for remaining candidates
+            remaining = candidates - exact_hits
+            if remaining and result_terms:
+                for term in remaining:
+                    if any(term in rt for rt in result_terms):
+                        self.candidate_counts[term] += 1
 
         # Learn candidates that meet threshold
         for term in candidates:
@@ -140,19 +147,24 @@ class PatternLearner:
 
         return newly_learned
 
-    _WORD_RE = re.compile(r'\b[a-zA-Z]+\b')
+    _WORD_RE = re.compile(r'[a-zA-Z]+')
 
     def _extract_candidates(self, text: str) -> Set[str]:
-        """Extract candidate entity terms from text in a single pass."""
+        """Extract candidate entity terms from text in a single pass.
+
+        Uses finditer to avoid materializing a full word list, and
+        lowercases per-word instead of copying the entire input string.
+        """
         candidates = set()
         min_len = self.config.min_term_length
         min_bigram = min_len * 2
-        words = self._WORD_RE.findall(text.lower())
+        stopwords = _STOPWORDS
 
         prev_word = None
         prev_ok = False
-        for word in words:
-            ok = word not in _STOPWORDS and len(word) >= min_len
+        for m in self._WORD_RE.finditer(text):
+            word = m.group().lower()
+            ok = len(word) >= min_len and word not in stopwords
             if ok:
                 candidates.add(word)
             if prev_ok and ok:

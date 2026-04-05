@@ -127,10 +127,14 @@ def _init_worker(extractor):
 def _extract_chunk(chunk):
     """Worker function for multiprocessing entity extraction."""
     extract = _worker_extractor.extract
-    return [(doc, extract(
-        doc['content'] if 'query' not in doc
-        else doc['content'] + ' ' + doc['query']
-    )) for doc in chunk]
+    results = []
+    for doc in chunk:
+        text = doc['content']
+        query = doc.get('query')
+        if query:
+            text = text + ' ' + query
+        results.append((doc, extract(text)))
+    return results
 
 
 class SpreadingActivation:
