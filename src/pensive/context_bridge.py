@@ -16,8 +16,11 @@ from typing import List, Optional, Protocol, runtime_checkable
 
 try:
     from .patterns import REAL_DATA_PATTERNS
+    from .mega_extract import MegaExtractor
+    _CONTEXT_EXTRACTOR = MegaExtractor(REAL_DATA_PATTERNS)
 except ImportError:
     REAL_DATA_PATTERNS = None
+    _CONTEXT_EXTRACTOR = None
 
 
 @runtime_checkable
@@ -33,17 +36,23 @@ class L1CacheLike(Protocol):
 
 
 def _extract_entities_from_text(text: str) -> List[str]:
-    """Extract entity strings from free text using the pattern registry."""
-    patterns = REAL_DATA_PATTERNS
-    if patterns is None:
-        # Fallback if import failed
-        patterns = [
-            (r'\b(\d{4}-\d{2}-\d{2})\b', 'date', True),
-            (r'\b(\d+(?:ms|MB|GB|%|people))\b', 'metric', True),
-            (r'\b([A-Z]-\d{2,4})\b', 'room', False),
-            (r'\b(prod-[a-z0-9-]+|gateway-[a-z0-9-]+)\b', 'server', True),
-            (r'\b([A-Z][a-z]+(?:\s+[A-Z][a-z]+))\b', 'person', False),
-        ]
+    """Extract entity strings from free text using the MegaExtractor.
+
+    Uses the pre-compiled mega-regex for 2-pass extraction instead of
+    N individual re.findall calls.
+    """
+    if _CONTEXT_EXTRACTOR is not None:
+        return list({label for label, _etype in _CONTEXT_EXTRACTOR.extract(text)
+                     if len(label) >= 2})
+
+    # Fallback if MegaExtractor unavailable
+    patterns = [
+        (r'\b(\d{4}-\d{2}-\d{2})\b', 'date', True),
+        (r'\b(\d+(?:ms|MB|GB|%|people))\b', 'metric', True),
+        (r'\b([A-Z]-\d{2,4})\b', 'room', False),
+        (r'\b(prod-[a-z0-9-]+|gateway-[a-z0-9-]+)\b', 'server', True),
+        (r'\b([A-Z][a-z]+(?:\s+[A-Z][a-z]+))\b', 'person', False),
+    ]
     entities = set()
     for pat, _etype, ci in patterns:
         flags = re.IGNORECASE if ci else 0
