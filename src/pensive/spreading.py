@@ -1092,8 +1092,9 @@ class SpreadingActivation:
             src_idx = sa._node_to_idx[src]
             dst_idx = sa._node_to_idx[dst]
             weight = ed.get('weight', 1.0)
-            sa._add_edge(src_idx, dst_idx, weight)
+            sa._add_edge_fast(src_idx, dst_idx, weight)
 
+        sa._dirty = True
         sa._compile()
 
         sa.entity_freq = defaultdict(int, data.get('entity_freq', {}))
