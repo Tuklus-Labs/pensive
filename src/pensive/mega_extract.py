@@ -45,11 +45,8 @@ class MegaExtractor:
             if regex is None:
                 continue
             for m in regex.finditer(text):
-                groups = m.groups()
-                for i, g in enumerate(groups):
-                    if g is not None:
-                        results.append((g.lower(), etype_map[i]))
-                        break
+                gi = m.lastindex
+                results.append((m.group(gi).lower(), etype_map[gi - 1]))
         return results
 
     def extract_with_raw(self, text: str) -> List[Tuple[str, str, str]]:
@@ -64,11 +61,9 @@ class MegaExtractor:
             if regex is None:
                 continue
             for m in regex.finditer(text):
-                groups = m.groups()
-                for i, g in enumerate(groups):
-                    if g is not None:
-                        results.append((g.lower(), etype_map[i], g))
-                        break
+                gi = m.lastindex
+                g = m.group(gi)
+                results.append((g.lower(), etype_map[gi - 1], g))
         return results
 
     def extract_with_spans(self, text: str) -> List[Tuple[int, int, str, str]]:
@@ -84,13 +79,9 @@ class MegaExtractor:
             if regex is None:
                 continue
             for m in regex.finditer(text):
-                groups = m.groups()
-                for i, g in enumerate(groups):
-                    if g is not None:
-                        start = m.start(i + 1)
-                        end = m.end(i + 1)
-                        results.append((start, end, g.lower(), etype_map[i]))
-                        break
+                gi = m.lastindex
+                g = m.group(gi)
+                results.append((m.start(gi), m.end(gi), g.lower(), etype_map[gi - 1]))
         results.sort(key=lambda r: r[0])
         return results
 

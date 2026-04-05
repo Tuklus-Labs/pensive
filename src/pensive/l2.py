@@ -216,7 +216,12 @@ class L2Handler:
         candidate_doc_ids: List[str],
         top_k: Optional[int] = None,
     ) -> List[L2Result]:
-        """Run FAISS search over a candidate subset (typically L1 hits)."""
+        """Rerank a candidate subset by semantic similarity.
+
+        For small candidate sets (typical L1 output of ~30 docs), uses
+        direct numpy dot product instead of creating a temporary FAISS
+        index, avoiding index construction overhead.
+        """
         top_k = top_k or self.config.max_results
         if not candidate_doc_ids:
             return []
@@ -246,7 +251,24 @@ class L2Handler:
             if not faiss_ids:
                 return []
 
-            query_emb = self._encode([query_text])
+            query_emb = self._encode([query_text])[0]
+
+            # For small candidate sets, numpy dot product beats FAISS
+            # index creation overhead. Threshold at 1000 candidates.
+            if len(faiss_ids) < 1000:
+                emb_matrix = np.vstack(embs).astype(np.float32)
+                scores = emb_matrix @ query_emb
+                k = min(top_k, len(faiss_ids))
+                if k >= len(scores):
+                    top_indices = np.argsort(scores)[::-1][:k]
+                else:
+                    top_indices = np.argpartition(scores, -k)[-k:]
+                    top_indices = top_indices[np.argsort(scores[top_indices])[::-1]]
+                result_ids = [faiss_ids[i] for i in top_indices]
+                result_scores = scores[top_indices]
+                return self._results_from_ids(result_ids, result_scores)
+
+            # For large candidate sets, use FAISS
             local = self._faiss.IndexFlatIP(self._dim)
             local_id_map = self._faiss.IndexIDMap2(local)
             local_id_map.add_with_ids(
@@ -255,7 +277,7 @@ class L2Handler:
             )
 
             k = min(top_k, len(faiss_ids))
-            scores, ids = local_id_map.search(query_emb, k)
+            scores, ids = local_id_map.search(query_emb.reshape(1, -1), k)
             return self._results_from_ids(ids[0], scores[0])
 
     def _results_from_ids(self, ids, scores) -> List[L2Result]:

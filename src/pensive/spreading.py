@@ -11,6 +11,7 @@ Usage:
     sa.build(documents)  # List of dicts with 'content', 'id', 'value' keys
     results = sa.query("What was the P99 latency on 2025-10-08?")
 """
+import heapq
 from collections import defaultdict
 from dataclasses import dataclass, field
 from typing import Dict, Iterable, List, Optional, Tuple
@@ -127,6 +128,7 @@ class SpreadingActivation:
         self._entity_terms: List[str] = []
         self._substr_match_cache: Dict[str, List[str]] = {}
         self._built = False
+        self._is_bipartite = True  # True until proven otherwise
         self._context_provider = None
         self._extractor = MegaExtractor(self.patterns)
 
@@ -184,6 +186,7 @@ class SpreadingActivation:
         self._entity_edge_positions = defaultdict(list)
         self._adj = None
         self._dirty = True
+        self._is_bipartite = True
         self.entity_freq = defaultdict(int)
         self._entity_index = defaultdict(list)
         self._exact_entities = set()
@@ -416,20 +419,21 @@ class SpreadingActivation:
         if workers is None:
             workers = min(mp.cpu_count(), 16)
 
-        if workers <= 1 or len(documents) < 10_000:
+        if workers <= 1 or len(documents) < 2_000:
             return self.build(documents)
 
         # Reset
         self._reset_graph_state()
 
-        # Chunk documents for workers
-        chunk_size = max(1000, len(documents) // workers)
+        # Scale workers to doc count to avoid fork overhead dominating
+        effective_workers = min(workers, max(2, len(documents) // 1000))
+        chunk_size = max(500, len(documents) // effective_workers)
         chunks = [documents[i:i + chunk_size]
                   for i in range(0, len(documents), chunk_size)]
 
         # Use fork context to share parent's compiled regexes with workers
         ctx = mp.get_context('fork')
-        with ctx.Pool(workers, initializer=_init_worker,
+        with ctx.Pool(effective_workers, initializer=_init_worker,
                       initargs=(self._extractor,)) as pool:
             chunk_results = pool.map(_extract_chunk, chunks)
 
@@ -511,10 +515,76 @@ class SpreadingActivation:
 
     def _spread(self, activations: Dict[int, float],
                 hops: Optional[int] = None) -> Dict[int, float]:
-        """Run spreading activation for N hops."""
+        """Run spreading activation for N hops.
+
+        For bipartite graphs (entity->value only, which is the default
+        build() structure), uses a vectorized single-hop path since
+        hops 2+ just apply uniform decay without changing rankings.
+        """
         self._compile()
 
         hops = hops if hops is not None else self.config.max_hops
+
+        if self._is_bipartite and hops >= 1:
+            return self._spread_bipartite(activations)
+
+        return self._spread_general(activations, hops)
+
+    def _spread_bipartite(self, activations: Dict[int, float]) -> Dict[int, float]:
+        """Vectorized single-hop spread for bipartite entity->value graphs.
+
+        Since value nodes have zero outgoing edges, only hop 1 produces
+        new activations. Extra hops just multiply all scores by decay,
+        preserving relative ordering. This method does exactly 1 productive
+        hop using per-node numpy scatter-max for neighbor propagation.
+        """
+        indptr = self._adj.indptr
+        indices = self._adj.indices
+        data = self._adj.data
+        decay = self.config.decay
+        threshold = self.config.threshold
+        max_active = self.config.max_active
+
+        n = len(self._idx_to_node)
+        result = np.zeros(n, dtype=np.float32)
+
+        # Retain decayed seed activation and spread to neighbors
+        for idx, score in activations.items():
+            decayed = score * decay
+            if decayed > result[idx]:
+                result[idx] = decayed
+
+            if score < threshold:
+                continue
+
+            row_start = indptr[idx]
+            row_end = indptr[idx + 1]
+            if row_start == row_end:
+                continue
+
+            nbrs = indices[row_start:row_end]
+            weights = data[row_start:row_end]
+            np.maximum.at(result, nbrs, score * decay * weights)
+
+        # Threshold filter + top-k pruning
+        active_mask = result >= threshold
+        final_idx = np.flatnonzero(active_mask)
+
+        if len(final_idx) == 0:
+            return {}
+
+        final_scores = result[final_idx]
+
+        if len(final_idx) > max_active:
+            top_k = np.argpartition(final_scores, -max_active)[-max_active:]
+            final_idx = final_idx[top_k]
+            final_scores = final_scores[top_k]
+
+        return {int(i): float(s) for i, s in zip(final_idx, final_scores)}
+
+    def _spread_general(self, activations: Dict[int, float],
+                        hops: int) -> Dict[int, float]:
+        """General multi-hop spreading for non-bipartite graphs."""
         indptr = self._adj.indptr
         indices = self._adj.indices
         data = self._adj.data
@@ -550,28 +620,37 @@ class SpreadingActivation:
 
     def _collect_results(self, activations: Dict[int, float],
                          top_k: int) -> List[Tuple[str, float]]:
-        """Collect value nodes from activation map."""
-        results = []
-        for idx, score in sorted(activations.items(), key=lambda x: -x[1]):
-            if self._node_type[idx] == _VALUE_TYPE:
-                label = self._node_label[idx]
-                results.append((label, score))
-                if len(results) >= top_k:
-                    break
-        return results
+        """Collect value nodes from activation map.
+
+        Uses heapq.nlargest for O(n log k) instead of full sort O(n log n).
+        """
+        value_acts = [
+            (score, idx) for idx, score in activations.items()
+            if self._node_type[idx] == _VALUE_TYPE
+        ]
+        if not value_acts:
+            return []
+        top = heapq.nlargest(top_k, value_acts)
+        return [(self._node_label[idx], score) for score, idx in top]
 
     def _collect_results_with_ids(self, activations: Dict[int, float],
                                    top_k: int) -> List[Tuple[str, str, float]]:
-        """Collect value nodes with doc IDs from activation map."""
+        """Collect value nodes with doc IDs from activation map.
+
+        Uses heapq.nlargest for O(n log k) instead of full sort O(n log n).
+        """
+        value_acts = [
+            (score, idx) for idx, score in activations.items()
+            if self._node_type[idx] == _VALUE_TYPE
+        ]
+        if not value_acts:
+            return []
+        top = heapq.nlargest(top_k, value_acts)
         results = []
-        for idx, score in sorted(activations.items(), key=lambda x: -x[1]):
-            if self._node_type[idx] == _VALUE_TYPE:
-                node_id = self._idx_to_node[idx]
-                doc_id = node_id[2:] if node_id.startswith('v:') else node_id
-                label = self._node_label[idx]
-                results.append((doc_id, label, score))
-                if len(results) >= top_k:
-                    break
+        for score, idx in top:
+            node_id = self._idx_to_node[idx]
+            doc_id = node_id[2:] if node_id.startswith('v:') else node_id
+            results.append((doc_id, self._node_label[idx], score))
         return results
 
     def query(self, query_text: str, top_k: int = 10,
@@ -688,6 +767,7 @@ class SpreadingActivation:
             'adj_shape': self._adj.shape,
             'entity_freq': dict(self.entity_freq),
             'entity_index': dict(self._entity_index),
+            'is_bipartite': self._is_bipartite,
             'config': self.config,
             'patterns': self.patterns,
         }
@@ -731,6 +811,7 @@ class SpreadingActivation:
         sa._exact_entities = set(sa.entity_freq.keys())
         sa._entity_terms = list(sa._exact_entities)
         sa._substr_match_cache = {}
+        sa._is_bipartite = data.get('is_bipartite', True)
         sa._built = True
         return sa
 
@@ -764,5 +845,11 @@ class SpreadingActivation:
         sa._exact_entities = set(sa.entity_freq.keys())
         sa._entity_terms = list(sa._exact_entities)
         sa._substr_match_cache = {}
+        # Legacy networkx graphs may not be bipartite -- check
+        sa._is_bipartite = all(
+            sa._adj.indptr[idx] == sa._adj.indptr[idx + 1]
+            for idx in range(len(sa._idx_to_node))
+            if sa._node_type[idx] == _VALUE_TYPE
+        ) if sa._adj is not None and sa._adj.nnz > 0 else True
         sa._built = True
         return sa
