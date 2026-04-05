@@ -305,23 +305,29 @@ class SpreadingActivation:
             for entity, _ in entities:
                 self.entity_freq[entity] += 1
 
-        # Build graph with specificity weights
+        # Build graph with specificity weights (single pass per doc)
+        spec_power = self.config.spec_power
+        edge_weight = self.config.edge_weight
+        entity_freq = self.entity_freq
+        node_to_idx = self._node_to_idx
+
         for doc, entities in extracted:
             answer_node = f"v:{doc['id']}"
             ans_idx = self._get_or_add_node(
                 answer_node, _VALUE_TYPE, doc['value'], 0.0
             )
 
-            doc_entities = {}
+            seen_in_doc = set()
             for entity, etype in entities:
                 if len(entity) < 2:
                     continue
                 node_id = f"e:{etype}:{entity}"
-                specificity = 1.0 / (self.entity_freq[entity] ** self.config.spec_power)
-                doc_entities[node_id] = (entity, etype, specificity)
+                if node_id in seen_in_doc:
+                    continue
+                seen_in_doc.add(node_id)
 
-            for node_id, (entity, etype, specificity) in doc_entities.items():
-                is_new = node_id not in self._node_to_idx
+                specificity = 1.0 / (entity_freq[entity] ** spec_power)
+                is_new = node_id not in node_to_idx
                 ent_idx = self._get_or_add_node(
                     node_id, _ENTITY_TYPE, entity, specificity
                 )
@@ -331,7 +337,7 @@ class SpreadingActivation:
 
                 self._add_edge(
                     ent_idx, ans_idx,
-                    specificity * self.config.edge_weight
+                    specificity * edge_weight
                 )
 
         self._built = True
@@ -372,22 +378,28 @@ class SpreadingActivation:
         # Keep old edges consistent with the updated frequencies.
         self._refresh_specificity_for_entities(batch_counts.keys())
 
+        spec_power = self.config.spec_power
+        edge_weight = self.config.edge_weight
+        entity_freq = self.entity_freq
+        node_to_idx = self._node_to_idx
+
         for doc, entities in extracted:
             answer_node = f"v:{doc['id']}"
             ans_idx = self._get_or_add_node(
                 answer_node, _VALUE_TYPE, doc['value'], 0.0
             )
 
-            doc_entities = {}
+            seen_in_doc = set()
             for entity, etype in entities:
                 if len(entity) < 2:
                     continue
                 node_id = f"e:{etype}:{entity}"
-                specificity = 1.0 / (self.entity_freq[entity] ** self.config.spec_power)
-                doc_entities[node_id] = (entity, etype, specificity)
+                if node_id in seen_in_doc:
+                    continue
+                seen_in_doc.add(node_id)
 
-            for node_id, (entity, etype, specificity) in doc_entities.items():
-                is_new = node_id not in self._node_to_idx
+                specificity = 1.0 / (entity_freq[entity] ** spec_power)
+                is_new = node_id not in node_to_idx
                 ent_idx = self._get_or_add_node(
                     node_id, _ENTITY_TYPE, entity, specificity
                 )
@@ -397,7 +409,7 @@ class SpreadingActivation:
 
                 self._add_edge(
                     ent_idx, ans_idx,
-                    specificity * self.config.edge_weight
+                    specificity * edge_weight
                 )
 
         self._built = True
@@ -610,7 +622,7 @@ class SpreadingActivation:
 
             if len(new_act) > self.config.max_active:
                 new_act = dict(
-                    sorted(new_act.items(), key=lambda x: -x[1])[:self.config.max_active]
+                    heapq.nlargest(self.config.max_active, new_act.items(), key=lambda x: x[1])
                 )
 
             activations = {k: v for k, v in new_act.items()

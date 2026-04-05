@@ -140,28 +140,27 @@ class PatternLearner:
 
         return newly_learned
 
+    _WORD_RE = re.compile(r'\b[a-zA-Z]+\b')
+
     def _extract_candidates(self, text: str) -> Set[str]:
-        """Extract candidate entity terms from text."""
+        """Extract candidate entity terms from text in a single pass."""
         candidates = set()
+        min_len = self.config.min_term_length
+        min_bigram = min_len * 2
+        words = self._WORD_RE.findall(text.lower())
 
-        # Split into words, normalize
-        words = re.findall(r'\b[a-zA-Z]+\b', text.lower())
-
+        prev_word = None
+        prev_ok = False
         for word in words:
-            # Skip stopwords and short words
-            if word in _STOPWORDS:
-                continue
-            if len(word) < self.config.min_term_length:
-                continue
-
-            candidates.add(word)
-
-        # Also extract multi-word phrases (bigrams)
-        for i in range(len(words) - 1):
-            if words[i] not in _STOPWORDS and words[i+1] not in _STOPWORDS:
-                phrase = f"{words[i]} {words[i+1]}"
-                if len(phrase) >= self.config.min_term_length * 2:
+            ok = word not in _STOPWORDS and len(word) >= min_len
+            if ok:
+                candidates.add(word)
+            if prev_ok and ok:
+                phrase = f"{prev_word} {word}"
+                if len(phrase) >= min_bigram:
                     candidates.add(phrase)
+            prev_word = word
+            prev_ok = ok
 
         return candidates
 
@@ -232,32 +231,36 @@ def integrate_with_sa(sa, learner: PatternLearner):
     # Track directly seeded value nodes per query (cleared each query)
     _direct_value_seeds: Dict[str, float] = {}
 
+    # Pre-build index for all existing learned terms
+    if hasattr(sa, '_idx_to_node') and hasattr(sa, '_node_type'):
+        value_labels = []
+        value_nodes = []
+        for idx, node_id in enumerate(sa._idx_to_node):
+            if sa._node_type[idx] != 1:
+                continue
+            value_labels.append(sa._node_label[idx].lower())
+            value_nodes.append(node_id)
+
+        for term in learner.learned_entities:
+            matches = [node_id for label, node_id in zip(value_labels, value_nodes)
+                       if term in label]
+            _learned_term_index[term] = matches
+
     def _build_term_index(term: str) -> List[str]:
         """Build index for a learned term (one-time scan per term)."""
         if term in _learned_term_index:
             return _learned_term_index[term]
 
-        logger.info(f"Building index for learned term: '{term}'")
         matches = []
         if hasattr(sa, '_idx_to_node') and hasattr(sa, '_node_type'):
-            # Sparse graph implementation.
             for idx, node_id in enumerate(sa._idx_to_node):
                 if sa._node_type[idx] != 1:
                     continue
                 label = sa._node_label[idx].lower()
                 if term in label:
                     matches.append(node_id)
-        elif hasattr(sa, 'graph'):
-            # Legacy networkx implementation.
-            for node in sa.graph.nodes():
-                node_data = sa.graph.nodes[node]
-                if node_data.get('type') == 'value':
-                    label = node_data.get('label', '').lower()
-                    if term in label:
-                        matches.append(node)
 
         _learned_term_index[term] = matches
-        logger.info(f"Indexed '{term}': {len(matches)} matching documents")
         return matches
 
     def patched_seed(words: List[str]) -> Dict[int, float]:
