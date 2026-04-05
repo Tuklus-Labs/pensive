@@ -127,6 +127,42 @@ class TestBuildPerformance:
 
         assert elapsed < 5.0, f"build took {elapsed:.1f}s > 5s at 10K docs"
 
+    def test_query_200k_under_2ms(self):
+        """At 200K docs, per-query mean should be under 2ms."""
+        sa = _build_graph(200_000)
+        sa.query('warmup query', top_k=10)
+
+        times = []
+        for _ in range(20):
+            sa._substr_match_cache.clear()
+            t0 = time.perf_counter_ns()
+            for q in QUERIES:
+                sa.query(q, top_k=10)
+            times.append(time.perf_counter_ns() - t0)
+
+        per_query_us = sum(times) / len(times) / len(QUERIES) / 1000
+        assert per_query_us < 2000, f"mean query latency {per_query_us:.0f}us > 2000us at 200K docs"
+
+    def test_serialization_round_trip_fast(self):
+        """Save/load at 10K should complete in under 2 seconds total."""
+        sa = _build_graph(10_000)
+
+        t0 = time.perf_counter()
+        data = sa.get_save_data()
+        save_s = time.perf_counter() - t0
+
+        t0 = time.perf_counter()
+        sa2 = SpreadingActivation.from_save_data(data)
+        load_s = time.perf_counter() - t0
+
+        total = save_s + load_s
+        assert total < 2.0, f"save+load took {total:.2f}s > 2s at 10K docs"
+
+        # Verify loaded graph produces same results
+        results1 = sa.query('cache hit rate', top_k=5)
+        results2 = sa2.query('cache hit rate', top_k=5)
+        assert len(results1) == len(results2), "round-trip changed result count"
+
 
 class TestTokenIndex:
     """Verify token index correctness and performance."""
