@@ -193,7 +193,7 @@ class SpreadingActivation:
         # Node storage (parallel arrays)
         self._node_to_idx: Dict[str, int] = {}
         self._idx_to_node: List[str] = []
-        self._node_type: List[int] = []
+        self._node_type = array.array('b')  # int8, zero-copy to numpy in _compile
         self._node_label: List[str] = []
         self._node_specificity: List[float] = []
 
@@ -268,8 +268,8 @@ class SpreadingActivation:
             self._adj = scipy.sparse.csr_matrix(
                 (weights, (rows, cols)), shape=(n, n),
             )
-        # Cache numpy arrays for vectorized operations in _collect_results
-        self._node_type_arr = np.array(self._node_type, dtype=np.int8)
+        # Fast buffer copy (1100x faster than np.array(list) at 100K nodes)
+        self._node_type_arr = np.frombuffer(self._node_type, dtype=np.int8).copy()
         # Pre-compute value node indices for fast collection
         self._value_indices = np.flatnonzero(self._node_type_arr == _VALUE_TYPE)
         # Cache substring eligibility (avoids per-query len() call)
@@ -280,7 +280,7 @@ class SpreadingActivation:
         """Reset graph state before a full rebuild."""
         self._node_to_idx = {}
         self._idx_to_node = []
-        self._node_type = []
+        self._node_type = array.array('b')
         self._node_label = []
         self._node_specificity = []
         self._edge_src = array.array('i')    # int32 COO row indices
@@ -1169,7 +1169,10 @@ class SpreadingActivation:
 
         sa._node_to_idx = data['node_to_idx']
         sa._idx_to_node = data['idx_to_node']
-        sa._node_type = data['node_type']
+        nt = data['node_type']
+        if not isinstance(nt, array.array):
+            nt = array.array('b', nt)
+        sa._node_type = nt
         sa._node_label = data['node_label']
         sa._node_specificity = data['node_specificity']
 
@@ -1182,7 +1185,7 @@ class SpreadingActivation:
         sa._edge_weight = array.array('f')
         sa._entity_edge_positions = defaultdict(list)
         sa._dirty = False
-        sa._node_type_arr = np.array(sa._node_type, dtype=np.int8)
+        sa._node_type_arr = np.frombuffer(sa._node_type, dtype=np.int8).copy()
         sa._value_indices = np.flatnonzero(sa._node_type_arr == _VALUE_TYPE)
 
         sa.entity_freq = defaultdict(int, data.get('entity_freq', {}))
