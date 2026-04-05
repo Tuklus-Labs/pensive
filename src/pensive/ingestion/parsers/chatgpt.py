@@ -25,6 +25,10 @@ logger = logging.getLogger(__name__)
 # Content types that represent internal model reasoning, not user-facing text.
 _SKIP_CONTENT_TYPES = frozenset({'thoughts', 'reasoning_recap'})
 
+# Module-level singletons -- both classes are stateless, no need to re-instantiate per parser.
+_DEFAULT_CHUNKER = SentenceAwareChunker()
+_DEFAULT_QUERY_GEN = QueryGenerator()
+
 
 class ChatGPTParser(BaseParser):
     """Parse ChatGPT data export into SADocuments.
@@ -41,8 +45,8 @@ class ChatGPTParser(BaseParser):
         chunker: SentenceAwareChunker = None,
     ):
         self.export_dir = export_dir
-        self.chunker = chunker or SentenceAwareChunker()
-        self.query_gen = QueryGenerator()
+        self.chunker = chunker or _DEFAULT_CHUNKER
+        self.query_gen = _DEFAULT_QUERY_GEN
 
     def source_name(self) -> str:
         return 'chatgpt'

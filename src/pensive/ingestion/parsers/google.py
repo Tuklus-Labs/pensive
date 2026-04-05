@@ -17,6 +17,9 @@ from ..query_gen import QueryGenerator
 
 logger = logging.getLogger(__name__)
 
+# Module-level singleton -- QueryGenerator is stateless.
+_DEFAULT_QUERY_GEN = QueryGenerator()
+
 
 class GoogleCalendarParser(BaseParser):
     """Parse Google Calendar ICS exports into SADocuments.
@@ -28,7 +31,7 @@ class GoogleCalendarParser(BaseParser):
     def __init__(self, takeout_dir: str):
         self.takeout_dir = Path(takeout_dir)
         self.calendar_dir = self.takeout_dir / 'Calendar'
-        self.query_gen = QueryGenerator()
+        self.query_gen = _DEFAULT_QUERY_GEN
 
     def source_name(self) -> str:
         return 'google_calendar'
@@ -198,7 +201,7 @@ class YouTubeCommentsParser(BaseParser):
     def __init__(self, takeout_dir: str):
         self.takeout_dir = Path(takeout_dir)
         self.comments_dir = self.takeout_dir / 'YouTube and YouTube Music' / 'comments'
-        self.query_gen = QueryGenerator()
+        self.query_gen = _DEFAULT_QUERY_GEN
 
     def source_name(self) -> str:
         return 'youtube_comments'

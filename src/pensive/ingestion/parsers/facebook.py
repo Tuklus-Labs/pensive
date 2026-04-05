@@ -21,6 +21,10 @@ from ..query_gen import QueryGenerator
 
 logger = logging.getLogger(__name__)
 
+# Module-level singletons -- both classes are stateless, no need to re-instantiate per parser.
+_DEFAULT_CHUNKER = SentenceAwareChunker()
+_DEFAULT_QUERY_GEN = QueryGenerator()
+
 # Subdirectories under your_facebook_activity/messages/ that contain threads
 THREAD_SUBDIRS = ('inbox', 'archived_threads', 'message_requests', 'e2ee_cutover')
 
@@ -38,8 +42,8 @@ class FacebookParser(BaseParser):
         """
         self.export_dir = Path(export_dir)
         self.messages_dir = self.export_dir / 'your_facebook_activity' / 'messages'
-        self.chunker = chunker or SentenceAwareChunker()
-        self.query_gen = QueryGenerator()
+        self.chunker = chunker or _DEFAULT_CHUNKER
+        self.query_gen = _DEFAULT_QUERY_GEN
 
     def source_name(self) -> str:
         return 'facebook'

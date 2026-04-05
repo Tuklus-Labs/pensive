@@ -235,35 +235,31 @@ def integrate_with_sa(sa, learner: PatternLearner):
     # Track directly seeded value nodes per query (cleared each query)
     _direct_value_seeds: Dict[str, float] = {}
 
-    # Pre-build index for all existing learned terms
+    # Pre-build value node lists once (cached for all future _build_term_index calls)
+    _cached_value_labels: List[str] = []
+    _cached_value_nodes: List[str] = []
     if hasattr(sa, '_idx_to_node') and hasattr(sa, '_node_type'):
-        value_labels = []
-        value_nodes = []
         for idx, node_id in enumerate(sa._idx_to_node):
             if sa._node_type[idx] != 1:
                 continue
-            value_labels.append(sa._node_label[idx].lower())
-            value_nodes.append(node_id)
+            _cached_value_labels.append(sa._node_label[idx].lower())
+            _cached_value_nodes.append(node_id)
 
         for term in learner.learned_entities:
-            matches = [node_id for label, node_id in zip(value_labels, value_nodes)
+            matches = [node_id for label, node_id in zip(_cached_value_labels, _cached_value_nodes)
                        if term in label]
             _learned_term_index[term] = matches
 
     def _build_term_index(term: str) -> List[str]:
-        """Build index for a learned term (one-time scan per term)."""
+        """Build index for a learned term (one-time scan per term).
+
+        Uses cached value node lists instead of rescanning all graph nodes.
+        """
         if term in _learned_term_index:
             return _learned_term_index[term]
 
-        matches = []
-        if hasattr(sa, '_idx_to_node') and hasattr(sa, '_node_type'):
-            for idx, node_id in enumerate(sa._idx_to_node):
-                if sa._node_type[idx] != 1:
-                    continue
-                label = sa._node_label[idx].lower()
-                if term in label:
-                    matches.append(node_id)
-
+        matches = [node_id for label, node_id in zip(_cached_value_labels, _cached_value_nodes)
+                   if term in label]
         _learned_term_index[term] = matches
         return matches
 
