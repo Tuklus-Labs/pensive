@@ -126,8 +126,10 @@ def _init_worker(extractor):
 
 def _extract_chunk(chunk):
     """Worker function for multiprocessing entity extraction."""
-    return [(doc, _worker_extractor.extract(
-        doc['content'] + (f" {doc['query']}" if 'query' in doc else "")
+    extract = _worker_extractor.extract
+    return [(doc, extract(
+        doc['content'] if 'query' not in doc
+        else doc['content'] + ' ' + doc['query']
     )) for doc in chunk]
 
 
@@ -372,23 +374,23 @@ class SpreadingActivation:
         """
         self._reset_graph_state()
 
-        # Single extraction pass
+        # Extraction + frequency counting in one pass (avoids second iteration)
         extracted = []
+        entity_freq = self.entity_freq
+        extractor_extract = self._extractor.extract
         for doc in documents:
             text = doc['content']
-            if 'query' in doc:
-                text = f"{text} {doc['query']}"
-            extracted.append((doc, self._extractor.extract(text)))
-
-        # Count entity frequencies
-        for _, entities in extracted:
+            query = doc.get('query')
+            if query:
+                text = text + ' ' + query
+            entities = extractor_extract(text)
+            extracted.append((doc, entities))
             for entity, _ in entities:
-                self.entity_freq[entity] += 1
+                entity_freq[entity] += 1
 
-        # Build graph with specificity weights (single pass per doc)
+        # Build graph with specificity weights
         spec_power = self.config.spec_power
         edge_weight = self.config.edge_weight
-        entity_freq = self.entity_freq
         node_to_idx = self._node_to_idx
 
         for doc, entities in extracted:
@@ -443,11 +445,13 @@ class SpreadingActivation:
 
         extracted = []
         batch_counts: Dict[str, int] = defaultdict(int)
+        extractor_extract = self._extractor.extract
         for doc in documents:
             text = doc['content']
-            if 'query' in doc:
-                text = f"{text} {doc['query']}"
-            entities = self._extractor.extract(text)
+            query = doc.get('query')
+            if query:
+                text = text + ' ' + query
+            entities = extractor_extract(text)
             extracted.append((doc, entities))
             for entity, _ in entities:
                 if len(entity) >= 2:
@@ -532,9 +536,14 @@ class SpreadingActivation:
 
         extracted = [item for chunk in chunk_results for item in chunk]
 
+        entity_freq = self.entity_freq
         for _, entities in extracted:
             for entity, _ in entities:
-                self.entity_freq[entity] += 1
+                entity_freq[entity] += 1
+
+        spec_power = self.config.spec_power
+        edge_weight = self.config.edge_weight
+        node_to_idx = self._node_to_idx
 
         for doc, entities in extracted:
             answer_node = f"v:{doc['id']}"
@@ -542,16 +551,17 @@ class SpreadingActivation:
                 answer_node, _VALUE_TYPE, doc['value'], 0.0
             )
 
-            doc_entities = {}
+            seen_in_doc = set()
             for entity, etype in entities:
                 if len(entity) < 2:
                     continue
                 node_id = f"e:{etype}:{entity}"
-                specificity = 1.0 / (self.entity_freq[entity] ** self.config.spec_power)
-                doc_entities[node_id] = (entity, etype, specificity)
+                if node_id in seen_in_doc:
+                    continue
+                seen_in_doc.add(node_id)
 
-            for node_id, (entity, etype, specificity) in doc_entities.items():
-                is_new = node_id not in self._node_to_idx
+                specificity = 1.0 / (entity_freq[entity] ** spec_power)
+                is_new = node_id not in node_to_idx
                 ent_idx = self._get_or_add_node(
                     node_id, _ENTITY_TYPE, entity, specificity
                 )
@@ -561,7 +571,7 @@ class SpreadingActivation:
 
                 self._add_edge_fast(
                     ent_idx, ans_idx,
-                    specificity * self.config.edge_weight
+                    specificity * edge_weight
                 )
 
         self._dirty = True
