@@ -231,26 +231,22 @@ class HybridSearcher:
         return self.bm25_index.size
 
 
-_ID_HEX = re.compile(r'0x[0-9a-f]+')
-_ID_SUBSYSTEM = re.compile(r'(?:subsystem|system|unit|module|sector|node)\s*[#]?(\d+)')
-_ID_ERROR = re.compile(r'(?:error|err|fault|code)\s*[#:-]?\s*([0-9a-fx]+)')
-_ID_NUMERIC = re.compile(r'\b\d{3,}\b')
-_ID_VERSION = re.compile(r'v\d+(?:\.\d+)+')
+_ID_MEGA = re.compile(
+    r'(?P<hex>0x[0-9a-f]+)'
+    r'|(?:(?:subsystem|system|unit|module|sector|node)\s*[#]?(?P<sub>\d+))'
+    r'|(?:(?:error|err|fault|code)\s*[#:-]?\s*(?P<err>[0-9a-fx]+))'
+    r'|(?P<ver>v\d+(?:\.\d+)+)'
+    r'|(?P<num>\b\d{3,}\b)'
+)
 
 
 def extract_identifiers(text: str) -> Set[str]:
     """Extract potential identifiers (hex codes, subsystem refs, error codes, versions)."""
     identifiers = set()
-    text_lower = text.lower()
-
-    identifiers.update(_ID_HEX.findall(text_lower))
-    for match in _ID_SUBSYSTEM.findall(text_lower):
-        identifiers.add(match)
-    for match in _ID_ERROR.findall(text_lower):
-        identifiers.add(match)
-    identifiers.update(_ID_NUMERIC.findall(text_lower))
-    identifiers.update(_ID_VERSION.findall(text_lower))
-
+    for m in _ID_MEGA.finditer(text.lower()):
+        val = m.group('hex') or m.group('sub') or m.group('err') or m.group('ver') or m.group('num')
+        if val:
+            identifiers.add(val)
     return identifiers
 
 
