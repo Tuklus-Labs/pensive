@@ -659,9 +659,8 @@ class SpreadingActivation:
                 weights = data[row_start:row_end]
                 np.maximum.at(result, nbrs, score * decay * weights)
 
-        # Threshold filter + top-k pruning
-        active_mask = result >= threshold
-        final_idx = np.flatnonzero(active_mask)
+        # Threshold filter + top-k pruning (skip intermediate bool mask)
+        final_idx = np.flatnonzero(result >= threshold)
 
         if len(final_idx) == 0:
             return {}
@@ -681,14 +680,17 @@ class SpreadingActivation:
         indptr = self._adj.indptr
         indices = self._adj.indices
         data = self._adj.data
+        decay = self.config.decay
+        threshold = self.config.threshold
+        max_active = self.config.max_active
 
         for _ in range(hops):
             new_act: Dict[int, float] = defaultdict(float)
 
             for node_idx, act in activations.items():
-                new_act[node_idx] = max(new_act[node_idx], act * self.config.decay)
+                new_act[node_idx] = max(new_act[node_idx], act * decay)
 
-                if act < self.config.threshold:
+                if act < threshold:
                     continue
 
                 row_start = indptr[node_idx]
@@ -698,16 +700,16 @@ class SpreadingActivation:
                     weight = data[j]
                     new_act[neighbor] = max(
                         new_act[neighbor],
-                        act * self.config.decay * weight
+                        act * decay * weight
                     )
 
-            if len(new_act) > self.config.max_active:
+            if len(new_act) > max_active:
                 new_act = dict(
-                    heapq.nlargest(self.config.max_active, new_act.items(), key=lambda x: x[1])
+                    heapq.nlargest(max_active, new_act.items(), key=lambda x: x[1])
                 )
 
             activations = {k: v for k, v in new_act.items()
-                          if v >= self.config.threshold}
+                          if v >= threshold}
 
         return activations
 
