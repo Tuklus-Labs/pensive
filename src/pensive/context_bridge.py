@@ -11,8 +11,11 @@ Sources of context:
 3. Memory graph neighbors (entities associated with query terms)
 """
 import itertools
+import logging
 import re
 from collections import defaultdict, deque
+
+logger = logging.getLogger(__name__)
 from typing import List, Optional, Protocol, runtime_checkable
 
 try:
@@ -139,8 +142,8 @@ class L1ContextBridge:
                     response_text = entry
                 if response_text:
                     entities.extend(_extract_entities_from_text(response_text))
-        except (AttributeError, TypeError):
-            pass
+        except (AttributeError, TypeError) as e:
+            logger.debug("L1 recent queries unavailable: %s", e)
         return entities
 
     def _from_graph_associations(self, query_text: str) -> List[str]:
@@ -156,8 +159,8 @@ class L1ContextBridge:
                 for path in paths:
                     for node_label, _, _ in path:
                         entities.append(node_label.lower())
-        except (AttributeError, TypeError):
-            pass
+        except (AttributeError, TypeError) as e:
+            logger.debug("L1 graph associations unavailable: %s", e)
         return entities
 
     def _from_entity_index(self) -> List[str]:
@@ -168,5 +171,6 @@ class L1ContextBridge:
             return [str(e).lower()
                     for e in itertools.islice(self.l1.entity_index,
                                               self.max_entities)]
-        except (AttributeError, TypeError):
+        except (AttributeError, TypeError) as e:
+            logger.debug("L1 entity index unavailable: %s", e)
             return []

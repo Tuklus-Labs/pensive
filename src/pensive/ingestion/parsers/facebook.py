@@ -142,4 +142,5 @@ class FacebookParser(BaseParser):
         try:
             return text.encode('latin-1').decode('utf-8')
         except (UnicodeDecodeError, UnicodeEncodeError):
+            logger.debug("Could not fix FB encoding for text (len=%d)", len(text))
             return text
