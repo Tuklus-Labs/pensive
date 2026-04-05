@@ -360,6 +360,59 @@ class L2Handler:
             ))
         return results
 
+    def batch_query(
+        self,
+        query_texts: List[str],
+        top_k: Optional[int] = None,
+    ) -> List[List[L2Result]]:
+        """Batch-query multiple texts with a single encode call.
+
+        Encodes all query texts in one sentence-transformer batch,
+        then searches each embedding individually. Much faster than
+        calling query() N times when N > 1.
+
+        Args:
+            query_texts: List of natural language queries.
+            top_k: Number of results per query.
+
+        Returns:
+            List of result lists, one per query text.
+        """
+        if not query_texts:
+            return []
+        if len(query_texts) == 1:
+            return [self.query(query_texts[0], top_k)]
+
+        top_k = top_k or self.config.max_results
+
+        with self._lock:
+            if self._id_map.ntotal == 0 and not self._buffer_embeddings:
+                return [[] for _ in query_texts]
+
+            # Single batch encode for all queries
+            all_embeddings = self._encode(query_texts)
+
+            results = []
+            for query_vec in all_embeddings:
+                if self._id_map.ntotal == 0 and self._buffer_embeddings:
+                    buf = np.vstack(self._buffer_embeddings)
+                    scores = buf @ query_vec
+                    k = min(top_k, scores.shape[0])
+                    if k >= len(scores):
+                        top_indices = np.argsort(scores)[::-1]
+                    else:
+                        top_indices = np.argpartition(scores, -k)[-k:]
+                        top_indices = top_indices[np.argsort(scores[top_indices])[::-1]]
+                    ids = [self._buffer_ids[i] for i in top_indices]
+                    results.append(self._results_from_ids(ids, scores[top_indices]))
+                else:
+                    k = min(top_k, self._id_map.ntotal)
+                    qv = query_vec.reshape(1, -1)
+                    scores, ids = self._id_map.search(qv, k)
+                    results.append(self._results_from_ids(ids[0], scores[0]))
+
+            return results
+
     def _query_sync(self, query_text: str, top_k: Optional[int] = None) -> List[L2Result]:
         """Sync query interface for ParallelHybrid compatibility."""
         return self.query(query_text, top_k)
