@@ -169,6 +169,7 @@ class SpreadingActivation:
         self._entity_terms: List[str] = []
         self._token_index: Dict[str, List[str]] = defaultdict(list)  # token -> entity labels
         self._substr_match_cache: Dict[str, List[str]] = {}
+        self._do_substr = True  # cached at compile time
         self._built = False
         self._is_bipartite = True  # True until proven otherwise
         self._context_provider = None
@@ -222,6 +223,8 @@ class SpreadingActivation:
         self._node_type_arr = np.array(self._node_type, dtype=np.int8)
         # Pre-compute value node indices for fast collection
         self._value_indices = np.flatnonzero(self._node_type_arr == _VALUE_TYPE)
+        # Cache substring eligibility (avoids per-query len() call)
+        self._do_substr = len(self._entity_terms) <= 10_000
         self._dirty = False
 
     def _reset_graph_state(self) -> None:
@@ -331,14 +334,11 @@ class SpreadingActivation:
         if cached is not None:
             return cached
 
-        matches = []
-        seen = set()
+        node_ids = set()
         for entity in self._token_index.get(word, []):
-            for node_id in self._entity_index.get(entity, []):
-                if node_id not in seen:
-                    seen.add(node_id)
-                    matches.append(node_id)
+            node_ids.update(self._entity_index.get(entity, ()))
 
+        matches = list(node_ids)
         self._substr_match_cache[word] = matches
         return matches
 
@@ -562,7 +562,7 @@ class SpreadingActivation:
     def _seed_from_words(self, words: List[str]) -> Dict[int, float]:
         """Seed activation from a list of lowercase words."""
         activations: Dict[int, float] = {}
-        do_substr = len(self._entity_terms) <= 10_000
+        do_substr = self._do_substr
 
         for word in dict.fromkeys(words):
             if word in _STOPWORDS:
@@ -634,16 +634,16 @@ class SpreadingActivation:
 
         n = len(self._idx_to_node)
 
-        # Convert activations dict to arrays for the kernel
-        act_indices = np.array(list(activations.keys()), dtype=np.int64)
-        act_scores = np.array(list(activations.values()), dtype=np.float32)
-
         if _numba_spread_bipartite is not None:
+            # Convert activations dict to arrays for the JIT kernel
+            act_indices = np.array(list(activations.keys()), dtype=np.int64)
+            act_scores = np.array(list(activations.values()), dtype=np.float32)
             result = _numba_spread_bipartite(
                 act_indices, act_scores, indptr, indices, data,
                 np.float32(decay), np.float32(threshold), n,
             )
         else:
+            # Fallback: iterate dict directly, no array overhead
             result = np.zeros(n, dtype=np.float32)
             for idx, score in activations.items():
                 decayed = score * decay
@@ -758,10 +758,9 @@ class SpreadingActivation:
         threshold = self.config.threshold
         n = len(self._idx_to_node)
 
-        act_indices = np.array(list(activations.keys()), dtype=np.int64)
-        act_scores = np.array(list(activations.values()), dtype=np.float32)
-
         if _numba_spread_bipartite is not None:
+            act_indices = np.array(list(activations.keys()), dtype=np.int64)
+            act_scores = np.array(list(activations.values()), dtype=np.float32)
             return _numba_spread_bipartite(
                 act_indices, act_scores, indptr, indices, data,
                 np.float32(decay), np.float32(threshold), n,
@@ -798,12 +797,11 @@ class SpreadingActivation:
         vi = self._value_indices
         scores = result[vi]
 
-        # Threshold filter
-        above = scores >= self.config.threshold
-        if not above.any():
+        # Combined threshold + nonzero filter (skip intermediate bool mask)
+        nz_local = np.flatnonzero(scores >= self.config.threshold)
+        if len(nz_local) == 0:
             return []
 
-        nz_local = np.flatnonzero(above)
         nz_scores = scores[nz_local]
         nz_global = vi[nz_local]
 
@@ -825,11 +823,10 @@ class SpreadingActivation:
         vi = self._value_indices
         scores = result[vi]
 
-        above = scores >= self.config.threshold
-        if not above.any():
+        nz_local = np.flatnonzero(scores >= self.config.threshold)
+        if len(nz_local) == 0:
             return []
 
-        nz_local = np.flatnonzero(above)
         nz_scores = scores[nz_local]
         nz_global = vi[nz_local]
 

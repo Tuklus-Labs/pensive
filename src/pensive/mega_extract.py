@@ -73,17 +73,41 @@ class MegaExtractor:
             List of (start_char, end_char, entity_lowercase, entity_type) tuples,
             sorted by start position. Includes all occurrences of each entity.
         """
-        results = []
+        # finditer returns matches in text order, so each list is pre-sorted.
+        # Merge two sorted lists in O(n) instead of sorting O(n log n).
+        lists = []
         for regex, etype_map in ((self._ci_regex, self._ci_etype_map),
                                   (self._cs_regex, self._cs_etype_map)):
             if regex is None:
                 continue
+            spans = []
             for m in regex.finditer(text):
                 gi = m.lastindex
                 g = m.group(gi)
-                results.append((m.start(gi), m.end(gi), g.lower(), etype_map[gi - 1]))
-        results.sort(key=lambda r: r[0])
-        return results
+                spans.append((m.start(gi), m.end(gi), g.lower(), etype_map[gi - 1]))
+            lists.append(spans)
+
+        if not lists:
+            return []
+        if len(lists) == 1:
+            return lists[0]
+
+        # Merge two sorted span lists
+        a, b = lists[0], lists[1]
+        merged = []
+        i = j = 0
+        while i < len(a) and j < len(b):
+            if a[i][0] <= b[j][0]:
+                merged.append(a[i])
+                i += 1
+            else:
+                merged.append(b[j])
+                j += 1
+        if i < len(a):
+            merged.extend(a[i:])
+        else:
+            merged.extend(b[j:])
+        return merged
 
 
 def _build_mega(
