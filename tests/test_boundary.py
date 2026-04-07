@@ -186,3 +186,97 @@ class TestAnalyzeBoundary:
         )
         if result.analysis.suggested_context:
             assert all(isinstance(s, str) for s in result.analysis.suggested_context)
+
+
+class TestQueryAnalyzed:
+    def test_query_analyzed_returns_analyzed_result(self):
+        sa = _build_sa_with_ambiguous_docs()
+        result = sa.query_analyzed("What was the P99 latency on 2025-07-16?")
+        assert hasattr(result, 'results')
+        assert hasattr(result, 'analysis')
+        assert isinstance(result.analysis, BoundaryAnalysis)
+
+    def test_query_analyzed_results_match_query(self):
+        sa = _build_sa_with_ambiguous_docs()
+        q = "What was the P99 latency on 2025-07-16?"
+        normal = sa.query(q)
+        analyzed = sa.query_analyzed(q)
+        # Results should be identical
+        assert len(analyzed.results) == len(normal)
+        for (a_label, a_score), (n_label, n_score) in zip(analyzed.results, normal):
+            assert a_label == n_label
+            assert abs(a_score - n_score) < 1e-6
+
+    def test_query_analyzed_with_context(self):
+        sa = _build_sa_with_ambiguous_docs()
+        result = sa.query_analyzed(
+            "What was the P99 latency on 2025-07-16?",
+            context=["199ms"]
+        )
+        assert result.results[0][0] == "199ms"
+
+    def test_query_analyzed_not_built_raises(self):
+        sa = SpreadingActivation(patterns=SYNTHETIC_PATTERNS)
+        with pytest.raises(ValueError, match="not built"):
+            sa.query_analyzed("test")
+
+
+class TestBoundaryEdgeCases:
+    def test_single_result_no_disambiguation_gap(self):
+        """One result means no gap to compute."""
+        docs = [
+            {'content': 'Meeting room A-512 has capacity of 11.',
+             'id': 'n1', 'value': '11',
+             'query': 'Capacity of A-512?'},
+        ]
+        sa = SpreadingActivation(patterns=SYNTHETIC_PATTERNS)
+        sa.build(docs)
+        result = analyze_boundary(sa, "Capacity of A-512?", top_k=1)
+        assert result.analysis.disambiguation_gap is None
+        assert result.analysis.context_needed is False
+
+    def test_many_tied_results(self):
+        """Multiple results at similar scores should flag context needed."""
+        docs = [
+            {'content': f'Latency on 2025-07-16 was {v}ms.',
+             'id': f'n{i}', 'value': f'{v}ms',
+             'query': 'Latency on 2025-07-16?'}
+            for i, v in enumerate([199, 200, 201, 202])
+        ]
+        sa = SpreadingActivation(patterns=SYNTHETIC_PATTERNS)
+        sa.build(docs)
+        result = analyze_boundary(sa, "Latency on 2025-07-16?")
+        # With 4 nearly identical docs, should detect ambiguity
+        assert result.analysis.disambiguation_gap is not None
+
+    def test_empty_query_string(self):
+        sa = _build_sa_with_distinct_docs()
+        result = analyze_boundary(sa, "")
+        assert result.analysis.confidence == "none"
+        assert result.results == []
+
+    def test_frequency_bands_cached_across_calls(self):
+        """FrequencyBands.from_entity_freq is deterministic."""
+        freq = {"a": 1, "b": 100, "c": 10000}
+        b1 = FrequencyBands.from_entity_freq(freq, n_bands=3)
+        b2 = FrequencyBands.from_entity_freq(freq, n_bands=3)
+        for e in freq:
+            assert b1.band_of(e) == b2.band_of(e)
+
+
+class TestContextDetection:
+    def test_ambiguous_docs_suggest_context(self):
+        """When two results tie and differ by an entity, suggest it."""
+        sa = _build_sa_with_ambiguous_docs()
+        result = analyze_boundary(sa, "What was the P99 latency on 2025-07-16?")
+        # The two answers differ in their value entities (199ms vs 257ms)
+        if result.analysis.context_needed:
+            assert (len(result.analysis.suggested_context) > 0
+                    or result.analysis.fundamentally_ambiguous)
+
+    def test_distinct_docs_no_context_needed(self):
+        """Clear winner means no context needed."""
+        sa = _build_sa_with_distinct_docs()
+        result = analyze_boundary(sa, "Capacity of meeting room A-512?")
+        assert result.analysis.context_needed is False
+        assert result.analysis.fundamentally_ambiguous is False
