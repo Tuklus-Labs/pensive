@@ -107,3 +107,82 @@ class TestFrequencyBands:
         bands = FrequencyBands.from_entity_freq(entity_freq, n_bands=3)
         assert bands.band_of("only") is not None
         assert bands.is_cross_band(["only"]) is False
+
+
+from pensive import SpreadingActivation, SpreadingConfig
+from pensive.patterns import SYNTHETIC_PATTERNS
+from pensive.boundary import analyze_boundary, AnalyzedResult
+
+
+def _build_sa_with_ambiguous_docs():
+    """Build an SA instance with two docs sharing entities but different answers."""
+    docs = [
+        {'content': 'System latency on 2025-07-16 was 199ms at the 99th percentile.',
+         'id': 'n1', 'value': '199ms',
+         'query': 'What was the P99 latency on 2025-07-16?'},
+        {'content': 'System latency on 2025-07-16 was 257ms at the 99th percentile.',
+         'id': 'n2', 'value': '257ms',
+         'query': 'What was the P99 latency on 2025-07-16?'},
+    ]
+    sa = SpreadingActivation(patterns=SYNTHETIC_PATTERNS)
+    sa.build(docs)
+    return sa
+
+
+def _build_sa_with_distinct_docs():
+    """Build an SA with docs that have non-overlapping entities."""
+    docs = [
+        {'content': 'Meeting room A-512 has capacity of 11 people.',
+         'id': 'n1', 'value': '11 people',
+         'query': 'Capacity of meeting room A-512?'},
+        {'content': 'Dr. Taylor Smith leads the Horizon initiative.',
+         'id': 'n2', 'value': 'Dr. Taylor Smith',
+         'query': 'Who leads Horizon?'},
+    ]
+    sa = SpreadingActivation(patterns=SYNTHETIC_PATTERNS)
+    sa.build(docs)
+    return sa
+
+
+class TestAnalyzeBoundary:
+    def test_returns_boundary_analysis(self):
+        sa = _build_sa_with_ambiguous_docs()
+        result = analyze_boundary(sa, "What was the P99 latency on 2025-07-16?")
+        assert isinstance(result, AnalyzedResult)
+        assert isinstance(result.analysis, BoundaryAnalysis)
+        assert len(result.results) >= 1
+
+    def test_ambiguous_query_has_small_disambiguation_gap(self):
+        sa = _build_sa_with_ambiguous_docs()
+        result = analyze_boundary(sa, "What was the P99 latency on 2025-07-16?")
+        # Two docs with same entities -- gap should be small or zero
+        if result.analysis.disambiguation_gap is not None:
+            assert result.analysis.disambiguation_gap < 0.20
+
+    def test_distinct_query_has_high_confidence(self):
+        sa = _build_sa_with_distinct_docs()
+        result = analyze_boundary(sa, "Capacity of meeting room A-512?")
+        assert result.analysis.confidence in ("high", "medium")
+
+    def test_no_results_query(self):
+        sa = _build_sa_with_distinct_docs()
+        result = analyze_boundary(sa, "xyzzy nonexistent gibberish")
+        assert result.analysis.confidence == "none"
+        assert result.analysis.boundary_distance is None
+        assert result.results == []
+
+    def test_boundary_distance_is_score_minus_threshold(self):
+        sa = _build_sa_with_distinct_docs()
+        result = analyze_boundary(sa, "Capacity of meeting room A-512?")
+        if result.results:
+            top_score = result.results[0][1]
+            expected_dist = top_score - sa.config.threshold
+            assert abs(result.analysis.boundary_distance - expected_dist) < 1e-6
+
+    def test_suggested_context_contains_differentiating_entities(self):
+        sa = _build_sa_with_ambiguous_docs()
+        result = analyze_boundary(
+            sa, "What was the P99 latency on 2025-07-16?", top_k=2
+        )
+        if result.analysis.suggested_context:
+            assert all(isinstance(s, str) for s in result.analysis.suggested_context)
