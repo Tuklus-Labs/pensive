@@ -1131,6 +1131,20 @@ class SpreadingActivation:
 
         return self._collect_results_with_ids(intersected, top_k)
 
+    def query_analyzed(self, query_text: str, top_k: int = 10,
+                       context: Optional[List[str]] = None,
+                       n_bands: int = 5):
+        """Query with boundary analysis diagnostics.
+
+        Same as query() but returns an AnalyzedResult with both the
+        normal results and a BoundaryAnalysis diagnostic.
+
+        See pensive.boundary for details on the diagnostic fields.
+        """
+        from .boundary import analyze_boundary
+        return analyze_boundary(self, query_text, top_k=top_k,
+                                context=context, n_bands=n_bands)
+
     def stats(self) -> Dict:
         """Return graph statistics."""
         n_nodes = len(self._idx_to_node)
