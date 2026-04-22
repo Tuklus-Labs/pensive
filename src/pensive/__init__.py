@@ -18,6 +18,7 @@ from .spreading import SpreadingActivation, SpreadingConfig
 from .mega_extract import MegaExtractor
 from .patterns import REAL_DATA_PATTERNS, ALL_PATTERNS, build_pattern_set
 from .boundary import BoundaryAnalysis, AnalyzedResult, FrequencyBands, analyze_boundary
+from .ingestion.pipeline import IngestPipeline
 
 __version__ = "0.1.1"
 
@@ -25,6 +26,7 @@ __all__ = [
     'SpreadingActivation',
     'SpreadingConfig',
     'MegaExtractor',
+    'IngestPipeline',
     'REAL_DATA_PATTERNS',
     'ALL_PATTERNS',
     'build_pattern_set',

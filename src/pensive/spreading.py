@@ -14,6 +14,7 @@ Usage:
 import array
 import heapq
 import re
+import threading
 from collections import defaultdict
 from dataclasses import dataclass, field
 from typing import Dict, Iterable, List, Optional, Tuple
@@ -212,6 +213,13 @@ class SpreadingActivation:
         self._do_substr = True  # cached at compile time
         self._built = False
         self._is_bipartite = True  # True until proven otherwise
+
+        # Guards concurrent build + query. Queries after build are
+        # generally read-only on the immutable structures, but
+        # build_parallel() concurrently mutates entity_freq which is also
+        # read by _get_specificity during query. Callers that mix
+        # parallel build with live queries should hold this lock.
+        self._build_lock = threading.RLock()
         self._context_provider = None
         self._extractor = MegaExtractor(self.patterns)
 
@@ -419,7 +427,22 @@ class SpreadingActivation:
         - 'id': str - Unique identifier
         - 'value': str - The answer/value to retrieve
         - 'query': str (optional) - Query text to include in entity extraction
+
+        Holds self._build_lock across the mutation phase so concurrent
+        query threads see a consistent graph. If build raises mid-way, the
+        graph is reset and _built stays False so subsequent queries fail
+        fast rather than returning stale results.
         """
+        with self._build_lock:
+            try:
+                return self._build_locked(documents)
+            except BaseException:
+                self._reset_graph_state()
+                self._built = False
+                raise
+
+    def _build_locked(self, documents: List[Dict]) -> 'SpreadingActivation':
+        """Caller holds self._build_lock."""
         self._reset_graph_state()
 
         # Extraction + frequency counting in one pass (avoids second iteration)
@@ -555,6 +578,10 @@ class SpreadingActivation:
         Graph construction (node/edge creation) remains sequential since it
         mutates shared state, but is fast compared to extraction.
 
+        Holds ``self._build_lock`` across the whole mutation phase so
+        concurrent query threads (which acquire the same lock when reading
+        ``entity_freq`` / the CSR) see a consistent graph.
+
         Args:
             documents: Same format as build()
             workers: Number of worker processes. Defaults to min(cpu_count, 16).
@@ -567,6 +594,19 @@ class SpreadingActivation:
         if workers <= 1 or len(documents) < 2_000:
             return self.build(documents)
 
+        with self._build_lock:
+            try:
+                return self._build_parallel_locked(documents, workers, mp)
+            except BaseException:
+                # Half-built graph is worse than no graph. Reset state and
+                # mark unbuilt so queries fail fast instead of returning
+                # garbage from a partially-populated adjacency matrix.
+                self._reset_graph_state()
+                self._built = False
+                raise
+
+    def _build_parallel_locked(self, documents, workers, mp):
+        """Internal: caller holds self._build_lock."""
         # Reset
         self._reset_graph_state()
 
@@ -577,7 +617,12 @@ class SpreadingActivation:
                   for i in range(0, len(documents), chunk_size)]
 
         # Use fork context to share parent's compiled regexes with workers
-        ctx = mp.get_context('fork')
+        # (fork is faster than spawn on Linux/macOS; falls back to spawn on
+        # Windows where fork is not available).
+        try:
+            ctx = mp.get_context('fork')
+        except ValueError:
+            ctx = mp.get_context('spawn')
         with ctx.Pool(effective_workers, initializer=_init_worker,
                       initargs=(self._extractor,)) as pool:
             chunk_results = pool.map(_extract_chunk, chunks)

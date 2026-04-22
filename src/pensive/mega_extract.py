@@ -74,6 +74,10 @@ class MegaExtractor:
                 if cs_literals:
                     etype = cs_literals.get(w)
                     if etype is not None:
+                        # Return lowercase for consistency with extract()'s
+                        # documented contract (all other paths in this
+                        # function also lowercase). Callers that need the
+                        # original case should use extract_with_raw().
                         results.append((wl, etype))
 
         # Regex path for complex patterns

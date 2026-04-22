@@ -91,12 +91,19 @@ def cmd_query(args):
     """Query an existing SA graph."""
     from .pipeline import IngestPipeline
 
-    pipeline = IngestPipeline.load_graph(args.graph)
+    pipeline = IngestPipeline.load_graph(args.graph, trusted=bool(getattr(args, 'trusted', False)))
     query = ' '.join(args.query_text)
+    context = args.context.split(',') if args.context else None
 
     t0 = time.perf_counter()
-    results = pipeline.sa.query(query, top_k=args.top_k,
-                                 context=args.context.split(',') if args.context else None)
+    if args.analyze:
+        diagnosed = pipeline.sa.query_analyzed(
+            query, top_k=args.top_k, context=context
+        )
+        results = diagnosed.results
+    else:
+        diagnosed = None
+        results = pipeline.sa.query(query, top_k=args.top_k, context=context)
     elapsed_ms = (time.perf_counter() - t0) * 1000
 
     print(f"Query: {query}")
@@ -107,12 +114,26 @@ def cmd_query(args):
     for i, (value, score) in enumerate(results):
         print(f"  {i+1}. [{score:.4f}] {value[:120]}...")
 
+    if diagnosed is not None:
+        analysis = diagnosed.analysis
+        print("\nBoundary analysis:")
+        print(f"  Confidence: {analysis.confidence}")
+        print(f"  Should trust: {analysis.should_trust}")
+        print(f"  Recommended action: {analysis.recommended_action}")
+        print(f"  Boundary distance: {analysis.boundary_distance}")
+        print(f"  Disambiguation gap: {analysis.disambiguation_gap}")
+        print(f"  Band crossing: {analysis.band_crossing}")
+        print(f"  Context needed: {analysis.context_needed}")
+        print(f"  Fundamentally ambiguous: {analysis.fundamentally_ambiguous}")
+        if analysis.suggested_context:
+            print(f"  Suggested context: {', '.join(analysis.suggested_context)}")
+
 
 def cmd_stats(args):
     """Show stats for an existing SA graph."""
     from .pipeline import IngestPipeline
 
-    pipeline = IngestPipeline.load_graph(args.graph)
+    pipeline = IngestPipeline.load_graph(args.graph, trusted=bool(getattr(args, 'trusted', False)))
 
     print("Graph statistics:")
     for k, v in pipeline.sa.stats().items():
@@ -148,11 +169,19 @@ def main():
     query_p.add_argument('--graph', required=True, help='Path to graph pickle')
     query_p.add_argument('--top-k', type=int, default=10)
     query_p.add_argument('--context', help='Comma-separated context entities')
+    query_p.add_argument('--analyze', action='store_true',
+                         help='Include boundary-analysis diagnostics')
+    query_p.add_argument('--trusted', action='store_true',
+                         help='Load unsigned legacy pickles (pre-HMAC-signing era). '
+                              'Unsafe on untrusted files -- only use on graphs you built yourself.')
     query_p.add_argument('query_text', nargs='+')
 
     # stats
     stats_p = sub.add_parser('stats', help='Show graph statistics')
     stats_p.add_argument('--graph', required=True, help='Path to graph pickle')
+    stats_p.add_argument('--trusted', action='store_true',
+                         help='Load unsigned legacy pickles (pre-HMAC-signing era). '
+                              'Unsafe on untrusted files -- only use on graphs you built yourself.')
 
     args = parser.parse_args()
     if not args.command:

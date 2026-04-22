@@ -23,6 +23,7 @@ Usage:
     results = hybrid.query("What was the P99 latency?")
 """
 import logging
+import math
 import time
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
@@ -58,7 +59,26 @@ class ParallelHybrid:
 
     Default mode: L2 runs on SA-selected candidates.
     Optional legacy mode runs SA and global L2 in parallel.
+
+    Rank fusion:
+        Results found by BOTH SA and L2 ("agreement") get the highest
+        weight. Results found only by L2 get a middle weight. SA-only
+        results get the lowest weight. The three constants are exposed
+        as constructor kwargs ``rank_fusion_agreement``,
+        ``rank_fusion_l2_only``, ``rank_fusion_sa_only``, or as class
+        attributes ``RANK_FUSION_AGREEMENT`` / ``RANK_FUSION_L2_ONLY`` /
+        ``RANK_FUSION_SA_ONLY``. The invariant
+        ``agreement > l2_only > sa_only`` is enforced in ``__init__``.
     """
+
+    # Rank fusion constants. Empirically tuned to weight signals as:
+    #   agreement (both SA and L2 returned the doc) > L2-only > SA-only
+    # Each family uses score = CONSTANT / (rank_value + 1) so rank 0 gets the
+    # full constant. Invariant: AGREEMENT > L2_ONLY > SA_ONLY keeps the tiers
+    # correctly ordered at the same rank.
+    RANK_FUSION_AGREEMENT: float = 100.0
+    RANK_FUSION_L2_ONLY: float = 50.0
+    RANK_FUSION_SA_ONLY: float = 30.0
 
     def __init__(
         self,
@@ -68,14 +88,52 @@ class ParallelHybrid:
         cross_encoder_model: str = 'cross-encoder/ms-marco-MiniLM-L-6-v2',
         l2_on_sa_hits: bool = True,
         l2_fallback_global: bool = True,
+        l2_fallback_on_low_confidence: bool = False,
         enable_pattern_learning: bool = True,
         pattern_learner: Optional[PatternLearner] = None,
+        rank_fusion_agreement: Optional[float] = None,
+        rank_fusion_l2_only: Optional[float] = None,
+        rank_fusion_sa_only: Optional[float] = None,
     ):
         self.sa = spreading_activation
         self.l2 = l2_handler
         self.l2_on_sa_hits = l2_on_sa_hits
         self.l2_fallback_global = l2_fallback_global
+        self.l2_fallback_on_low_confidence = l2_fallback_on_low_confidence
         self._executor = None  # lazy-init only for legacy parallel mode
+
+        # Rank-fusion weights: per-instance override of class defaults.
+        self.rank_fusion_agreement = (
+            rank_fusion_agreement
+            if rank_fusion_agreement is not None
+            else self.RANK_FUSION_AGREEMENT
+        )
+        self.rank_fusion_l2_only = (
+            rank_fusion_l2_only
+            if rank_fusion_l2_only is not None
+            else self.RANK_FUSION_L2_ONLY
+        )
+        self.rank_fusion_sa_only = (
+            rank_fusion_sa_only
+            if rank_fusion_sa_only is not None
+            else self.RANK_FUSION_SA_ONLY
+        )
+        # Reject NaN explicitly: NaN comparisons are all False, so a NaN
+        # value would silently bypass the invariant check below and then
+        # poison every ranking score downstream.
+        for _name, _val in (
+            ("agreement", self.rank_fusion_agreement),
+            ("l2_only", self.rank_fusion_l2_only),
+            ("sa_only", self.rank_fusion_sa_only),
+        ):
+            if not isinstance(_val, (int, float)) or math.isnan(_val):
+                raise ValueError(f"rank_fusion_{_name} must be a non-NaN number, got {_val!r}")
+        if not (self.rank_fusion_agreement > self.rank_fusion_l2_only > self.rank_fusion_sa_only):
+            raise ValueError(
+                "rank fusion weights must satisfy agreement > l2_only > sa_only "
+                f"(got {self.rank_fusion_agreement}, {self.rank_fusion_l2_only}, "
+                f"{self.rank_fusion_sa_only})"
+            )
 
         self.cross_encoder = None
         if use_cross_encoder and CROSS_ENCODER_AVAILABLE:
@@ -113,26 +171,49 @@ class ParallelHybrid:
 
         if self.l2_on_sa_hits:
             # L2 runs on L1 candidates first. This is the default production path.
-            sa_results = self._query_sa(query, sa_top_k, context)
-            candidate_ids = [r['doc_id'] for r in sa_results]
-            l2_results = self._query_l2_on_candidates(query, candidate_ids, l2_top_k)
+            sa_results, sa_analysis = self._query_sa(
+                query,
+                sa_top_k,
+                context,
+                analyze=self.l2_fallback_on_low_confidence,
+            )
+            use_global_l2 = (
+                self.l2_fallback_global
+                and self.l2_fallback_on_low_confidence
+                and self._should_run_global_l2(sa_analysis)
+            )
 
-            if not l2_results and self.l2_fallback_global:
+            if use_global_l2:
                 l2_results = self._query_l2(query, l2_top_k)
+            else:
+                candidate_ids = [r['doc_id'] for r in sa_results]
+                l2_results = self._query_l2_on_candidates(
+                    query, candidate_ids, l2_top_k
+                )
+                if not l2_results and self.l2_fallback_global:
+                    l2_results = self._query_l2(query, l2_top_k)
 
             stage_ms = (time.perf_counter() - t0) * 1000
+            stage_label = "Boundary fallback" if use_global_l2 else "Two-stage"
             logger.info(
-                "Two-stage: SA=%d, L2=%d in %.0fms",
+                "%s: SA=%d, L2=%d in %.0fms",
+                stage_label,
                 len(sa_results), len(l2_results), stage_ms,
             )
         else:
             # Legacy mode: fire SA and global L2 in parallel.
             if self._executor is None:
                 self._executor = ThreadPoolExecutor(max_workers=4)
-            sa_future = self._executor.submit(self._query_sa, query, sa_top_k, context)
+            sa_future = self._executor.submit(
+                self._query_sa,
+                query,
+                sa_top_k,
+                context,
+                self.l2_fallback_on_low_confidence,
+            )
             l2_future = self._executor.submit(self._query_l2, query, l2_top_k)
 
-            sa_results = sa_future.result()
+            sa_results, _ = sa_future.result()
             l2_results = l2_future.result()
 
             parallel_ms = (time.perf_counter() - t0) * 1000
@@ -154,23 +235,25 @@ class ParallelHybrid:
             l2_hit = l2_by_id.get(doc_id)
 
             if sa_hit and l2_hit:
-                # BOTH found it - strong signal
+                # BOTH found it - strong signal. Use harmonic mean of ranks
+                # so a doc ranked #1 by one side and #10 by the other doesn't
+                # get as strong a boost as #1/#1 did.
                 sa_rank = sa_hit['rank']
                 l2_rank = l2_hit['rank']
                 combined_rank = 2 / (1/(sa_rank+1) + 1/(l2_rank+1))
-                score = 100.0 / combined_rank
+                score = self.rank_fusion_agreement / combined_rank
                 source = 'both'
                 content = l2_hit.get('content') or sa_hit.get('content', '')
                 summary = l2_hit.get('summary') or sa_hit.get('summary', content[:500])
 
             elif l2_hit:
-                score = 50.0 / (l2_hit['rank'] + 1)
+                score = self.rank_fusion_l2_only / (l2_hit['rank'] + 1)
                 source = 'l2'
                 content = l2_hit.get('content', '')
                 summary = l2_hit.get('summary', content[:500])
 
             else:
-                score = 30.0 / (sa_hit['rank'] + 1)
+                score = self.rank_fusion_sa_only / (sa_hit['rank'] + 1)
                 source = 'sa'
                 content = sa_hit.get('content', '')
                 summary = sa_hit.get('summary', content[:500])
@@ -219,14 +302,22 @@ class ParallelHybrid:
         return results
 
     def _query_sa(
-        self, query: str, top_k: int, context: Optional[List[str]]
-    ) -> List[Dict[str, Any]]:
+        self,
+        query: str,
+        top_k: int,
+        context: Optional[List[str]],
+        analyze: bool = False,
+    ) -> tuple[List[Dict[str, Any]], Optional[Any]]:
         """Query spreading activation."""
         if not self.sa or not getattr(self.sa, '_built', False):
-            return []
+            return [], None
 
         try:
             results = self.sa.query_with_doc_ids(query, top_k=top_k, context=context)
+            analysis = None
+            if analyze:
+                from .boundary import analyze_boundary_results
+                analysis = analyze_boundary_results(self.sa, query, results)
             return [
                 {
                     'doc_id': doc_id,
@@ -236,10 +327,17 @@ class ParallelHybrid:
                     'rank': i,
                 }
                 for i, (doc_id, value, score) in enumerate(results)
-            ]
+            ], analysis
         except Exception as e:
             logger.warning("SA query failed: %s", e)
-            return []
+            return [], None
+
+    @staticmethod
+    def _should_run_global_l2(sa_analysis: Optional[Any]) -> bool:
+        """Return True when SA says the query is low-confidence."""
+        if sa_analysis is None:
+            return False
+        return sa_analysis.context_needed or sa_analysis.confidence == 'low'
 
     def _query_l2(self, query: str, top_k: int) -> List[Dict[str, Any]]:
         """Query L2 vector store."""
