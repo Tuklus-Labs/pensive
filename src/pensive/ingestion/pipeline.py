@@ -56,15 +56,17 @@ def _load_or_create_key() -> bytes:
     The key is used only to verify that graphs were saved by this user;
     it is not a cryptographic secret in the authentication sense.
 
-    A trailing newline / whitespace in the key file is stripped so that a
-    manually-edited file matches what save_graph wrote.
+    The raw key bytes are returned unchanged. ``secrets.token_bytes(32)`` can
+    legitimately produce trailing whitespace bytes (0x09, 0x0a, 0x0b, 0x0c,
+    0x0d, 0x20), and stripping them would silently truncate the key and
+    desync HMAC verification from the in-memory value.
     """
     env = os.environ.get("PENSIVE_PICKLE_KEY")
     if env:
         return env.encode("utf-8")
     path = _default_key_path()
     if path.exists():
-        return path.read_bytes().rstrip()
+        return path.read_bytes()
     # Generate a fresh key, persist at 0600. This is best-effort; if we
     # can't write, we still return a one-shot key so save/load in the
     # same process works.
@@ -142,14 +144,19 @@ class IngestPipeline:
         data = self.sa.get_save_data()
         data['pipeline_stats'] = dict(self.stats)
         payload = pickle.dumps(data, protocol=pickle.HIGHEST_PROTOCOL)
-        with open(path, 'wb') as f:
+        target = Path(path)
+        tmp = target.with_suffix(target.suffix + ".tmp")
+        with open(tmp, 'wb') as f:
             if sign:
                 key = _load_or_create_key()
                 mac = hmac.new(key, payload, hashlib.sha256).digest()
                 f.write(_SIGNED_MAGIC)
                 f.write(mac)
             f.write(payload)
-        size_mb = Path(path).stat().st_size / (1024 * 1024)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, target)
+        size_mb = target.stat().st_size / (1024 * 1024)
         logger.info("Graph saved to %s (%.1f MB, signed=%s)", path, size_mb, sign)
 
     @classmethod

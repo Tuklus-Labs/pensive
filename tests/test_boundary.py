@@ -58,6 +58,18 @@ class TestBoundaryAnalysisDataclass:
         )
         assert ba.confidence == "medium"
 
+    def test_confidence_low_when_context_is_needed(self):
+        ba = BoundaryAnalysis(
+            boundary_distance=0.50,
+            disambiguation_gap=0.01,
+            band_crossing=False,
+            context_needed=True,
+            suggested_context=["199ms"],
+            fundamentally_ambiguous=False,
+            top_scores=[0.65, 0.64],
+        )
+        assert ba.confidence == "low"
+
     def test_no_results_yields_none_boundary(self):
         ba = BoundaryAnalysis(
             boundary_distance=None,
@@ -69,6 +81,32 @@ class TestBoundaryAnalysisDataclass:
             top_scores=[],
         )
         assert ba.confidence == "none"
+
+    def test_should_trust_false_when_context_needed(self):
+        ba = BoundaryAnalysis(
+            boundary_distance=0.50,
+            disambiguation_gap=0.01,
+            band_crossing=False,
+            context_needed=True,
+            suggested_context=["199ms"],
+            fundamentally_ambiguous=False,
+            top_scores=[0.65, 0.64],
+        )
+        assert ba.should_trust is False
+        assert ba.recommended_action == "request_context"
+
+    def test_no_results_recommend_no_result(self):
+        ba = BoundaryAnalysis(
+            boundary_distance=None,
+            disambiguation_gap=None,
+            band_crossing=False,
+            context_needed=False,
+            suggested_context=[],
+            fundamentally_ambiguous=False,
+            top_scores=[],
+        )
+        assert ba.should_trust is False
+        assert ba.recommended_action == "no_result"
 
 
 class TestFrequencyBands:

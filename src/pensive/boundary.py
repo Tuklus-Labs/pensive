@@ -53,6 +53,8 @@ class BoundaryAnalysis:
             return "none"
         if self.boundary_distance is None:
             return "none"
+        if self.context_needed:
+            return "low"
         if self.boundary_distance >= 0.15 and (
             self.disambiguation_gap is None or self.disambiguation_gap >= 0.10
         ):
@@ -62,6 +64,28 @@ class BoundaryAnalysis:
         ):
             return "low"
         return "medium"
+
+    @property
+    def should_trust(self) -> bool:
+        """Research helper: whether the current result looks safe to trust."""
+        if self.confidence == "none":
+            return False
+        if self.context_needed:
+            return False
+        return self.confidence in {"high", "medium"}
+
+    @property
+    def recommended_action(self) -> str:
+        """Research helper for the next retrieval action to take."""
+        if self.confidence == "none":
+            return "no_result"
+        if self.context_needed and not self.fundamentally_ambiguous:
+            return "request_context"
+        if self.context_needed:
+            return "warn_ambiguous"
+        if not self.should_trust:
+            return "warn_low_confidence"
+        return "trust"
 
 
 class FrequencyBands:
@@ -151,6 +175,27 @@ class AnalyzedResult:
     analysis: BoundaryAnalysis
 
 
+def analyze_boundary_results(sa, query_text: str,
+                             results: list,
+                             n_bands: int = 5) -> BoundaryAnalysis:
+    """Compute boundary analysis for an existing SA result set.
+
+    Accepts either `query()` results (`[(value, score), ...]`) or
+    `query_with_doc_ids()` results (`[(doc_id, value, score), ...]`).
+    This lets callers reuse already-fetched SA hits when they only need
+    the diagnostic.
+    """
+    if not sa._built:
+        raise ValueError("Graph not built. Call build() first.")
+
+    score_arr, query_act = _compute_score_arr(sa, query_text)
+    normalized_results = _normalize_results(results)
+    return _compute_analysis(
+        sa, score_arr, normalized_results, query_act, len(normalized_results),
+        n_bands,
+    )
+
+
 def analyze_boundary(sa, query_text: str,
                      top_k: int = 10,
                      context: Optional[List[str]] = None,
@@ -177,7 +222,12 @@ def analyze_boundary(sa, query_text: str,
 
     # Get results via the canonical path (handles numba, max_active, etc.)
     results = sa.query(query_text, top_k=top_k, context=context)
+    analysis = analyze_boundary_results(sa, query_text, results, n_bands=n_bands)
+    return AnalyzedResult(results=results, analysis=analysis)
 
+
+def _compute_score_arr(sa, query_text: str) -> tuple:
+    """Return the raw score array and seeded query activations."""
     # Get the raw score array separately for analysis
     # (We need per-node scores, not just top-k results)
     sa._compile()
@@ -192,10 +242,21 @@ def analyze_boundary(sa, query_text: str,
         for idx, score in spread.items():
             score_arr[idx] = score
 
-    analysis = _compute_analysis(
-        sa, score_arr, results, query_act, top_k, n_bands
-    )
-    return AnalyzedResult(results=results, analysis=analysis)
+    return score_arr, query_act
+
+
+def _normalize_results(results: list) -> list:
+    """Normalize SA results to `(label, score)` tuples."""
+    normalized = []
+    for result in results:
+        if len(result) == 2:
+            label, score = result
+        elif len(result) >= 3:
+            label, score = result[1], result[-1]
+        else:
+            raise ValueError(f"Unsupported SA result tuple: {result!r}")
+        normalized.append((label, float(score)))
+    return normalized
 
 
 def _compute_analysis(

@@ -40,17 +40,23 @@ def test_whitespace_xdg_config_home_falls_back(monkeypatch, tmp_path):
     assert str(p).startswith(str(fake_home))
 
 
-# ------------- Trailing whitespace in key file -------------
+# ------------- Key file bytes returned unchanged -------------
+# secrets.token_bytes(32) can legitimately end in whitespace bytes
+# (0x09/0x0a/0x0b/0x0c/0x0d/0x20). Stripping those on load would silently
+# desync the on-disk key from the in-memory key and break HMAC verification
+# ~2.3% of the time. _load_or_create_key must return the file bytes verbatim.
 
-def test_key_file_trailing_newline_stripped(monkeypatch, tmp_path):
+def test_key_file_bytes_returned_verbatim(monkeypatch, tmp_path):
     monkeypatch.delenv("PENSIVE_PICKLE_KEY", raising=False)
     monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path))
     keydir = tmp_path / "pensive"
     keydir.mkdir()
     keyfile = keydir / "pickle.key"
-    keyfile.write_bytes(b"my-key-value\n")
+    # Key ending in a whitespace byte (0x0a) must NOT be stripped.
+    raw = b"my-key-value\n"
+    keyfile.write_bytes(raw)
     k = _load_or_create_key()
-    assert k == b"my-key-value"
+    assert k == raw, "key file bytes must be returned unchanged (no rstrip)"
 
 
 # ------------- build() exception safety + lock acquisition -------------

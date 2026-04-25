@@ -96,6 +96,28 @@ results = sa.query(
 )
 ```
 
+## Boundary Analysis
+
+Inspect whether a query is close to the activation boundary, mixes rare and
+common entities, or should ask the caller for more context:
+
+```python
+diagnosed = sa.query_analyzed("What was the P99 latency on 2025-07-16?")
+
+print(diagnosed.analysis.confidence)         # "low", "medium", "high", or "none"
+print(diagnosed.analysis.should_trust)       # False when retrieval looks unreliable
+print(diagnosed.analysis.recommended_action) # "trust", "request_context", "no_result", ...
+print(diagnosed.analysis.boundary_distance)  # score - threshold
+print(diagnosed.analysis.context_needed)     # True when SA sees ambiguity
+print(diagnosed.analysis.suggested_context)  # e.g. ["199ms", "257ms"]
+```
+
+From the CLI:
+
+```bash
+pensive query --graph graph.pkl --analyze "What was the P99 latency on 2025-07-16?"
+```
+
 ## Hybrid Retrieval (`pypensive[full]`)
 
 Default flow is two-stage retrieval:
@@ -120,6 +142,7 @@ hybrid = ParallelHybrid(
     l2_handler=l2,
     l2_on_sa_hits=True,       # default
     l2_fallback_global=True,  # default
+    l2_fallback_on_low_confidence=True,  # Escalate ambiguous SA queries to global L2
 )
 results = hybrid.query("What was the P99 latency on 2025-07-16?")
 
