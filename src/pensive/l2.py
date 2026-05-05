@@ -119,13 +119,28 @@ class L2Handler:
         return emb
 
     def _store_embeddings(self, ids: List[int], embeddings: np.ndarray):
-        """Store embeddings in the contiguous array, growing as needed."""
+        """Store embeddings in the contiguous array, growing as needed.
+
+        Newly grown rows are zero-initialized rather than left as
+        ``np.empty`` garbage. The hot-path bounds check is
+        ``faiss_id < self._emb_array.shape[0]`` -- a "stored" row that
+        was never written would still pass that check and then dot-product
+        a zeroed vector against the query, returning a stable 0.0 score
+        instead of a random nonsense one. Faster to allocate empty + zero
+        the new region than ``np.zeros`` the whole capacity each grow.
+        """
         max_id = max(ids) + 1
         if max_id > self._emb_capacity:
             new_cap = max(max_id, self._emb_capacity * 2, 256)
             new_arr = np.empty((new_cap, self._dim), dtype=np.float32)
-            if self._emb_array.shape[0] > 0:
-                new_arr[:self._emb_array.shape[0]] = self._emb_array
+            old_size = self._emb_array.shape[0]
+            if old_size > 0:
+                new_arr[:old_size] = self._emb_array
+            # Zero the newly grown region so any read of an unwritten
+            # slot returns a defined zero vector rather than uninitialized
+            # memory.
+            if new_cap > old_size:
+                new_arr[old_size:new_cap].fill(0.0)
             self._emb_array = new_arr
             self._emb_capacity = new_cap
         for i, fid in enumerate(ids):

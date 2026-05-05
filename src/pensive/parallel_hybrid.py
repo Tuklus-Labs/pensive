@@ -33,10 +33,16 @@ from .pattern_learner import PatternLearner
 
 logger = logging.getLogger(__name__)
 
+# sentence_transformers may import-fail with errors other than ImportError
+# in degraded environments (e.g. transformers itself fails to import a
+# kernel module and surfaces FileNotFoundError, or torch raises OSError
+# on a missing CUDA library). Catch the broad Exception so a degraded
+# upstream dep does not break the rest of ParallelHybrid -- callers that
+# don't ask for cross-encoder reranking get a normal experience.
 try:
     from sentence_transformers import CrossEncoder
     CROSS_ENCODER_AVAILABLE = True
-except ImportError:
+except Exception:  # noqa: BLE001 -- intentionally broad; see comment above
     CrossEncoder = None
     CROSS_ENCODER_AVAILABLE = False
 
@@ -226,8 +232,27 @@ class ParallelHybrid:
         sa_by_id = {r['doc_id']: r for r in sa_results}
         l2_by_id = {r['doc_id']: r for r in l2_results}
 
-        # Merge with agreement boosting (dict_keys supports | natively)
-        all_ids = sa_by_id.keys() | l2_by_id.keys()
+        # Merge with agreement boosting. Sort the union for a deterministic
+        # iteration order so equal-score ties resolve identically across
+        # runs (set-iteration order is not guaranteed across Python
+        # invocations even when the inputs are identical).
+        all_ids = sorted(sa_by_id.keys() | l2_by_id.keys())
+
+        # Rank-fusion floor: an agreement hit at any rank must outrank an
+        # L2-only or SA-only hit at any rank. The simplest formulation
+        # that preserves the "best individual rank" signal while keeping
+        # the tier invariant true across rank=0..tail is:
+        #
+        #     agreement_score = AGREEMENT / (best_rank + 1) + AGREEMENT_FLOOR
+        #
+        # where AGREEMENT_FLOOR is the highest score any single-source
+        # candidate can receive (= L2_ONLY at rank 0). This keeps the
+        # rank ordering inside the "both" tier (lower combined rank ->
+        # higher score) while guaranteeing every "both" hit beats every
+        # single-source hit at any rank pair. l2_only and sa_only retain
+        # their original 1/(rank+1) family so AGREEMENT > L2_ONLY > SA_ONLY
+        # at every shared rank R.
+        agreement_floor = self.rank_fusion_l2_only
 
         candidates = []
         for doc_id in all_ids:
@@ -235,13 +260,17 @@ class ParallelHybrid:
             l2_hit = l2_by_id.get(doc_id)
 
             if sa_hit and l2_hit:
-                # BOTH found it - strong signal. Use harmonic mean of ranks
-                # so a doc ranked #1 by one side and #10 by the other doesn't
-                # get as strong a boost as #1/#1 did.
+                # Both found it. Use the BEST of the two ranks (whichever
+                # source was more confident) as the rank-decay denominator,
+                # then add the floor so every "both" outranks every
+                # single-source result.
                 sa_rank = sa_hit['rank']
                 l2_rank = l2_hit['rank']
-                combined_rank = 2 / (1/(sa_rank+1) + 1/(l2_rank+1))
-                score = self.rank_fusion_agreement / combined_rank
+                best_rank = min(sa_rank, l2_rank)
+                score = (
+                    self.rank_fusion_agreement / (best_rank + 1)
+                    + agreement_floor
+                )
                 source = 'both'
                 content = l2_hit.get('content') or sa_hit.get('content', '')
                 summary = l2_hit.get('summary') or sa_hit.get('summary', content[:500])
@@ -268,7 +297,10 @@ class ParallelHybrid:
                 'source': source,
             })
 
-        candidates.sort(key=lambda x: -x['score'])
+        # Stable, deterministic ordering: primary by descending score,
+        # secondary by doc_id ascending so tied scores resolve to the
+        # same final rank across runs.
+        candidates.sort(key=lambda x: (-x['score'], x['doc_id']))
 
         # Optional cross-encoder reranking
         if self.cross_encoder and candidates:

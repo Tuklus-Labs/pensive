@@ -145,6 +145,51 @@ class SpreadingConfig:
     max_hops: int = 4
     max_active: int = 50
 
+    def __post_init__(self):
+        """Reject configurations that would produce nonsense activations.
+
+        Each rejected condition has a specific failure mode:
+
+        * ``decay >= 1.0`` -- multi-hop ``_spread_general`` multiplies
+          activation by ``decay`` each hop. With decay >= 1 activation
+          grows without bound; the threshold filter never fires and
+          ranking collapses.
+        * ``decay < 0`` -- flips the sign of every propagated score on
+          alternating hops; top-k loses meaning.
+        * ``spec_power < 0`` -- inverts the inverse-frequency weighting,
+          rewarding common entities and burying rare/discriminative ones.
+        * ``threshold < 0`` -- the activation filter ``score >= threshold``
+          stops filtering anything; ``max_active`` becomes the only cap
+          and queries explode in cost.
+        * ``max_hops < 0`` -- ``range(max_hops)`` skips the spread loop
+          entirely and the query returns only the seed activations.
+        """
+        if self.decay >= 1.0:
+            raise ValueError(
+                f"SpreadingConfig.decay must be < 1.0 (got {self.decay}); "
+                "values >= 1 cause unbounded amplification across hops."
+            )
+        if self.decay < 0:
+            raise ValueError(
+                f"SpreadingConfig.decay must be >= 0 (got {self.decay}); "
+                "negative decay flips activation sign per hop."
+            )
+        if self.spec_power < 0:
+            raise ValueError(
+                f"SpreadingConfig.spec_power must be >= 0 (got "
+                f"{self.spec_power}); negative power inverts the "
+                "inverse-frequency weighting."
+            )
+        if self.threshold < 0:
+            raise ValueError(
+                f"SpreadingConfig.threshold must be >= 0 (got "
+                f"{self.threshold}); negative threshold disables filtering."
+            )
+        if self.max_hops < 0:
+            raise ValueError(
+                f"SpreadingConfig.max_hops must be >= 0 (got {self.max_hops})."
+            )
+
 
 # Default patterns for real conversational data
 PATTERNS = REAL_DATA_PATTERNS
@@ -479,7 +524,14 @@ class SpreadingActivation:
                     continue
                 seen_in_doc.add(node_id)
 
-                specificity = 1.0 / (entity_freq[entity] ** spec_power)
+                # Defense-in-depth: clamp freq to >= 1. The vanilla
+                # extraction path increments entity_freq before this
+                # loop runs, so freq should always be >= 1 here, but a
+                # subclass or future caller could populate `extracted`
+                # without updating `entity_freq` and a freq of 0 would
+                # blow up with ZeroDivisionError under spec_power > 0.
+                freq = max(entity_freq[entity], 1)
+                specificity = 1.0 / (freq ** spec_power)
                 is_new = node_id not in node_to_idx
                 ent_idx = self._get_or_add_node(
                     node_id, _ENTITY_TYPE, entity, specificity
@@ -554,7 +606,10 @@ class SpreadingActivation:
                     continue
                 seen_in_doc.add(node_id)
 
-                specificity = 1.0 / (entity_freq[entity] ** spec_power)
+                # Defense-in-depth: clamp freq to >= 1. See _build_locked
+                # for rationale.
+                freq = max(entity_freq[entity], 1)
+                specificity = 1.0 / (freq ** spec_power)
                 is_new = node_id not in node_to_idx
                 ent_idx = self._get_or_add_node(
                     node_id, _ENTITY_TYPE, entity, specificity
@@ -653,7 +708,10 @@ class SpreadingActivation:
                     continue
                 seen_in_doc.add(node_id)
 
-                specificity = 1.0 / (entity_freq[entity] ** spec_power)
+                # Defense-in-depth: clamp freq to >= 1. See _build_locked
+                # for rationale.
+                freq = max(entity_freq[entity], 1)
+                specificity = 1.0 / (freq ** spec_power)
                 is_new = node_id not in node_to_idx
                 ent_idx = self._get_or_add_node(
                     node_id, _ENTITY_TYPE, entity, specificity
@@ -1083,6 +1141,14 @@ class SpreadingActivation:
         if not self._built:
             raise ValueError("Graph not built. Call build() first.")
 
+        # Empty / None / whitespace query short-circuits to no results.
+        # The downstream word-tokenization would yield an empty seed
+        # set anyway, but the upstream fast-path branches still run a
+        # numpy spread over an empty dict and an empty context branch
+        # would crash on `for w in None`.
+        if not query_text:
+            return []
+
         if context is None and self._context_provider is not None:
             context = self._context_provider(query_text)
 
@@ -1135,6 +1201,11 @@ class SpreadingActivation:
         """
         if not self._built:
             raise ValueError("Graph not built. Call build() first.")
+
+        # Empty / None query short-circuits. Mirrors query(); see there
+        # for rationale.
+        if not query_text:
+            return []
 
         if context is None and self._context_provider is not None:
             context = self._context_provider(query_text)

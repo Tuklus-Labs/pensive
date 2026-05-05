@@ -39,14 +39,32 @@ class ChatGPTParser(BaseParser):
     meaningful text content.
     """
 
+    # Default 1 GiB ceiling on conversations.json. The largest exports
+    # observed in production are O(100 MB); anything past 1 GiB is
+    # almost certainly a misuse, a corrupted file, or an attack on
+    # ``json.load`` memory.
+    DEFAULT_MAX_FILE_SIZE: int = 1 * 1024 * 1024 * 1024
+
+    # Cap on how many node hops to follow when walking from a leaf back
+    # to the root. The visited-set already breaks cycles, but a long
+    # straight chain (no cycle) would still walk forever on a malformed
+    # export. ChatGPT conversations very rarely exceed a few thousand
+    # turns; 50,000 is a generous cap.
+    MAX_THREAD_PATH: int = 50_000
+
     def __init__(
         self,
         export_dir: str,
         chunker: SentenceAwareChunker = None,
+        max_file_size: Optional[int] = None,
     ):
         self.export_dir = export_dir
         self.chunker = chunker or _DEFAULT_CHUNKER
         self.query_gen = _DEFAULT_QUERY_GEN
+        self.max_file_size = (
+            max_file_size if max_file_size is not None
+            else self.DEFAULT_MAX_FILE_SIZE
+        )
 
     def source_name(self) -> str:
         return 'chatgpt'
@@ -60,6 +78,21 @@ class ChatGPTParser(BaseParser):
         conversations_path = os.path.join(self.export_dir, 'conversations.json')
         if not os.path.isfile(conversations_path):
             logger.error("conversations.json not found in %s", self.export_dir)
+            return
+
+        # Stat first to reject oversized files before json.load() pulls
+        # the whole blob into memory and the dict explodes 5-10x in size.
+        try:
+            file_size = os.path.getsize(conversations_path)
+        except OSError as e:
+            logger.error("could not stat %s: %s", conversations_path, e)
+            return
+        if self.max_file_size is not None and file_size > self.max_file_size:
+            logger.error(
+                "conversations.json at %s is %d bytes which exceeds the "
+                "max_file_size cap of %d bytes; refusing to load.",
+                conversations_path, file_size, self.max_file_size,
+            )
             return
 
         logger.info("Loading %s ...", conversations_path)
@@ -156,12 +189,25 @@ class ChatGPTParser(BaseParser):
         best_leaf = max(leaves, key=_leaf_time)
 
         # --- walk backward to root ---
+        # The visited set guards against cycles, but a malformed export
+        # could be a long straight chain of millions of nodes that would
+        # eat unbounded RAM/time. Cap the walk at MAX_THREAD_PATH and
+        # log if we hit the ceiling so the operator knows the export
+        # was truncated for safety.
         path_ids: List[str] = []
         current = best_leaf
         visited = set()  # guard against cycles
+        max_path_len = self.MAX_THREAD_PATH
         while current and current not in visited:
             visited.add(current)
             path_ids.append(current)
+            if len(path_ids) >= max_path_len:
+                logger.warning(
+                    "Conversation thread exceeded MAX_THREAD_PATH=%d; "
+                    "truncating walk. Export may be malformed.",
+                    max_path_len,
+                )
+                break
             node = mapping.get(current, {})
             current = node.get('parent')
 
@@ -221,6 +267,12 @@ class ChatGPTParser(BaseParser):
 
         parts = content.get('parts')
         if not parts:
+            return None
+        # Defensive: corrupted / hostile exports have been observed with
+        # `parts` set to a number or string instead of a list. Without
+        # this guard, the `for p in parts` below raises TypeError on
+        # int and aborts the entire ingest mid-batch.
+        if not isinstance(parts, (list, tuple)):
             return None
 
         # Filter to string parts only — dicts are images, tool calls, etc.

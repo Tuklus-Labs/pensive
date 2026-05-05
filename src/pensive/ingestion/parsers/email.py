@@ -97,7 +97,7 @@ class EmailJSONLParser(BaseParser):
                         if len(chunks) > 1:
                             value += f" (part {i+1}/{len(chunks)})"
 
-                        query = self.query_gen.generate(chunk) if hasattr(self.query_gen, 'generate') else ''
+                        query = self.query_gen.for_email(sender, subject, chunk)
 
                         yield SADocument(
                             content=chunk,

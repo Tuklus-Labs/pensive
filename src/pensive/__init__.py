@@ -20,7 +20,7 @@ from .patterns import REAL_DATA_PATTERNS, ALL_PATTERNS, build_pattern_set
 from .boundary import BoundaryAnalysis, AnalyzedResult, FrequencyBands, analyze_boundary
 from .ingestion.pipeline import IngestPipeline
 
-__version__ = "0.1.1"
+__version__ = "0.2.0"
 
 __all__ = [
     'SpreadingActivation',

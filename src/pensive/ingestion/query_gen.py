@@ -57,6 +57,24 @@ class QueryGenerator:
         terms_str = ' '.join(key_terms)
         return f"What happened in {project}? {terms_str}"
 
+    def for_email(self, sender: str, subject: str, body: str) -> str:
+        """Generate a query for an email document.
+
+        Mirrors the structure of ``for_chatgpt`` -- pulls the most
+        distinctive terms out of the body and assembles a natural
+        question phrased the way a user is likely to ask about the
+        message later. Both ``sender`` and ``subject`` may be empty
+        strings (mbox exports sometimes omit one or the other); the
+        output stays well-formed in either case.
+        """
+        key_terms = self._extract_key_terms(body)
+        terms_str = ' '.join(key_terms)
+        sender = (sender or '').strip()
+        subject = (subject or '').strip() or '(no subject)'
+        if sender:
+            return f"What did {sender} email about {subject}? {terms_str}"
+        return f"What was the email about {subject}? {terms_str}"
+
     def _extract_key_terms(self, text: str, max_terms: int = 3) -> List[str]:
         """Extract the most distinctive words from text.
 

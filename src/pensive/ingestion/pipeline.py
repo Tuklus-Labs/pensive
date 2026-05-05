@@ -51,32 +51,63 @@ def _default_key_path() -> Path:
 
 
 def _load_or_create_key() -> bytes:
-    """Get the HMAC key from env or a locally-generated file (0600).
+    """Get the HMAC key from disk first, then env, else generate.
 
-    The key is used only to verify that graphs were saved by this user;
-    it is not a cryptographic secret in the authentication sense.
+    Precedence:
+        1. On-disk key file at ``~/.config/pensive/pickle.key`` (or
+           ``$XDG_CONFIG_HOME/pensive/pickle.key``) if it exists.
+        2. ``PENSIVE_PICKLE_KEY`` environment variable.
+        3. Freshly generated 32-byte key, persisted at 0600.
 
-    The raw key bytes are returned unchanged. ``secrets.token_bytes(32)`` can
-    legitimately produce trailing whitespace bytes (0x09, 0x0a, 0x0b, 0x0c,
-    0x0d, 0x20), and stripping them would silently truncate the key and
-    desync HMAC verification from the in-memory value.
+    The disk-first precedence is deliberate. A hostile shell rc could
+    set ``PENSIVE_PICKLE_KEY`` to a known weak value, then deliver a
+    forged "signed" pickle that passes verification under that key,
+    yielding arbitrary code execution at load time. Reading the file
+    first means an attacker has to overwrite a 0600 file in the user's
+    config directory before the env var is even consulted.
+
+    The raw key bytes are returned unchanged. ``secrets.token_bytes(32)``
+    can legitimately produce trailing whitespace bytes (0x09, 0x0a,
+    0x0b, 0x0c, 0x0d, 0x20), and stripping them would silently truncate
+    the key and desync HMAC verification from the in-memory value.
     """
-    env = os.environ.get("PENSIVE_PICKLE_KEY")
-    if env:
-        return env.encode("utf-8")
     path = _default_key_path()
     if path.exists():
         return path.read_bytes()
+    env = os.environ.get("PENSIVE_PICKLE_KEY")
+    if env:
+        return env.encode("utf-8")
     # Generate a fresh key, persist at 0600. This is best-effort; if we
     # can't write, we still return a one-shot key so save/load in the
     # same process works.
     key = secrets.token_bytes(32)
     try:
         path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        # Best-effort tighten of the parent dir mode. Path.mkdir(mode=...)
+        # is a no-op when the directory already exists, so explicitly
+        # chmod afterwards. Skip silently if we don't own the parent.
+        try:
+            os.chmod(path.parent, 0o700)
+        except OSError as chmod_err:
+            logger.warning(
+                "could not chmod 0700 on %s: %s",
+                path.parent, chmod_err,
+            )
         tmp = path.with_suffix(".key.tmp")
-        tmp.write_bytes(key)
-        tmp.chmod(0o600)
-        tmp.rename(path)
+        # Atomic exclusive open at 0600 so the secret never exists at
+        # umask-default permissions, even briefly. O_EXCL refuses to
+        # overwrite a stale tmp from a crashed prior run; clean it up
+        # first if it's left over.
+        try:
+            os.unlink(tmp)
+        except FileNotFoundError:
+            pass
+        fd = os.open(str(tmp), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        try:
+            os.write(fd, key)
+        finally:
+            os.close(fd)
+        os.replace(str(tmp), str(path))
     except OSError as e:
         logger.warning("could not persist pensive pickle key to %s: %s", path, e)
     return key
@@ -159,8 +190,14 @@ class IngestPipeline:
         size_mb = target.stat().st_size / (1024 * 1024)
         logger.info("Graph saved to %s (%.1f MB, signed=%s)", path, size_mb, sign)
 
+    # 2 GiB default ceiling on graph files. Real corpora top out around
+    # several hundred MB; anything bigger is almost certainly a malformed
+    # or hostile file and will OOM the process during read_bytes().
+    DEFAULT_MAX_LOAD_SIZE: int = 2 * 1024 * 1024 * 1024
+
     @classmethod
-    def load_graph(cls, path: str, trusted: bool = False) -> 'IngestPipeline':
+    def load_graph(cls, path: str, trusted: bool = False,
+                   max_size: Optional[int] = None) -> 'IngestPipeline':
         """Load a previously built graph.
 
         By default the file must carry a valid HMAC signature (produced by
@@ -168,8 +205,25 @@ class IngestPipeline:
         ``trusted=True`` -- this bypasses signature verification and will
         unpickle the file. Do this ONLY if you trust the file's origin;
         a hostile pickle executes arbitrary code when loaded.
+
+        ``max_size`` (bytes) caps how large a file we are willing to read
+        into memory. Defaults to ``DEFAULT_MAX_LOAD_SIZE`` (2 GiB). A
+        file larger than the cap is rejected without being read so a
+        hostile or corrupt artifact cannot OOM the process.
         """
-        raw = Path(path).read_bytes()
+        cap = max_size if max_size is not None else cls.DEFAULT_MAX_LOAD_SIZE
+        target = Path(path)
+        try:
+            file_size = target.stat().st_size
+        except FileNotFoundError:
+            raise
+        if cap is not None and file_size > cap:
+            raise ValueError(
+                f"Graph at {path} is {file_size} bytes which exceeds the "
+                f"max_size cap of {cap} bytes. Pass a larger max_size if "
+                "you trust this file."
+            )
+        raw = target.read_bytes()
         if raw.startswith(_SIGNED_MAGIC):
             header_len = len(_SIGNED_MAGIC)
             min_size = header_len + _HMAC_SIZE
@@ -214,7 +268,18 @@ class IngestPipeline:
                 stacklevel=2,
             )
             data = pickle.loads(raw)
-        sa = SpreadingActivation.from_save_data(data)
+        # Convert structural unpickling errors (KeyError on missing fields,
+        # AttributeError on stale class layouts, TypeError on the wrong
+        # outer type) into the same ValueError shape every other rejection
+        # branch in this loader uses. Keeps caller-side error handling
+        # consistent for "valid HMAC but corrupted/wrong-shape" cases —
+        # e.g. a half-written save from a crashed process.
+        try:
+            sa = SpreadingActivation.from_save_data(data)
+        except (KeyError, AttributeError, TypeError) as e:
+            raise ValueError(
+                f"Graph at {path} is signed but has unexpected structure: {e}"
+            ) from e
         pipe = cls(sa=sa)
         pipe.stats = data.get('pipeline_stats', data.get('stats', {}))
         return pipe

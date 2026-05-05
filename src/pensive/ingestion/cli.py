@@ -13,9 +13,11 @@ Usage:
     pensive stats --graph sa_graph.pkl
 """
 import argparse
+import os
 import sys
 import time
 import logging
+from pathlib import Path
 
 logging.basicConfig(
     level=logging.INFO,
@@ -60,6 +62,21 @@ def cmd_build(args):
     if not parsers:
         print("No data sources specified. Use --chatgpt, --facebook, or --google.")
         sys.exit(1)
+
+    # Resolve and canonicalize the output path so the existence check
+    # operates on the final path, not on a relative form that race
+    # conditions could exploit. Refuse to overwrite an existing file
+    # unless --force is set so an accidental rerun does not wipe a
+    # multi-hour graph build.
+    output_path = Path(args.output).expanduser().resolve()
+    if output_path.exists() and not args.force:
+        print(
+            f"ERROR: output file already exists: {output_path}\n"
+            "Pass --force to overwrite.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+    args.output = str(output_path)
 
     print(f"Building SA graph from {len(parsers)} source(s)...")
     pipeline = IngestPipeline(batch_size=args.batch_size, progress_callback=_progress)
@@ -163,6 +180,10 @@ def main():
                         help='Target chunk size in characters (default: 800)')
     build_p.add_argument('--batch-size', type=int, default=1000,
                         help='Batch size for add_documents (default: 1000)')
+    build_p.add_argument('--force', action='store_true',
+                        help='Overwrite the output file if it already exists. '
+                             'Without this flag, build refuses to clobber an '
+                             'existing graph.')
 
     # query
     query_p = sub.add_parser('query', help='Query the SA graph')

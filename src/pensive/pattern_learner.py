@@ -237,42 +237,73 @@ def integrate_with_sa(sa, learner: PatternLearner):
     Key insight: Value nodes seeded directly won't survive spreading
     (they have no neighbors, just decay below threshold). So we track
     them separately and inject them into final results.
+
+    Cache invalidation: this function pre-builds a cache of value-node
+    labels for the SA graph as it exists at integration time. If the
+    caller subsequently calls ``sa.add_documents`` (which is allowed
+    by the SA API), the cache would go stale -- new value nodes would
+    not be seedable. To prevent that, ``add_documents`` is wrapped to
+    also invalidate the cache. Re-integrating is unnecessary; the next
+    query rebuilds the cache lazily.
     """
     original_seed = sa._seed_from_words
     original_query = sa.query_with_doc_ids
+    original_add_documents = sa.add_documents
 
-    # Lazy index: term → list of value node IDs
-    _learned_term_index: Dict[str, List[str]] = {}
+    # Mutable single-cell containers (so the inner closures can
+    # mutate them without the `nonlocal` dance — list/dict cells are
+    # rebindable through ``[0]`` indexing).
+    _cache: Dict[str, object] = {
+        'value_labels': [],
+        'value_nodes': [],
+        'term_index': {},
+        'valid': False,
+    }
 
     # Track directly seeded value nodes per query (cleared each query)
     _direct_value_seeds: Dict[str, float] = {}
 
-    # Pre-build value node lists once (cached for all future _build_term_index calls)
-    _cached_value_labels: List[str] = []
-    _cached_value_nodes: List[str] = []
-    if hasattr(sa, '_idx_to_node') and hasattr(sa, '_node_type'):
-        for idx, node_id in enumerate(sa._idx_to_node):
-            if sa._node_type[idx] != 1:
-                continue
-            _cached_value_labels.append(sa._node_label[idx].lower())
-            _cached_value_nodes.append(node_id)
-
+    def _rebuild_cache() -> None:
+        """(Re)build the value-node label cache from the current SA graph."""
+        labels: List[str] = []
+        nodes: List[str] = []
+        if hasattr(sa, '_idx_to_node') and hasattr(sa, '_node_type'):
+            for idx, node_id in enumerate(sa._idx_to_node):
+                if sa._node_type[idx] != 1:
+                    continue
+                labels.append(sa._node_label[idx].lower())
+                nodes.append(node_id)
+        term_index: Dict[str, List[str]] = {}
         for term in learner.learned_entities:
-            matches = [node_id for label, node_id in zip(_cached_value_labels, _cached_value_nodes)
-                       if term in label]
-            _learned_term_index[term] = matches
+            term_index[term] = [
+                node_id for label, node_id in zip(labels, nodes)
+                if term in label
+            ]
+        _cache['value_labels'] = labels
+        _cache['value_nodes'] = nodes
+        _cache['term_index'] = term_index
+        _cache['valid'] = True
+
+    _rebuild_cache()
 
     def _build_term_index(term: str) -> List[str]:
         """Build index for a learned term (one-time scan per term).
 
         Uses cached value node lists instead of rescanning all graph nodes.
+        Lazily rebuilds the entire cache if it has been invalidated by
+        an ``add_documents`` call.
         """
-        if term in _learned_term_index:
-            return _learned_term_index[term]
+        if not _cache['valid']:
+            _rebuild_cache()
+        term_index: Dict[str, List[str]] = _cache['term_index']  # type: ignore[assignment]
+        if term in term_index:
+            return term_index[term]
 
-        matches = [node_id for label, node_id in zip(_cached_value_labels, _cached_value_nodes)
+        labels: List[str] = _cache['value_labels']  # type: ignore[assignment]
+        nodes: List[str] = _cache['value_nodes']  # type: ignore[assignment]
+        matches = [node_id for label, node_id in zip(labels, nodes)
                    if term in label]
-        _learned_term_index[term] = matches
+        term_index[term] = matches
         return matches
 
     def patched_seed(words: List[str]) -> Dict[int, float]:
@@ -328,6 +359,22 @@ def integrate_with_sa(sa, learner: PatternLearner):
 
         return results
 
+    def patched_add_documents(documents):
+        """Wrap add_documents to invalidate the cached value-node index.
+
+        Without this, value nodes added after ``integrate_with_sa`` was
+        called would never be reachable through learned terms because
+        ``_cached_value_labels`` was a one-shot snapshot.
+        """
+        result = original_add_documents(documents)
+        _cache['valid'] = False
+        # Drop the per-term lookup table too -- a previously-cached
+        # empty match for a term might be wrong now that new value
+        # nodes exist.
+        _cache['term_index'] = {}
+        return result
+
     sa._seed_from_words = patched_seed
     sa.query_with_doc_ids = patched_query
+    sa.add_documents = patched_add_documents
     logger.info(f"Integrated pattern learner with SA ({len(learner.learned_entities)} learned entities)")
