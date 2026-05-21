@@ -132,7 +132,14 @@ def test_clear_empties_handler():
 def test_parallel_hybrid_shutdown_does_not_hang():
     """shutdown must complete promptly (the thread pool is lazy, so the
     no-pool case should be near-instant). Wrap in a watchdog thread that
-    flips a flag, then assert the call finished before the watchdog."""
+    flips a flag, then assert the call finished before the watchdog.
+
+    PENPY-P7-NEW-1 strengthening: also verify that shutdown ACTUALLY
+    shut the executor down, not just returned. The fix-4 version of
+    this test only proved "shutdown() did not hang" -- replacing the
+    body with `return` still passed. Now we assert the executor's
+    internal _shutdown flag is True AND that submit() raises after.
+    """
     ph = ParallelHybrid(spreading_activation=None, l2_handler=None,
                         enable_pattern_learning=False)
 
@@ -140,6 +147,14 @@ def test_parallel_hybrid_shutdown_does_not_hang():
     # would skip the shutdown branch entirely.
     from concurrent.futures import ThreadPoolExecutor
     ph._executor = ThreadPoolExecutor(max_workers=2)
+    captured_executor = ph._executor
+
+    # Precondition: executor is live, submit works.
+    fut = captured_executor.submit(lambda: 42)
+    assert fut.result(timeout=2.0) == 42, "precondition: executor must be live"
+    assert captured_executor._shutdown is False, (
+        "precondition: executor must not be shut down yet"
+    )
 
     done = threading.Event()
 
@@ -152,6 +167,21 @@ def test_parallel_hybrid_shutdown_does_not_hang():
     t.join(timeout=5.0)
 
     assert done.is_set(), "ParallelHybrid.shutdown did not return within 5s"
+
+    # Sabotage-resistant assertions: replacing shutdown() with `return`
+    # leaves _shutdown=False and submit() still works, so both of these
+    # fail loudly. Tests the contract, not just the call.
+    assert captured_executor._shutdown is True, (
+        "ParallelHybrid.shutdown() must actually shut down the executor "
+        "(executor._shutdown should be True). A no-op shutdown() that "
+        "returns immediately would leave this False."
+    )
+
+    # submit() on a shut-down executor raises RuntimeError. This is the
+    # second half of the sabotage gate -- catches an executor that was
+    # somehow flagged shutdown without actually rejecting submissions.
+    with pytest.raises(RuntimeError):
+        captured_executor.submit(lambda: 1)
 
 
 def test_parallel_hybrid_shutdown_no_executor_safe():
