@@ -307,8 +307,14 @@ def integrate_with_sa(sa, learner: PatternLearner):
         return matches
 
     def patched_seed(words: List[str]) -> Dict[int, float]:
-        # Clear direct seeds from previous query
-        _direct_value_seeds.clear()
+        # NOTE: do NOT clear _direct_value_seeds here. SpreadingActivation
+        # invokes _seed_from_words TWICE per query when a context is
+        # provided (once for the query terms, once for the context terms).
+        # Clearing per-seed wiped the query-derived learned-term hits
+        # before the context call repopulated only context-derived hits,
+        # silently losing the query's own learned entities. The clear is
+        # performed at the entry of patched_query() below, which is the
+        # true per-query boundary. (PENPY-CRIT-2 regression fix.)
 
         # Get original seeds (entity nodes)
         seeds = original_seed(words)
@@ -322,14 +328,28 @@ def integrate_with_sa(sa, learner: PatternLearner):
                 matching_nodes = _build_term_index(term)
                 for node in matching_nodes:
                     # Track direct value node seeds separately
-                    # (they won't survive spreading)
-                    _direct_value_seeds[node] = sa.config.substr_boost
+                    # (they won't survive spreading). Accumulate across
+                    # both the query and context seeding passes; if the
+                    # same node gets seeded twice we keep the larger
+                    # score (currently both passes use substr_boost so
+                    # the value is identical, but max() is the safe
+                    # idempotent merge).
+                    prev = _direct_value_seeds.get(node, 0.0)
+                    boost = sa.config.substr_boost
+                    if boost > prev:
+                        _direct_value_seeds[node] = boost
 
         return seeds
 
     def patched_query(query_text: str, top_k: int = 50,
                       context: Optional[List[str]] = None) -> List[Tuple[str, str, float]]:
         """Query with learned entity support."""
+        # Per-query reset of direct value seeds. patched_seed accumulates
+        # across the query-seeding and (optional) context-seeding calls
+        # within a single original_query invocation; this clear is the
+        # boundary between successive queries.
+        _direct_value_seeds.clear()
+
         # Call original query (which uses patched _seed_from_words)
         results = original_query(query_text, top_k, context)
 
