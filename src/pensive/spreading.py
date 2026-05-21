@@ -1004,6 +1004,15 @@ class SpreadingActivation:
         When numba is available, runs the spread and value-node collection
         in a single JIT kernel, avoiding the numpy round-trip (~20% faster).
         """
+        # PENPY-IMP-6: short-circuit top_k <= 0. The general (non-numpy)
+        # path correctly handles this via heapq.nlargest(0, ...) = [], but
+        # the numpy fast-path's np.argpartition(scores, -0)[-0:] degenerates
+        # to argpartition(scores, 0)[0:] = the full array, leaking ALL
+        # value nodes back to the caller. Negatives are nonsense input but
+        # the guard covers them too.
+        if top_k <= 0:
+            return []
+
         indptr = self._adj.indptr
         indices = self._adj.indices
         data = self._adj.data
@@ -1047,6 +1056,11 @@ class SpreadingActivation:
         self, activations: Dict[int, float], top_k: int
     ) -> List[Tuple[str, str, float]]:
         """Like _spread_and_collect_bipartite but returns (doc_id, value, score)."""
+        # PENPY-IMP-6: see _spread_and_collect_bipartite. Same argpartition
+        # degeneracy applies to this with-ids variant.
+        if top_k <= 0:
+            return []
+
         indptr = self._adj.indptr
         indices = self._adj.indices
         data = self._adj.data
@@ -1101,6 +1115,11 @@ class SpreadingActivation:
         sparse results (~0.5-1% density), this avoids O(n) fancy
         indexing on the full value node array.
         """
+        # PENPY-IMP-6: see _spread_and_collect_bipartite. Reached via the
+        # context+bipartite branch in query() and query_with_doc_ids().
+        if top_k <= 0:
+            return []
+
         # Find all non-zero entries above threshold (sparse)
         nz_all = np.flatnonzero(result >= self.config.threshold)
         if len(nz_all) == 0:
@@ -1126,6 +1145,10 @@ class SpreadingActivation:
     def _collect_from_array_with_ids(self, result: np.ndarray, top_k: int
                                       ) -> List[Tuple[str, str, float]]:
         """Like _collect_from_array but returns (doc_id, value, score)."""
+        # PENPY-IMP-6: see _spread_and_collect_bipartite.
+        if top_k <= 0:
+            return []
+
         nz_all = np.flatnonzero(result >= self.config.threshold)
         if len(nz_all) == 0:
             return []
