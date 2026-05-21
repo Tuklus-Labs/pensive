@@ -25,7 +25,9 @@ def test_imp5_boundary_cache_invalidates_on_rebuild_same_n_nodes():
     Reproduction from PENPY-IMP-5: build A with values 199ms/257ms,
     populate cache via analyze_boundary, rebuild with values 999ms/888ms
     (same n_nodes). Without the fix, analyze_boundary returns the stale
-    199ms/257ms entity disambiguation context instead of the new labels.
+    199ms/257ms entity disambiguation context for B's queries -- the
+    user-visible symptom is analysis.suggested_context coming back empty
+    because the label-index lookup misses on B's new labels.
     """
     docs_a = [
         {'content': 'System latency on 2025-07-16 was 199ms at the 99th percentile.',
@@ -49,10 +51,19 @@ def test_imp5_boundary_cache_invalidates_on_rebuild_same_n_nodes():
     # Build A and prime the cache via an ambiguous query
     sa.build(docs_a)
     result_a = analyze_boundary(sa, "What was the P99 latency on 2025-07-16?")
-    result_a_values = {label for label, _ in result_a.results}
-    assert '199ms' in result_a_values or '257ms' in result_a_values, (
-        "Sanity: build A should surface its own value labels in results, "
-        f"got {result_a_values}"
+    # Sanity: the ambiguous query on A must produce suggested_context
+    # with A's value labels -- if this is empty even with build A,
+    # the test isn't actually exercising the disambiguation path.
+    assert set(result_a.analysis.suggested_context) >= {'199ms', '257ms'}, (
+        "Sanity: build A's ambiguous query should produce "
+        "suggested_context containing both A labels, got "
+        f"{result_a.analysis.suggested_context}"
+    )
+    # Cache must now be populated with A's labels.
+    cached_a = getattr(sa, '_boundary_value_label_index', None)
+    assert cached_a is not None, (
+        "Sanity: analyze_boundary on ambiguous query should populate "
+        "the boundary value-label cache for PENPY-IMP-2."
     )
 
     # Rebuild with docs_b. n_nodes should match (same schema), but every
@@ -69,22 +80,24 @@ def test_imp5_boundary_cache_invalidates_on_rebuild_same_n_nodes():
     )
 
     result_b = analyze_boundary(sa, "What was the P99 latency on 2025-07-16?")
-    result_b_values = {label for label, _ in result_b.results}
 
-    # Post-fix invariant: results from build B must contain B's labels,
-    # not A's. Without the cache fix, the label-index lookup would
-    # silently return [] for B's labels (cache only knows A's) and
-    # _resolve_value_node_idx would return None for both top results.
-    assert '999ms' in result_b_values or '888ms' in result_b_values, (
+    # The user-visible symptom: analysis.suggested_context returns []
+    # instead of B's new labels because _resolve_value_node_idx hits
+    # the stale A-cache, finds no entries for 999ms/888ms, and returns
+    # None for both result indices -- which short-circuits the
+    # differentiating-entities computation.
+    suggested = set(result_b.analysis.suggested_context)
+    assert {'999ms', '888ms'}.issubset(suggested), (
         f"PENPY-IMP-5 regression: rebuild with new value labels returned "
-        f"results {result_b_values} -- expected B's labels (999ms/888ms). "
-        "The boundary value-label cache likely served stale entries from "
-        "build A. Check _get_value_label_index cache key and "
-        "_reset_graph_state invalidation."
+        f"suggested_context={result_b.analysis.suggested_context} -- "
+        "expected B's labels (999ms, 888ms). The boundary value-label "
+        "cache likely served stale entries from build A. Check "
+        "_get_value_label_index cache key and _reset_graph_state "
+        "invalidation."
     )
-    assert '199ms' not in result_b_values and '257ms' not in result_b_values, (
-        f"PENPY-IMP-5 regression: rebuild surfaced A's stale labels "
-        f"in B's results: {result_b_values}"
+    assert '199ms' not in suggested and '257ms' not in suggested, (
+        f"PENPY-IMP-5 regression: rebuild surfaced A's stale labels in "
+        f"B's suggested_context: {result_b.analysis.suggested_context}"
     )
 
 
