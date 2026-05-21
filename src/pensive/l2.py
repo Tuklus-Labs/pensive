@@ -66,12 +66,15 @@ class L2Handler:
             # to get_embedding_dimension; the old name still exists but emits
             # FutureWarning. Prefer the new name when present, fall back to
             # the old one for pre-5 installs. Avoids pinning the dependency.
-            get_dim = getattr(
-                self._model,
-                'get_embedding_dimension',
-                self._model.get_sentence_embedding_dimension,
-            )
-            self._dim = get_dim()
+            # NOTE: cannot use getattr(obj, 'new', obj.old) because the default
+            # arg is evaluated eagerly -- once upstream removes the old alias,
+            # that pattern AttributeErrors before getattr can return the new
+            # name. hasattr() probes are the only safe form. Covered by
+            # tests/test_pass4_pass6_dep1_regression.py.
+            if hasattr(self._model, 'get_embedding_dimension'):
+                self._dim = self._model.get_embedding_dimension()
+            else:
+                self._dim = self._model.get_sentence_embedding_dimension()
             logger.info("Loaded embedding model: %s (dim=%d)",
                         self.config.embedding_model, self._dim)
         except ImportError:
