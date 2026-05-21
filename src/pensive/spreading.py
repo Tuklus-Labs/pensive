@@ -240,8 +240,11 @@ class SpreadingActivation:
         self._node_label: List[str] = []
         self._node_specificity: List[float] = []
 
-        # Edge storage (COO during build, CSR for queries)
-        # array.array enables zero-copy np.frombuffer in _compile()
+        # Edge storage (COO during build, CSR for queries).
+        # array.array gives compact typed storage (8 bytes per int edge,
+        # 4 bytes per float weight) and amortized-O(1) append. _compile()
+        # copies these into fresh numpy arrays -- see PENPY-P5-CRIT-1 in
+        # _compile() for why we do not use np.frombuffer here.
         self._edge_src = array.array('i')
         self._edge_dst = array.array('i')
         self._edge_weight = array.array('f')
@@ -267,11 +270,19 @@ class SpreadingActivation:
         # unsafe for build()-then-rebuild with size-stable schemas.
         self._graph_generation: int = 0
 
-        # Guards concurrent build + query. Queries after build are
-        # generally read-only on the immutable structures, but
-        # build_parallel() concurrently mutates entity_freq which is also
-        # read by _get_specificity during query. Callers that mix
-        # parallel build with live queries should hold this lock.
+        # Guards build_parallel's worker-thread fanout, where the workers
+        # concurrently mutate entity_freq which is also read by
+        # _get_specificity during query. Callers that mix parallel build
+        # with live queries should hold this lock.
+        #
+        # Note (PENPY-P5-CRIT-1): the BufferError race between
+        # add_documents() and concurrent query() is NOT covered by this
+        # lock. That race was solved structurally in _compile() by
+        # copying array.array buffers into fresh numpy arrays instead of
+        # exporting views via np.frombuffer(). add_documents + query is
+        # therefore safe to call concurrently without holding this lock,
+        # subject to the usual rule that mid-update reads can see a
+        # consistent-but-stale graph.
         self._build_lock = threading.RLock()
         self._context_provider = None
         self._extractor = MegaExtractor(self.patterns)
@@ -310,28 +321,96 @@ class SpreadingActivation:
     def _compile(self) -> None:
         """Convert COO edge lists to CSR matrix for fast neighbor iteration.
 
-        Uses np.frombuffer for zero-copy views of the array.array buffers.
-        scipy internally copies during CSR construction so the view is safe.
+        Concurrency model (PENPY-P5-CRIT-1):
+
+        Readers (query()) and writers (add_documents()) both eventually
+        call _compile(). Three hazards we have to defend against:
+
+          1. Buffer-export race -- an earlier version used np.frombuffer()
+             over the array.array storage, which kept a live buffer view
+             while the CSR was being built. A writer's _add_edge.append()
+             during that window raised BufferError. Fix: copy into fresh
+             numpy arrays (np.array(arr)) so no buffer view escapes.
+
+          2. Torn-read race -- copying _edge_src, _edge_dst, _edge_weight
+             one at a time is NOT atomic. A writer that appends between
+             the rows-copy and the cols-copy yields three arrays with
+             mismatched lengths, which scipy rejects with
+             "all index and data arrays must have the same length".
+             Fix: snapshot len() once under the build lock, then copy
+             exactly that many elements from each array.
+
+          3. CSR-publish race -- a reader mid-_compile sees a partially
+             constructed self._adj. Fix: build the new csr_matrix into a
+             local, then assign self._adj in one statement at the end.
+             CPython attribute writes are atomic under the GIL, so other
+             readers either see the old _adj or the new one, never an
+             intermediate.
+
+        We hold self._build_lock for the length snapshot + array copies
+        only. The actual CSR construction happens outside the lock so
+        concurrent queries don't serialize behind a single _compile().
+
         Also caches numpy arrays for node_type and node_specificity.
         """
         if not self._dirty:
             return
         n = len(self._idx_to_node)
-        if not self._edge_src:
-            self._adj = scipy.sparse.csr_matrix((n, n), dtype=np.float32)
+
+        # Snapshot the COO buffers under the lock so writers can't tear
+        # the read between len() and the copy. This is a fast pure-Python
+        # critical section -- a few function calls -- not the O(n_edges)
+        # CSR build itself.
+        with self._build_lock:
+            if not self._dirty:
+                # Another thread already compiled while we waited.
+                return
+            edge_count = len(self._edge_src)
+            # If a sibling reader is mid-compile and changed n via an
+            # add_documents concurrent with our snapshot, recompute now.
+            n = len(self._idx_to_node)
+            if edge_count == 0:
+                weights = rows = cols = None
+            else:
+                # np.array(arr.array) does a clean typed copy with no
+                # buffer-export refcount on the source. We slice to
+                # edge_count to lock in the snapshot length so a later
+                # writer append (between these three copies, e.g. during
+                # GIL release on a large allocation) cannot tear the
+                # snapshot. array.array slicing copies, not views.
+                src_snap = self._edge_src[:edge_count]
+                dst_snap = self._edge_dst[:edge_count]
+                w_snap = self._edge_weight[:edge_count]
+                node_type_snap = bytes(self._node_type)
+                n_terms = len(self._entity_terms)
+            # End of critical section -- now we can do the heavy CSR
+            # construction outside the lock. The snapshots above are
+            # already disconnected from the live arrays.
+
+        if edge_count == 0:
+            new_adj = scipy.sparse.csr_matrix((n, n), dtype=np.float32)
         else:
-            weights = np.frombuffer(self._edge_weight, dtype=np.float32)
-            rows = np.frombuffer(self._edge_src, dtype=np.int32)
-            cols = np.frombuffer(self._edge_dst, dtype=np.int32)
-            self._adj = scipy.sparse.csr_matrix(
+            weights = np.array(w_snap, dtype=np.float32)
+            rows = np.array(src_snap, dtype=np.int32)
+            cols = np.array(dst_snap, dtype=np.int32)
+            new_adj = scipy.sparse.csr_matrix(
                 (weights, (rows, cols)), shape=(n, n),
             )
-        # Fast buffer copy (1100x faster than np.array(list) at 100K nodes)
-        self._node_type_arr = np.frombuffer(self._node_type, dtype=np.int8).copy()
-        # Pre-compute value node indices for fast collection
-        self._value_indices = np.flatnonzero(self._node_type_arr == _VALUE_TYPE)
-        # Cache substring eligibility (avoids per-query len() call)
-        self._do_substr = len(self._entity_terms) <= 10_000
+
+        # Atomic publish of compiled state. Assignments in CPython are
+        # atomic under the GIL, so concurrent readers see either the
+        # complete old set or the complete new set of cached attrs.
+        self._adj = new_adj
+        # bytes -> int8 numpy buffer copy; no view kept on _node_type.
+        new_node_type_arr = np.frombuffer(
+            node_type_snap if edge_count > 0 else bytes(self._node_type),
+            dtype=np.int8,
+        ).copy()
+        self._node_type_arr = new_node_type_arr
+        self._value_indices = np.flatnonzero(new_node_type_arr == _VALUE_TYPE)
+        self._do_substr = (
+            n_terms if edge_count > 0 else len(self._entity_terms)
+        ) <= 10_000
         self._dirty = False
 
     def _reset_graph_state(self) -> None:
@@ -580,27 +659,22 @@ class SpreadingActivation:
         1) count all entity-frequency deltas in the incoming batch
         2) update existing entity weights once
         3) add batch edges with post-update specificity
+
+        PENPY-P5-CRIT-1: the mutation phase (everything that touches
+        _edge_* / _node_* / entity_freq) runs under _build_lock so a
+        concurrent reader's _compile() cannot observe a torn snapshot
+        where, e.g., _edge_src has 1000 entries but _edge_dst has 1001.
+        The regex extraction phase above does not touch shared state, so
+        it stays outside the lock.
         """
         if not documents:
             return
 
-        self._ensure_mutable_edges()
-
-        # PENPY-IMP-5: bump generation so caches keyed on
-        # (n_nodes, generation) invalidate. add_documents() typically
-        # increases n_nodes, but a batch of all-duplicate documents
-        # could leave node count unchanged while still mutating edges
-        # and frequencies.
-        self._graph_generation += 1
-        if hasattr(self, '_boundary_value_label_index'):
-            try:
-                delattr(self, '_boundary_value_label_index')
-            except AttributeError:
-                pass
-
+        # Phase 1: pure extraction, no shared-state mutation. Safe
+        # outside the lock so multiple writers can extract in parallel.
+        extractor_extract = self._extractor.extract
         extracted = []
         batch_counts: Dict[str, int] = defaultdict(int)
-        extractor_extract = self._extractor.extract
         for doc in documents:
             text = doc['content']
             query = doc.get('query')
@@ -612,50 +686,69 @@ class SpreadingActivation:
                 if len(entity) >= 2:
                     batch_counts[entity] += 1
 
-        for entity, count in batch_counts.items():
-            self.entity_freq[entity] += count
+        # Phase 2: graph mutation. Single-writer guard so readers in
+        # _compile() see either the pre-batch or post-batch graph but
+        # not an intermediate where the COO arrays have mismatched
+        # lengths.
+        with self._build_lock:
+            self._ensure_mutable_edges()
 
-        # Keep old edges consistent with the updated frequencies.
-        self._refresh_specificity_for_entities(batch_counts.keys())
+            # PENPY-IMP-5: bump generation so caches keyed on
+            # (n_nodes, generation) invalidate. add_documents() typically
+            # increases n_nodes, but a batch of all-duplicate documents
+            # could leave node count unchanged while still mutating edges
+            # and frequencies.
+            self._graph_generation += 1
+            if hasattr(self, '_boundary_value_label_index'):
+                try:
+                    delattr(self, '_boundary_value_label_index')
+                except AttributeError:
+                    pass
 
-        spec_power = self.config.spec_power
-        edge_weight = self.config.edge_weight
-        entity_freq = self.entity_freq
-        node_to_idx = self._node_to_idx
+            for entity, count in batch_counts.items():
+                self.entity_freq[entity] += count
 
-        for doc, entities in extracted:
-            answer_node = f"v:{doc['id']}"
-            ans_idx = self._get_or_add_node(
-                answer_node, _VALUE_TYPE, doc['value'], 0.0
-            )
+            # Keep old edges consistent with the updated frequencies.
+            self._refresh_specificity_for_entities(batch_counts.keys())
 
-            seen_in_doc = set()
-            for entity, etype in entities:
-                if len(entity) < 2:
-                    continue
-                node_id = f"e:{etype}:{entity}"
-                if node_id in seen_in_doc:
-                    continue
-                seen_in_doc.add(node_id)
+            spec_power = self.config.spec_power
+            edge_weight = self.config.edge_weight
+            entity_freq = self.entity_freq
+            node_to_idx = self._node_to_idx
 
-                # Defense-in-depth: clamp freq to >= 1. See _build_locked
-                # for rationale.
-                freq = max(entity_freq[entity], 1)
-                specificity = 1.0 / (freq ** spec_power)
-                is_new = node_id not in node_to_idx
-                ent_idx = self._get_or_add_node(
-                    node_id, _ENTITY_TYPE, entity, specificity
+            for doc, entities in extracted:
+                answer_node = f"v:{doc['id']}"
+                ans_idx = self._get_or_add_node(
+                    answer_node, _VALUE_TYPE, doc['value'], 0.0
                 )
 
-                if is_new:
-                    self._index_entity_node(entity, node_id)
+                seen_in_doc = set()
+                for entity, etype in entities:
+                    if len(entity) < 2:
+                        continue
+                    node_id = f"e:{etype}:{entity}"
+                    if node_id in seen_in_doc:
+                        continue
+                    seen_in_doc.add(node_id)
 
-                self._add_edge(
-                    ent_idx, ans_idx,
-                    specificity * edge_weight
-                )
+                    # Defense-in-depth: clamp freq to >= 1. See
+                    # _build_locked for rationale.
+                    freq = max(entity_freq[entity], 1)
+                    specificity = 1.0 / (freq ** spec_power)
+                    is_new = node_id not in node_to_idx
+                    ent_idx = self._get_or_add_node(
+                        node_id, _ENTITY_TYPE, entity, specificity
+                    )
 
-        self._built = True
+                    if is_new:
+                        self._index_entity_node(entity, node_id)
+
+                    self._add_edge(
+                        ent_idx, ans_idx,
+                        specificity * edge_weight
+                    )
+
+            self._built = True
 
     def build_parallel(self, documents: List[Dict],
                        workers: Optional[int] = None) -> 'SpreadingActivation':
