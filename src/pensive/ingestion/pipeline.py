@@ -270,13 +270,21 @@ class IngestPipeline:
             data = pickle.loads(raw)
         # Convert structural unpickling errors (KeyError on missing fields,
         # AttributeError on stale class layouts, TypeError on the wrong
-        # outer type) into the same ValueError shape every other rejection
-        # branch in this loader uses. Keeps caller-side error handling
-        # consistent for "valid HMAC but corrupted/wrong-shape" cases —
-        # e.g. a half-written save from a crashed process.
+        # outer type, ValueError from sparse-matrix validation) into the
+        # same ValueError shape every other rejection branch in this
+        # loader uses. Keeps caller-side error handling consistent for
+        # "valid HMAC but corrupted/wrong-shape" cases -- e.g. a
+        # half-written save from a crashed process.
+        # PENPY-P5-IMP-2: ValueError is now raised by
+        # SpreadingActivation._from_sparse_v1 when the CSR matrix fails
+        # check_format(), which catches the prior segfault class
+        # (adj_indices out of bounds for n_nodes). IndexError is
+        # included for the same reason -- numpy / scipy can surface
+        # bounds violations either way.
         try:
             sa = SpreadingActivation.from_save_data(data)
-        except (KeyError, AttributeError, TypeError) as e:
+        except (KeyError, AttributeError, TypeError, ValueError,
+                IndexError) as e:
             raise ValueError(
                 f"Graph at {path} is signed but has unexpected structure: {e}"
             ) from e

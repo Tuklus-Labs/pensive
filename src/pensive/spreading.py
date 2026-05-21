@@ -1485,6 +1485,23 @@ class SpreadingActivation:
             (data['adj_data'], data['adj_indices'], data['adj_indptr']),
             shape=data['adj_shape'],
         )
+        # PENPY-P5-IMP-2: from_save_data() previously trusted adj_indices
+        # / adj_indptr / adj_shape literally. A corrupted (truncated or
+        # tampered) save with adj_indices >= n_nodes would not error at
+        # load time -- the OOB index would survive into the numba JIT
+        # kernel and segfault Python on the first query that seeded the
+        # corresponding entity. check_format(full_check=True) validates
+        # that all indices are in range and indptr is monotone, and
+        # raises ValueError on violation. Wrap any scipy structural
+        # exception into ValueError so callers (e.g. load_graph) catch
+        # corruption uniformly instead of letting it surface as a
+        # delayed segfault.
+        try:
+            sa._adj.check_format(full_check=True)
+        except (ValueError, TypeError, IndexError) as e:
+            raise ValueError(
+                f"from_save_data: corrupted adjacency matrix: {e}"
+            ) from e
         sa._edge_src = array.array('i')
         sa._edge_dst = array.array('i')
         sa._edge_weight = array.array('f')
