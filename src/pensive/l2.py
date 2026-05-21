@@ -62,7 +62,16 @@ class L2Handler:
         try:
             from sentence_transformers import SentenceTransformer
             self._model = SentenceTransformer(self.config.embedding_model)
-            self._dim = self._model.get_sentence_embedding_dimension()
+            # sentence-transformers >=5 renamed get_sentence_embedding_dimension
+            # to get_embedding_dimension; the old name still exists but emits
+            # FutureWarning. Prefer the new name when present, fall back to
+            # the old one for pre-5 installs. Avoids pinning the dependency.
+            get_dim = getattr(
+                self._model,
+                'get_embedding_dimension',
+                self._model.get_sentence_embedding_dimension,
+            )
+            self._dim = get_dim()
             logger.info("Loaded embedding model: %s (dim=%d)",
                         self.config.embedding_model, self._dim)
         except ImportError:
