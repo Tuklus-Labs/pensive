@@ -106,7 +106,16 @@ class L2Handler:
         self._qc_fid_buf: np.ndarray = np.empty(256, dtype=np.int64)
         self._qc_emb_buf: np.ndarray = np.empty((256, self._dim), dtype=np.float32)
         self._qc_scores_buf: np.ndarray = np.empty(256, dtype=np.float32)
-        # Persistent 2D view for query vector reshape (avoids alloc per search)
+        # Persistent 2D view for query vector reshape (avoids alloc per search).
+        # PENPY-MIN-2: this buffer is shared between query() and the
+        # large-n branch of query_candidates(). Both paths acquire
+        # self._lock before reading/writing it, so concurrent calls
+        # serialize correctly. Any new caller that touches this buffer
+        # MUST also hold self._lock for the duration of the write+use
+        # pair (i.e. fill _query_2d and consume it before releasing).
+        # batch_query() deliberately allocates a separate reshape rather
+        # than share this buffer; do not change that without auditing
+        # the lock contract here.
         self._query_2d: np.ndarray = np.empty((1, self._dim), dtype=np.float32)
 
     def _encode_query(self, text: str) -> np.ndarray:
