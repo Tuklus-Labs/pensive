@@ -289,7 +289,18 @@ class SpreadingActivation:
 
     def _get_or_add_node(self, node_id: str, node_type: int,
                          label: str, specificity: float) -> int:
-        """Get existing node index or add a new node. Returns the index."""
+        """Get existing node index or add a new node. Returns the index.
+
+        PENPY-P7-NEW-5: marks the graph dirty on new-node creation. The
+        edge-add path also sets _dirty=True, but add_documents() can grow
+        _idx_to_node without ever calling _add_edge() if a document
+        contains no entities matched by the patterns (the v: answer node
+        is still appended). Without this flag, _adj.shape[0] stays at the
+        old node count while _idx_to_node lengthens, so queries operate
+        on a stale CSR and save/load round-trips fail the n_nodes
+        validation. Setting _dirty here is canonical: anything that
+        appends to _idx_to_node must trigger a recompile.
+        """
         idx = self._node_to_idx.get(node_id)
         if idx is not None:
             self._node_specificity[idx] = specificity
@@ -300,6 +311,7 @@ class SpreadingActivation:
         self._node_type.append(node_type)
         self._node_label.append(label)
         self._node_specificity.append(specificity)
+        self._dirty = True
         return idx
 
     def _add_edge(self, src_idx: int, dst_idx: int, weight: float) -> None:
