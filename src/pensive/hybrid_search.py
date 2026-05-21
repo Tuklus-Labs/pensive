@@ -295,7 +295,18 @@ def boost_identifier_matches(
                 source=result.source
             ))
         else:
-            boosted.append(result)
+            # PENPY-IMP-4: always emit a fresh SearchResult so the rank
+            # reassignment below doesn't mutate caller-owned objects.
+            # Previously the unchanged input was appended directly,
+            # which silently overwrote .rank on the caller's instance.
+            boosted.append(SearchResult(
+                document_id=result.document_id,
+                content=result.content,
+                score=result.score,
+                rank=result.rank,
+                metadata=dict(result.metadata),
+                source=result.source,
+            ))
 
     boosted.sort(key=lambda x: x.score, reverse=True)
     for i, result in enumerate(boosted, start=1):

@@ -399,10 +399,35 @@ class ParallelHybrid:
         try:
             if hasattr(self.l2, 'query_candidates'):
                 results = self.l2.query_candidates(query, candidate_doc_ids, top_k=top_k)
-            else:
-                # Compatibility fallback for older L2 handlers.
-                results = self.l2.query(query, top_k=top_k)
-            return self._normalize_l2_results(results)
+                return self._normalize_l2_results(results)
+
+            # Compatibility fallback for older L2 handlers without
+            # query_candidates(). The contract of this method is
+            # "rerank these specific candidate doc IDs"; returning
+            # arbitrary global results would silently break the
+            # downstream agreement-boost logic by mixing in doc IDs
+            # that were never in the SA candidate set. So we issue a
+            # global query but filter the results down to the
+            # candidate set before returning. If the global query
+            # surfaces fewer than top_k of the candidates, callers can
+            # still combine these with the SA-only path; we don't
+            # backfill with non-candidate global hits here.
+            # (PENPY-IMP-1 contract fix.)
+            logger.warning(
+                "L2 handler %s lacks query_candidates(); using filtered "
+                "global-query fallback (consider upgrading the handler).",
+                type(self.l2).__name__,
+            )
+            candidate_set = set(candidate_doc_ids)
+            # Ask for more than top_k to compensate for filtering loss.
+            oversample_k = max(top_k * 4, top_k + len(candidate_doc_ids))
+            results = self.l2.query(query, top_k=oversample_k)
+            normalized = self._normalize_l2_results(results)
+            filtered = [r for r in normalized if r['doc_id'] in candidate_set]
+            # Re-rank within the filtered subset.
+            for i, r in enumerate(filtered[:top_k]):
+                r['rank'] = i
+            return filtered[:top_k]
         except Exception as e:
             logger.warning("Candidate L2 query failed: %s", e)
             return []

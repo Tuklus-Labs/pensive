@@ -3,6 +3,7 @@ import subprocess
 import sys
 
 from pensive.mega_extract import MegaExtractor
+from pensive.parallel_hybrid import ParallelHybrid
 from pensive.pattern_learner import PatternLearner, integrate_with_sa
 from pensive.patterns import SYNTHETIC_PATTERNS
 from pensive.spreading import SpreadingActivation
@@ -203,3 +204,195 @@ def test_case_insensitive_literal_alternation_still_works():
         assert types_emitted.count("thing") == 2, (
             f"ci=True should match all cases for {text!r}, got {got}"
         )
+
+
+# ---------------------------------------------------------------------------
+# PENPY-IMP-1: L2 candidate-rerank fallback must respect the candidate set
+# ---------------------------------------------------------------------------
+
+
+class _LegacyL2Result:
+    def __init__(self, document_id, content, score):
+        self.document_id = document_id
+        self.content = content
+        self.score = score
+
+
+class _LegacyL2NoCandidates:
+    """L2 handler WITHOUT query_candidates() to exercise the fallback path.
+
+    The global query() returns a mix of in-candidate-set and out-of-set
+    doc IDs so we can prove the fallback filters correctly.
+    """
+    def __init__(self, payload):
+        self._payload = payload
+        self.global_call_count = 0
+
+    def query(self, query_text, top_k=10):
+        self.global_call_count += 1
+        return self._payload[:top_k]
+
+
+def test_l2_candidate_fallback_filters_to_candidate_set():
+    """PENPY-IMP-1 regression: when the L2 handler lacks query_candidates(),
+    _query_l2_on_candidates() must filter the global-query results down
+    to the SA candidate set. Returning arbitrary global doc IDs would
+    silently break the agreement-boost logic downstream by treating
+    non-candidate documents as if they were SA hits.
+
+    Sabotage check: reverting the fix (return unfiltered global results)
+    surfaces 'doc-OUT' from the global query, which was never in the
+    candidate list.
+    """
+    # Global L2 returns a deliberately scrambled mix.
+    legacy_l2 = _LegacyL2NoCandidates([
+        _LegacyL2Result('doc-OUT', 'unrelated content', 0.95),  # NOT a candidate
+        _LegacyL2Result('doc-A', 'relevant A', 0.80),
+        _LegacyL2Result('doc-OUT2', 'also unrelated', 0.75),    # NOT a candidate
+        _LegacyL2Result('doc-B', 'relevant B', 0.60),
+    ])
+
+    hybrid = ParallelHybrid(
+        spreading_activation=None,
+        l2_handler=legacy_l2,
+        enable_pattern_learning=False,
+    )
+
+    results = hybrid._query_l2_on_candidates(
+        query='anything',
+        candidate_doc_ids=['doc-A', 'doc-B'],
+        top_k=5,
+    )
+
+    returned_ids = {r['doc_id'] for r in results}
+    assert returned_ids == {'doc-A', 'doc-B'}, (
+        f"Candidate-rerank fallback must filter to the candidate set. "
+        f"Got {returned_ids!r}, expected only doc-A/doc-B. "
+        f"Returning unfiltered global results (the pre-fix behavior) "
+        f"would have leaked doc-OUT/doc-OUT2 through."
+    )
+    assert legacy_l2.global_call_count == 1, (
+        f"Expected exactly one global query() call, got "
+        f"{legacy_l2.global_call_count}"
+    )
+
+
+def test_l2_candidate_fallback_empty_candidate_set_returns_empty():
+    """Companion to PENPY-IMP-1: an empty candidate set must short-circuit
+    and never issue a global L2 query."""
+    legacy_l2 = _LegacyL2NoCandidates([
+        _LegacyL2Result('doc-OUT', 'unrelated content', 0.95),
+    ])
+
+    hybrid = ParallelHybrid(
+        spreading_activation=None,
+        l2_handler=legacy_l2,
+        enable_pattern_learning=False,
+    )
+
+    results = hybrid._query_l2_on_candidates(
+        query='anything',
+        candidate_doc_ids=[],
+        top_k=5,
+    )
+
+    assert results == []
+    assert legacy_l2.global_call_count == 0, (
+        f"Empty candidate list must short-circuit before issuing a global "
+        f"L2 query; got {legacy_l2.global_call_count} calls"
+    )
+
+
+# ---------------------------------------------------------------------------
+# PENPY-IMP-3: boundary.analyze_boundary must handle None/empty queries
+# ---------------------------------------------------------------------------
+
+
+def test_analyze_boundary_handles_none_query():
+    """PENPY-IMP-3 regression: analyze_boundary(sa, None) must not crash.
+
+    SpreadingActivation.query(None) already returns []. The boundary
+    diagnostic path forgot to mirror that guard: _compute_score_arr ran
+    `query_text.split()` on None and raised AttributeError. The bug was
+    masked in ParallelHybrid by a broad `except Exception`, surfacing as
+    'SA query failed' log spam instead.
+
+    Sabotage check: removing the falsy-query guard from
+    analyze_boundary_results makes this test raise AttributeError on
+    `None.split`.
+    """
+    from pensive.boundary import analyze_boundary, analyze_boundary_results
+
+    sa = SpreadingActivation(patterns=SYNTHETIC_PATTERNS)
+    sa.build([
+        {"id": "doc-a", "content": "alpha", "value": "alpha",
+         "query": "alpha?"},
+    ])
+
+    # Direct results-helper call with None should not throw and should
+    # return a no-result BoundaryAnalysis.
+    analysis = analyze_boundary_results(sa, None, [])
+    assert analysis.boundary_distance is None
+    assert analysis.top_scores == []
+    assert analysis.confidence == "none"
+
+    # Same for empty string.
+    analysis_empty = analyze_boundary_results(sa, "", [])
+    assert analysis_empty.top_scores == []
+    assert analysis_empty.confidence == "none"
+
+    # Full analyze_boundary() entry point also routes through this.
+    full = analyze_boundary(sa, None)
+    assert full.results == []
+    assert full.analysis.top_scores == []
+    assert full.analysis.confidence == "none"
+
+
+# ---------------------------------------------------------------------------
+# PENPY-IMP-4: boost_identifier_matches must not mutate caller's input ranks
+# ---------------------------------------------------------------------------
+
+
+def test_boost_identifier_matches_does_not_mutate_input_rank():
+    """PENPY-IMP-4 regression: when a result is not boosted (no
+    identifier match), boost_identifier_matches used to re-export the
+    original SearchResult and then reassign its .rank, silently
+    mutating caller-owned state. Callers retaining a reference to the
+    input list saw ranks overwritten out from under them.
+
+    Sabotage check: dropping the new-SearchResult construction on the
+    not-boosted branch makes the input rank get reassigned by the
+    function's tail loop.
+    """
+    from pensive.hybrid_search import SearchResult, boost_identifier_matches
+
+    # The query contains a hex identifier; only doc-A's content matches.
+    inputs = [
+        SearchResult(
+            document_id='doc-A', content='see 0xdeadbeef for context',
+            score=0.5, rank=42, source='dense',
+        ),
+        SearchResult(
+            document_id='doc-B', content='unrelated body',
+            score=0.4, rank=99, source='dense',
+        ),
+    ]
+    original_rank_B = inputs[1].rank
+    original_score_B = inputs[1].score
+    original_meta_B = dict(inputs[1].metadata)
+
+    out = boost_identifier_matches(inputs, query='look up 0xdeadbeef now')
+
+    # doc-B (not boosted) must NOT have its caller-visible rank
+    # changed.
+    assert inputs[1].rank == original_rank_B, (
+        f"Expected input doc-B rank to remain {original_rank_B}, "
+        f"but it was mutated to {inputs[1].rank} (function leaked rank "
+        f"reassignment into caller-owned object)."
+    )
+    # Score and metadata also untouched.
+    assert inputs[1].score == original_score_B
+    assert inputs[1].metadata == original_meta_B
+
+    # The returned list still has well-ordered ranks (1, 2, ...).
+    assert [r.rank for r in out] == list(range(1, len(out) + 1))

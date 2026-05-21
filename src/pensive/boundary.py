@@ -188,6 +188,22 @@ def analyze_boundary_results(sa, query_text: str,
     if not sa._built:
         raise ValueError("Graph not built. Call build() first.")
 
+    # Mirror SpreadingActivation.query()'s falsy-query short-circuit
+    # (PENPY-IMP-3). Without this, _compute_score_arr() would call
+    # `query_text.split()` on None and raise AttributeError; an empty
+    # string would propagate to an empty seed set with no useful
+    # analysis. Either way, the analysis collapses to the no-results
+    # branch of _compute_analysis, so return that directly.
+    if not query_text:
+        return _compute_analysis(
+            sa,
+            score_arr=np.zeros(0, dtype=np.float32),
+            results=[],
+            query_act={},
+            top_k=0,
+            n_bands=n_bands,
+        )
+
     score_arr, query_act = _compute_score_arr(sa, query_text)
     normalized_results = _normalize_results(results)
     return _compute_analysis(
@@ -333,17 +349,67 @@ def _resolve_value_node_idx(sa, score_arr: np.ndarray, result: tuple) -> Optiona
 
     Uses the score array to disambiguate when multiple value nodes
     share the same label -- picks the one whose score matches.
+
+    Uses a per-SA cached label->[value-idx,...] inverse index instead of
+    a linear scan over all nodes. At 164K-doc corpora the linear scan
+    used to dominate per-query cost; the cache is built once on the
+    first ambiguous-query analysis and reused thereafter. The cache is
+    invalidated if the SA grows (node count changes); the next call
+    rebuilds it lazily. (PENPY-IMP-2 perf fix.)
     """
     label, score = result
+    index = _get_value_label_index(sa)
+    matches = index.get(label)
+    if not matches:
+        return None
+    if len(matches) == 1:
+        return matches[0]
     best_idx = None
     best_diff = float('inf')
-    for idx, node_label in enumerate(sa._node_label):
-        if node_label == label and sa._node_type[idx] == _VALUE_TYPE:
-            diff = abs(float(score_arr[idx]) - score)
-            if diff < best_diff:
-                best_diff = diff
-                best_idx = idx
+    for idx in matches:
+        diff = abs(float(score_arr[idx]) - score)
+        if diff < best_diff:
+            best_diff = diff
+            best_idx = idx
     return best_idx
+
+
+def _get_value_label_index(sa) -> Dict[str, List[int]]:
+    """Return (cached) {label -> [value-node indices]} dict for the SA.
+
+    Lazily built on first call; invalidated when the SA's node count
+    changes (the only kind of growth this module observes). Caching is
+    keyed on a private attribute on the SA itself so callers don't need
+    to thread state through.
+    """
+    cache_attr = '_boundary_value_label_index'
+    n_nodes = len(sa._idx_to_node)
+    cached = getattr(sa, cache_attr, None)
+    if cached is not None and cached[0] == n_nodes:
+        return cached[1]
+
+    index: Dict[str, List[int]] = {}
+    # Prefer the precomputed _value_indices numpy array if available; it
+    # already filters to value nodes, avoiding the per-node type check.
+    value_indices = getattr(sa, '_value_indices', None)
+    if value_indices is not None:
+        node_label = sa._node_label
+        for idx in value_indices:
+            idx_int = int(idx)
+            index.setdefault(node_label[idx_int], []).append(idx_int)
+    else:
+        node_type = sa._node_type
+        for idx, node_label in enumerate(sa._node_label):
+            if node_type[idx] == _VALUE_TYPE:
+                index.setdefault(node_label, []).append(idx)
+
+    try:
+        setattr(sa, cache_attr, (n_nodes, index))
+    except (AttributeError, TypeError):
+        # SA may use __slots__ in some future version; fall back to
+        # returning the freshly-built index uncached.
+        pass
+    return index
 
 
 def _find_differentiating_entities(sa, idx_a: int, idx_b: int) -> tuple:

@@ -1146,7 +1146,9 @@ class SpreadingActivation:
         # set anyway, but the upstream fast-path branches still run a
         # numpy spread over an empty dict and an empty context branch
         # would crash on `for w in None`.
-        if not query_text:
+        # (PENPY-MIN-1: also catch whitespace-only queries so the
+        # comment-vs-code contract holds.)
+        if not (query_text and query_text.strip()):
             return []
 
         if context is None and self._context_provider is not None:
@@ -1202,9 +1204,9 @@ class SpreadingActivation:
         if not self._built:
             raise ValueError("Graph not built. Call build() first.")
 
-        # Empty / None query short-circuits. Mirrors query(); see there
-        # for rationale.
-        if not query_text:
+        # Empty / None / whitespace query short-circuits. Mirrors
+        # query(); see there for rationale. (PENPY-MIN-1.)
+        if not (query_text and query_text.strip()):
             return []
 
         if context is None and self._context_provider is not None:
