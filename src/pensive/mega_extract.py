@@ -21,7 +21,15 @@ _WORD_RE = re.compile(r'[a-zA-Z0-9]+')
 class MegaExtractor:
     """Combine regex patterns into mega-regexes + literal sets for fast extraction.
 
-    All patterns must have exactly 1 capturing group containing the entity text.
+    All patterns must have exactly 1 capturing group containing the entity
+    text. This is validated at construction (see PENPY-MIN-4): a pattern
+    with 0 groups, multiple positional groups, or any named groups
+    (``(?P<name>...)``) raises ``ValueError`` immediately instead of
+    deferring to an IndexError on the first match. Non-capturing groups
+    ``(?:...)`` and lookahead/lookbehind assertions ``(?=...)``,
+    ``(?!...)``, ``(?<=...)``, ``(?<!...)`` do NOT count as capturing
+    groups and are fine to use freely.
+
     Patterns are split by case sensitivity and joined with | alternation.
     Pure literal alternation patterns are further extracted into frozenset
     lookups to avoid regex overhead for simple word matching.
@@ -38,8 +46,50 @@ class MegaExtractor:
 
         Args:
             patterns: List of (regex_str, entity_type, case_insensitive) tuples.
-                      Each regex must have exactly 1 capturing group.
+                      Each regex must have exactly 1 capturing group; see the
+                      class docstring for the full restriction.
+
+        Raises:
+            ValueError: If any pattern violates the single-capturing-group
+                contract, or contains a named capturing group. The pre-fix
+                behavior was a runtime IndexError on the first match against
+                a multi-group pattern (PENPY-MIN-4); validating at
+                construction surfaces caller errors immediately and with
+                actionable context (pattern index + actual group count).
         """
+        # PENPY-MIN-4: validate up front. _build_mega + extract() assume
+        # each pattern contributes exactly one capturing group whose index
+        # corresponds to a slot in etype_map. Named groups also break the
+        # m.lastindex -> etype_map indexing in subtle ways. Catch both
+        # before they cause IndexError at extract() time.
+        for idx, (regex_str, _etype, _ci) in enumerate(patterns):
+            try:
+                compiled = re.compile(regex_str)
+            except re.error as e:
+                raise ValueError(
+                    f"MegaExtractor: pattern {idx} ({regex_str!r}) is not "
+                    f"a valid regex: {e}"
+                ) from e
+            if compiled.groups != 1:
+                raise ValueError(
+                    f"MegaExtractor: pattern {idx} ({regex_str!r}) has "
+                    f"{compiled.groups} capturing groups, expected 1. "
+                    f"Wrap shared sub-expressions in non-capturing "
+                    f"groups (?:...) or use lookahead/lookbehind "
+                    f"assertions instead."
+                )
+            if compiled.groupindex:
+                # groupindex maps named-group name -> group number.
+                # Even if there's only 1 group total, naming it shifts
+                # the etype_map indexing assumption.
+                named = sorted(compiled.groupindex.keys())
+                raise ValueError(
+                    f"MegaExtractor: pattern {idx} ({regex_str!r}) uses "
+                    f"named capturing groups {named}, which conflict "
+                    f"with the lastindex-based etype mapping. Use a "
+                    f"plain positional group `(...)` instead."
+                )
+
         ci_pats = [(r, et) for r, et, ci in patterns if ci]
         cs_pats = [(r, et) for r, et, ci in patterns if not ci]
 
