@@ -213,6 +213,25 @@ results = idx.search("error 0x4F2A")  # Exact identifier matching
 | 10M docs | ~0.4ms | 30 GB | ~10 min |
 | 50M docs | ~0.45ms | 139 GB | ~28 min |
 
+### Long-lived processes: structural memory growth
+
+The graph is append-only: `add_documents()` extends `_idx_to_node`,
+`_node_to_idx`, `_node_label`, and the COO edge buffers without
+compacting. A pure-query workload has flat RSS, but a daemon that
+indefinitely interleaves `add_documents()` with queries grows RSS
+roughly linearly with corpus size. Pass-7 measured the per-node cost
+at ~50 bytes (Python dict + list slot overhead, not counting edge
+buffers), so 1M incrementally-added nodes adds ~50 MB on top of the
+adjacency matrix.
+
+This is not a leak; it is the structural cost of an append-only graph
+with no eviction or compaction path. For very-long-lived processes
+that ingest forever, the recommended pattern is to periodically
+serialize the graph with `get_save_data()`, discard the old
+`SpreadingActivation` instance, and rebuild from the save -- which
+also defragments the underlying Python data structures. A dedicated
+`compact()` method is on the roadmap; track in the issue tracker.
+
 ## License
 
 MIT
