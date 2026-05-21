@@ -45,3 +45,55 @@ def test_cli_has_trusted_flag():
     assert "--trusted" in help_out.stdout, (
         f"stats subcommand missing --trusted flag. stdout:\n{help_out.stdout}"
     )
+
+
+def test_case_sensitive_literal_alternation_matches_original_case():
+    """PENPY-CRIT-1 regression: a literal alternation pattern registered
+    with case_insensitive=False must match ONLY the original-case forms.
+
+    The fast-literal optimization in _split_literal_patterns used to
+    unconditionally lowercase keys, which silently broke case-sensitive
+    literal patterns: the dict stored 'foo'/'bar' but extract() looked
+    up 'Foo'/'Bar', so no matches ever fired.
+    """
+    # Case-sensitive literal alternation
+    patterns = [(r"\b(Foo|Bar)\b", "thing", False)]
+    extractor = MegaExtractor(patterns)
+
+    # Original case: must match
+    got = extractor.extract("Look at Foo and Bar over there")
+    types_emitted = [etype for _, etype in got]
+    assert types_emitted.count("thing") == 2, (
+        f"Case-sensitive literals 'Foo' and 'Bar' should each match, got {got}"
+    )
+
+    # Lowercase: must NOT match (case-sensitive pattern)
+    got_lower = extractor.extract("look at foo and bar over there")
+    types_lower = [etype for _, etype in got_lower]
+    assert "thing" not in types_lower, (
+        f"Case-sensitive pattern must NOT match lowercase variants, "
+        f"got {got_lower}"
+    )
+
+    # Mixed: only the matching-case word should fire
+    got_mixed = extractor.extract("Foo and bar — only Foo should match")
+    types_mixed = [etype for _, etype in got_mixed]
+    assert types_mixed.count("thing") == 2, (
+        f"Two case-correct 'Foo' should match, got {got_mixed}"
+    )
+
+
+def test_case_insensitive_literal_alternation_still_works():
+    """Counterpart to PENPY-CRIT-1: ci=True literals must still match
+    regardless of case (don't break the original behaviour while fixing
+    the ci=False bug).
+    """
+    patterns = [(r"\b(Foo|Bar)\b", "thing", True)]
+    extractor = MegaExtractor(patterns)
+
+    for text in ("foo bar", "FOO BAR", "Foo Bar", "fOo bAr"):
+        got = extractor.extract(text)
+        types_emitted = [etype for _, etype in got]
+        assert types_emitted.count("thing") == 2, (
+            f"ci=True should match all cases for {text!r}, got {got}"
+        )

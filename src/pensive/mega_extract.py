@@ -43,8 +43,8 @@ class MegaExtractor:
         ci_pats = [(r, et) for r, et, ci in patterns if ci]
         cs_pats = [(r, et) for r, et, ci in patterns if not ci]
 
-        ci_regex_pats, ci_literals = _split_literal_patterns(ci_pats)
-        cs_regex_pats, cs_literals = _split_literal_patterns(cs_pats)
+        ci_regex_pats, ci_literals = _split_literal_patterns(ci_pats, case_insensitive=True)
+        cs_regex_pats, cs_literals = _split_literal_patterns(cs_pats, case_insensitive=False)
 
         self._ci_regex, self._ci_etype_map = _build_mega(ci_regex_pats, re.IGNORECASE)
         self._cs_regex, self._cs_etype_map = _build_mega(cs_regex_pats, 0)
@@ -67,11 +67,19 @@ class MegaExtractor:
             for m in _WORD_RE.finditer(text):
                 w = m.group()
                 wl = w.lower()
+                ci_hit = False
                 if ci_literals:
                     etype = ci_literals.get(wl)
                     if etype is not None:
                         results.append((wl, etype))
-                if cs_literals:
+                        ci_hit = True
+                if cs_literals and not ci_hit:
+                    # Skip cs lookup if ci already matched this word's
+                    # lowercase form -- prevents duplicate emission when
+                    # a caller (e.g. via subclass) populates both dicts
+                    # with overlapping keys. The current
+                    # _split_literal_patterns won't produce overlaps, but
+                    # the guard preserves the dedupe contract.
                     etype = cs_literals.get(w)
                     if etype is not None:
                         # Return lowercase for consistency with extract()'s
@@ -111,11 +119,13 @@ class MegaExtractor:
             for m in _WORD_RE.finditer(text):
                 w = m.group()
                 wl = w.lower()
+                ci_hit = False
                 if ci_literals:
                     etype = ci_literals.get(wl)
                     if etype is not None:
                         results.append((wl, etype, w))
-                if cs_literals:
+                        ci_hit = True
+                if cs_literals and not ci_hit:
                     etype = cs_literals.get(w)
                     if etype is not None:
                         results.append((wl, etype, w))
@@ -148,11 +158,13 @@ class MegaExtractor:
                 wl = w.lower()
                 start = m.start()
                 end = m.end()
+                ci_hit = False
                 if ci_literals:
                     etype = ci_literals.get(wl)
                     if etype is not None:
                         all_spans.append((start, end, wl, etype))
-                if cs_literals:
+                        ci_hit = True
+                if cs_literals and not ci_hit:
                     etype = cs_literals.get(w)
                     if etype is not None:
                         all_spans.append((start, end, wl, etype))
@@ -218,6 +230,7 @@ class MegaExtractor:
 
 def _split_literal_patterns(
     patterns: List[Tuple[str, str]],
+    case_insensitive: bool = True,
 ) -> Tuple[List[Tuple[str, str]], Dict[str, str]]:
     """Split patterns into regex patterns and literal word lookups.
 
@@ -225,8 +238,15 @@ def _split_literal_patterns(
         \\b(word1|word2|...)\\b
     where every alternative is purely alphanumeric [a-zA-Z0-9]+.
 
+    Args:
+        patterns: List of (regex_str, entity_type) tuples.
+        case_insensitive: If True, literal keys are lowercased (caller
+            should look up by lowercased word). If False, keys are stored
+            in original case (caller must look up with the raw-case word).
+
     Returns:
         (regex_patterns, literal_dict) where literal_dict maps word -> etype.
+        The literal_dict key casing is controlled by `case_insensitive`.
     """
     regex_pats = []
     literals: Dict[str, str] = {}
@@ -256,9 +276,13 @@ def _split_literal_patterns(
             else:
                 complex_alts.append(alt)
 
-        # Add literal words to the dict
+        # Add literal words to the dict. Preserve the original casing
+        # contract: ci patterns use lowercase keys (matched against
+        # word.lower() at extract time), cs patterns use raw-case keys
+        # (matched against the raw word at extract time).
         for word in literal_alts:
-            literals[word.lower()] = etype
+            key = word.lower() if case_insensitive else word
+            literals[key] = etype
 
         # Keep complex alternatives in the regex
         if complex_alts:
