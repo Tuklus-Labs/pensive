@@ -20,3 +20,24 @@ pensive = "pensive.ingestion.cli:main"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/pensive"]
+
+# PENPY-P5-MIN-1: keep runtime artifacts out of the published sdist.
+# Hatch does not honor .gitignore by default, so an empty/stale
+# vector_meta.db left over from local development would otherwise be
+# bundled into pypensive-X.Y.Z.tar.gz. Exclude all runtime-data and
+# checkpoint shapes explicitly. Also belt-and-braces exclude the
+# repo's local virtualenv, build/test caches, and __pycache__ trees
+# in case hatch's default include logic ever changes.
+[tool.hatch.build.targets.sdist]
+exclude = [
+  "*.db",
+  "*.faiss",
+  "*.pkl",
+  "/venv",
+  "/dist",
+  "/build",
+  "/.pytest_cache",
+  "**/__pycache__",
+  "/research",
+  "/dell_ingest.pkl",
+]
