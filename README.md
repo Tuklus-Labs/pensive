@@ -19,12 +19,45 @@ from pensive import SpreadingActivation
 sa = SpreadingActivation()
 sa.build([
     {'id': '1', 'content': 'The P99 latency was 42ms on 2025-10-08', 'value': '42ms on 2025-10-08'},
-    {'id': '2', 'content': 'GPU temp hit 82C during the training run', 'value': '82C during training'},
+    {'id': '2', 'content': 'Build 1234 completed in 320s with rss 18GB', 'value': '320s build, 18GB rss'},
     {'id': '3', 'content': 'Meeting with Sarah Chen about Project Atlas budget', 'value': 'Atlas budget meeting'},
 ])
 
-results = sa.query("What was the P99 latency?")
-# [('42ms on 2025-10-08', 1.623), ...]
+# Queries are entity-exact: pass the entity surface form, NOT a natural-
+# language question. Pensive extracts entities (metrics, dates, IDs,
+# people, projects, ...) via regex and matches the query against those
+# extracted entities. A query like "42ms" returns answers connected to
+# that entity in the graph; a query like "What was the P99 latency?"
+# returns [] because none of those query tokens are recognized entities.
+results = sa.query("42ms")
+# [('42ms on 2025-10-08', 4.5)]
+
+results = sa.query("sarah chen")
+# [('Atlas budget meeting', 2.4)]
+
+results = sa.query("2025-10-08")
+# [('42ms on 2025-10-08', 4.5)]
+```
+
+### Natural-language queries
+
+`sa.query()` does NOT parse natural language. If you need to map a
+question like "What was the P99 latency?" to entities, run your own
+extractor first and pass the extracted entity to `sa.query()`. The
+`pensive.mega_extract.MegaExtractor` class is the same one Pensive uses
+internally and accepts any custom pattern set.
+
+```python
+from pensive import SpreadingActivation
+from pensive.mega_extract import MegaExtractor
+from pensive.patterns import REAL_DATA_PATTERNS
+
+extractor = MegaExtractor(REAL_DATA_PATTERNS)
+question = "What was the latency on 2025-10-08?"
+for entity, _etype in extractor.extract(question):
+    hits = sa.query(entity)
+    if hits:
+        print(entity, '->', hits)
 ```
 
 ## Parallel Build (large corpora)
