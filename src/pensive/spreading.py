@@ -1502,6 +1502,33 @@ class SpreadingActivation:
             raise ValueError(
                 f"from_save_data: corrupted adjacency matrix: {e}"
             ) from e
+
+        # PENPY-P6-MIN-1: check_format only validates the CSR structural
+        # invariants; it does NOT verify that the parallel node arrays
+        # (node_type / idx_to_node / node_label) have the same length as
+        # n_nodes. A corrupted save where these arrays disagree would be
+        # silently accepted; subsequent queries would return empty or
+        # behave inconsistently with no crash. Defense-in-depth: catch
+        # length mismatches explicitly and raise ValueError so callers
+        # (load_graph) reject the save uniformly. Covered by
+        # tests/test_pass4_pass6_dep1_regression.py and
+        # tests/test_pass5_p5_from_save_data.py extensions.
+        n_nodes = sa._adj.shape[0]
+        if len(sa._node_type) != n_nodes:
+            raise ValueError(
+                f"_from_sparse_v1: corrupted save data: "
+                f"node_type={len(sa._node_type)} expected n_nodes={n_nodes}"
+            )
+        if len(sa._idx_to_node) != n_nodes:
+            raise ValueError(
+                f"_from_sparse_v1: corrupted save data: "
+                f"idx_to_node={len(sa._idx_to_node)} expected n_nodes={n_nodes}"
+            )
+        if len(sa._node_label) != n_nodes:
+            raise ValueError(
+                f"_from_sparse_v1: corrupted save data: "
+                f"node_label={len(sa._node_label)} expected n_nodes={n_nodes}"
+            )
         sa._edge_src = array.array('i')
         sa._edge_dst = array.array('i')
         sa._edge_weight = array.array('f')

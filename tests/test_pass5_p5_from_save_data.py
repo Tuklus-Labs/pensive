@@ -91,3 +91,78 @@ def test_p5_imp2_load_graph_wraps_oob_as_value_error(tmp_path):
 
     with pytest.raises(ValueError):
         IngestPipeline.load_graph(str(out))
+
+
+# --------------------------------------------------------------------------
+# PENPY-P6-MIN-1: parallel-array length consistency on load
+# --------------------------------------------------------------------------
+#
+# check_format only validates the CSR adjacency. It does NOT verify that
+# node_type / idx_to_node / node_label have the same length as n_nodes.
+# A corrupted save with mismatched parallel arrays was previously
+# accepted silently; subsequent queries returned empty or behaved
+# inconsistently with no crash. _from_sparse_v1 now raises ValueError
+# with a descriptive message when any of these length-mismatch.
+# Sabotage gate: deleting the length-mismatch checks restores the
+# silent-accept behavior and these tests fail "DID NOT RAISE".
+
+
+def _valid_payload(n_nodes: int = 2) -> dict:
+    """Build a valid sparse_v1 payload to mutate per-test.
+
+    A self-loop on node 0 keeps adj_indices/adj_indptr structurally
+    valid; mutating only the parallel arrays isolates the MIN-1 path.
+    """
+    return {
+        'format': 'sparse_v1',
+        'node_to_idx': {f'e:n{i}': i for i in range(n_nodes)},
+        'idx_to_node': [f'e:n{i}' for i in range(n_nodes)],
+        'node_type': array.array('b', [0] * n_nodes),
+        'node_label': [f'n{i}' for i in range(n_nodes)],
+        'node_specificity': [1.0] * n_nodes,
+        'adj_data': np.array([0.5], dtype=np.float32),
+        'adj_indices': np.array([0], dtype=np.int32),
+        'adj_indptr': np.array([0, 1] + [1] * (n_nodes - 1), dtype=np.int32),
+        'adj_shape': (n_nodes, n_nodes),
+        'entity_freq': {},
+        'entity_index': {},
+        'is_bipartite': True,
+    }
+
+
+def test_p6_min1_rejects_node_type_length_mismatch():
+    """node_type length != n_nodes must raise ValueError mentioning node_type."""
+    payload = _valid_payload(n_nodes=2)
+    payload['node_type'] = array.array('b', [0])  # length 1, expected 2
+
+    with pytest.raises(ValueError, match=r'node_type=1 expected n_nodes=2'):
+        SpreadingActivation.from_save_data(payload)
+
+
+def test_p6_min1_rejects_idx_to_node_length_mismatch():
+    """idx_to_node length != n_nodes must raise ValueError mentioning idx_to_node."""
+    payload = _valid_payload(n_nodes=2)
+    payload['idx_to_node'] = ['e:n0']  # length 1, expected 2
+
+    with pytest.raises(ValueError, match=r'idx_to_node=1 expected n_nodes=2'):
+        SpreadingActivation.from_save_data(payload)
+
+
+def test_p6_min1_rejects_node_label_length_mismatch():
+    """node_label length != n_nodes must raise ValueError mentioning node_label."""
+    payload = _valid_payload(n_nodes=2)
+    payload['node_label'] = ['n0']  # length 1, expected 2
+
+    with pytest.raises(ValueError, match=r'node_label=1 expected n_nodes=2'):
+        SpreadingActivation.from_save_data(payload)
+
+
+def test_p6_min1_valid_payload_still_loads():
+    """A correctly-shaped payload must still load successfully -- guard
+    against an over-eager rejection breaking the happy path."""
+    payload = _valid_payload(n_nodes=2)
+    sa = SpreadingActivation.from_save_data(payload)
+    assert sa._adj.shape == (2, 2)
+    assert len(sa._node_type) == 2
+    assert len(sa._idx_to_node) == 2
+    assert len(sa._node_label) == 2
