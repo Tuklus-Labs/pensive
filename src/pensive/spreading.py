@@ -259,6 +259,14 @@ class SpreadingActivation:
         self._built = False
         self._is_bipartite = True  # True until proven otherwise
 
+        # Monotonic generation counter. Incremented on every graph mutation
+        # boundary (reset, build, add_documents) so downstream caches
+        # (e.g. boundary._get_value_label_index) can invalidate on rebuild
+        # even when the new graph happens to have the same node count.
+        # See PENPY-IMP-5: keying caches on len(_idx_to_node) alone was
+        # unsafe for build()-then-rebuild with size-stable schemas.
+        self._graph_generation: int = 0
+
         # Guards concurrent build + query. Queries after build are
         # generally read-only on the immutable structures, but
         # build_parallel() concurrently mutates entity_freq which is also
@@ -346,6 +354,18 @@ class SpreadingActivation:
         self._entity_terms = []
         self._substr_match_cache = {}
         self._token_index = defaultdict(list)
+
+        # PENPY-IMP-5: bump generation so downstream caches keyed on
+        # (n_nodes, generation) invalidate on rebuild even when the new
+        # graph has the same node count. Belt-and-suspenders: also drop
+        # the boundary value-label cache directly, in case any consumer
+        # didn't migrate to the generation-aware key.
+        self._graph_generation += 1
+        if hasattr(self, '_boundary_value_label_index'):
+            try:
+                delattr(self, '_boundary_value_label_index')
+            except AttributeError:
+                pass
 
     def _index_entity_node(self, entity: str, node_id: str) -> None:
         """Index a new entity node for exact, partial, and substring seeding."""
@@ -565,6 +585,18 @@ class SpreadingActivation:
             return
 
         self._ensure_mutable_edges()
+
+        # PENPY-IMP-5: bump generation so caches keyed on
+        # (n_nodes, generation) invalidate. add_documents() typically
+        # increases n_nodes, but a batch of all-duplicate documents
+        # could leave node count unchanged while still mutating edges
+        # and frequencies.
+        self._graph_generation += 1
+        if hasattr(self, '_boundary_value_label_index'):
+            try:
+                delattr(self, '_boundary_value_label_index')
+            except AttributeError:
+                pass
 
         extracted = []
         batch_counts: Dict[str, int] = defaultdict(int)

@@ -377,15 +377,24 @@ def _resolve_value_node_idx(sa, score_arr: np.ndarray, result: tuple) -> Optiona
 def _get_value_label_index(sa) -> Dict[str, List[int]]:
     """Return (cached) {label -> [value-node indices]} dict for the SA.
 
-    Lazily built on first call; invalidated when the SA's node count
-    changes (the only kind of growth this module observes). Caching is
-    keyed on a private attribute on the SA itself so callers don't need
-    to thread state through.
+    Lazily built on first call; invalidated whenever the SA's graph
+    generation advances (covers full rebuilds via ``build()`` and
+    incremental updates via ``add_documents()``). Falling back on just
+    ``len(sa._idx_to_node)`` is unsafe: a second ``build()`` with a
+    size-stable schema can keep the node count identical while changing
+    every value label (PENPY-IMP-5). The combined ``(n_nodes, generation)``
+    key is monotonic, so a stale cache entry will never match a new SA
+    state.
+
+    Caching is keyed on a private attribute on the SA itself so callers
+    don't need to thread state through.
     """
     cache_attr = '_boundary_value_label_index'
     n_nodes = len(sa._idx_to_node)
+    generation = getattr(sa, '_graph_generation', 0)
+    key = (n_nodes, generation)
     cached = getattr(sa, cache_attr, None)
-    if cached is not None and cached[0] == n_nodes:
+    if cached is not None and cached[0] == key:
         return cached[1]
 
     index: Dict[str, List[int]] = {}
@@ -404,7 +413,7 @@ def _get_value_label_index(sa) -> Dict[str, List[int]]:
                 index.setdefault(node_label, []).append(idx)
 
     try:
-        setattr(sa, cache_attr, (n_nodes, index))
+        setattr(sa, cache_attr, (key, index))
     except (AttributeError, TypeError):
         # SA may use __slots__ in some future version; fall back to
         # returning the freshly-built index uncached.
