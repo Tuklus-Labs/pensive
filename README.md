@@ -81,8 +81,10 @@ pipe.ingest_all([
     FacebookParser("/path/to/facebook-export/"),
 ])
 
-# Query
-results = pipe.sa.query("What did we talk about last week?")
+# Query (entity-exact -- see Quickstart on extracting entities from
+# natural-language questions before calling query()).
+results = pipe.sa.query("2025-10-08")
+results = pipe.sa.query("project atlas")
 
 # Save/load
 pipe.save_graph("my_graph.pkl")
@@ -93,7 +95,10 @@ pipe = IngestPipeline.load_graph("my_graph.pkl")
 
 ```bash
 pensive build --chatgpt ~/chatgpt-export/ --facebook ~/fb-export/ -o graph.pkl
-pensive query --graph graph.pkl "What was the deployment date?"
+# Queries are entity-exact -- pass the entity itself, not a natural-
+# language question. For NL questions, run MegaExtractor over the
+# question first (see Quickstart) and feed the extracted entity here.
+pensive query --graph graph.pkl "2025-10-08"
 pensive stats --graph graph.pkl
 ```
 
@@ -120,12 +125,23 @@ sa = SpreadingActivation(config=SpreadingConfig(
 
 ## Contextual Disambiguation
 
-Provide conversation context to disambiguate queries:
+Provide conversation context to disambiguate queries. The query is
+still an entity (Pensive does not parse natural language); context
+boosts candidates that also activate from the context entities.
 
 ```python
+# Two docs mention "199ms" and "199gb" respectively. A bare query for
+# the project entity returns both; context biases toward the GPU one.
+sa.build([
+    {'id': '1', 'content': 'GPU memory bandwidth was 199GB on Project Atlas',
+     'value': 'Atlas GPU 199GB bandwidth'},
+    {'id': '2', 'content': 'Project Atlas API P99 latency was 199ms',
+     'value': 'Atlas API 199ms latency'},
+])
+
 results = sa.query(
-    "What was the temperature?",
-    context=["GPU", "training run"]  # Disambiguates toward GPU temp, not weather
+    "atlas",
+    context=["GPU", "training run"]  # Steers toward the GPU/bandwidth doc
 )
 ```
 
@@ -135,7 +151,12 @@ Inspect whether a query is close to the activation boundary, mixes rare and
 common entities, or should ask the caller for more context:
 
 ```python
-diagnosed = sa.query_analyzed("What was the P99 latency on 2025-07-16?")
+# Entity-exact query, same as sa.query() -- the analyzer wraps the
+# regular query path with a diagnostic envelope. A natural-language
+# input like "What was the P99 latency on 2025-07-16?" lands on
+# confidence='none', should_trust=False because none of those tokens
+# are entities. Use an extracted entity instead.
+diagnosed = sa.query_analyzed("2025-07-16")
 
 print(diagnosed.analysis.confidence)         # "low", "medium", "high", or "none"
 print(diagnosed.analysis.should_trust)       # False when retrieval looks unreliable
@@ -145,10 +166,10 @@ print(diagnosed.analysis.context_needed)     # True when SA sees ambiguity
 print(diagnosed.analysis.suggested_context)  # e.g. ["199ms", "257ms"]
 ```
 
-From the CLI:
+From the CLI (still entity-exact):
 
 ```bash
-pensive query --graph graph.pkl --analyze "What was the P99 latency on 2025-07-16?"
+pensive query --graph graph.pkl --analyze "2025-07-16"
 ```
 
 ## Hybrid Retrieval (`pypensive[full]`)
