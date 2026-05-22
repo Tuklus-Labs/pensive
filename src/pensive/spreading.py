@@ -333,10 +333,10 @@ class SpreadingActivation:
     def _compile(self) -> None:
         """Convert COO edge lists to CSR matrix for fast neighbor iteration.
 
-        Concurrency model (PENPY-P5-CRIT-1):
+        Concurrency model (PENPY-P5-CRIT-1, PENPY-P8-CRIT-1):
 
         Readers (query()) and writers (add_documents()) both eventually
-        call _compile(). Three hazards we have to defend against:
+        call _compile(). Four hazards we have to defend against:
 
           1. Buffer-export race -- an earlier version used np.frombuffer()
              over the array.array storage, which kept a live buffer view
@@ -359,71 +359,167 @@ class SpreadingActivation:
              readers either see the old _adj or the new one, never an
              intermediate.
 
+          4. Publish-outside-lock race (PENPY-P8-CRIT-1) -- thread A
+             snapshots state under the lock, releases, builds CSR
+             slowly. Thread B interleaves: acquires lock, mutates the
+             graph (add_documents bumps _graph_generation), compiles,
+             publishes. Then A publishes its STALE CSR over B's fresher
+             one and unconditionally sets _dirty=False -- so the next
+             _compile() short-circuits at the top, leaving the graph
+             permanently stuck with _adj.shape[0] < len(_idx_to_node).
+             Symptoms: silent wrong query results (entities present but
+             unreachable through CSR), save/load ValueError on the
+             n_nodes invariant, and persistent stuck state.
+
+             Fix: snapshot _graph_generation under the lock alongside
+             the COO copies. After building CSR outside the lock,
+             re-acquire the lock and check the generation hasn't moved.
+             If it has, discard our work and retry with the newer
+             snapshot. The publish itself happens INSIDE the lock so a
+             concurrent writer cannot interleave between our generation
+             check and the _dirty=False assignment.
+
         We hold self._build_lock for the length snapshot + array copies
-        only. The actual CSR construction happens outside the lock so
-        concurrent queries don't serialize behind a single _compile().
+        and for the generation-checked publish. The actual CSR
+        construction happens outside the lock so concurrent queries
+        don't serialize behind a single _compile().
 
         Also caches numpy arrays for node_type and node_specificity.
         """
         if not self._dirty:
             return
-        n = len(self._idx_to_node)
 
-        # Snapshot the COO buffers under the lock so writers can't tear
-        # the read between len() and the copy. This is a fast pure-Python
-        # critical section -- a few function calls -- not the O(n_edges)
-        # CSR build itself.
+        # Bounded optimistic retry: if a concurrent writer beats us to
+        # publish, we rebuild against the newer snapshot. Each iteration
+        # builds the CSR outside the lock to preserve the read
+        # parallelism that was the original point of releasing the lock
+        # in pass-5 fix-3.
+        #
+        # If we exhaust the retry budget under pathological writer
+        # contention (writers bumping _graph_generation faster than we
+        # can build a CSR), we fall through to a synchronous publish:
+        # snapshot + build + publish all under the lock. That guarantees
+        # forward progress and a non-None _adj even when readers cannot
+        # find an optimistic gap. The synchronous path serializes
+        # writers behind us for the CSR-build duration, which is the
+        # legitimate cost of guaranteeing the reader sees a current
+        # graph. Without this fallback, readers can be perpetually
+        # starved -- _adj stays None and queries crash on .indptr.
+        for _attempt in range(8):
+            # Snapshot the COO buffers and the graph generation under
+            # the lock so writers can't tear the read between len() and
+            # the copy. Fast pure-Python critical section.
+            with self._build_lock:
+                if not self._dirty:
+                    # Another thread already compiled while we waited.
+                    return
+                snap_generation = self._graph_generation
+                edge_count = len(self._edge_src)
+                n = len(self._idx_to_node)
+                # Snapshot node_type + n_terms under the lock so the
+                # publish step doesn't re-read live (and possibly newer)
+                # state when the generation check passes. This also
+                # fixes a latent inconsistency where the edge_count == 0
+                # path was using bytes(self._node_type) at publish time,
+                # observing a different node_type than the one this
+                # _compile() was supposed to publish.
+                node_type_snap = bytes(self._node_type)
+                n_terms = len(self._entity_terms)
+                if edge_count == 0:
+                    src_snap = dst_snap = w_snap = None
+                else:
+                    # np.array(arr.array) does a clean typed copy with
+                    # no buffer-export refcount on the source.
+                    # array.array slicing copies, not views.
+                    src_snap = self._edge_src[:edge_count]
+                    dst_snap = self._edge_dst[:edge_count]
+                    w_snap = self._edge_weight[:edge_count]
+                # End of snapshot critical section -- the heavy CSR
+                # construction happens outside the lock.
+
+            new_adj = self._build_csr(
+                edge_count, n, src_snap, dst_snap, w_snap,
+            )
+            new_node_type_arr = np.frombuffer(
+                node_type_snap, dtype=np.int8,
+            ).copy()
+
+            # Publish-with-generation-check (PENPY-P8-CRIT-1). Re-acquire
+            # the lock and verify no writer has touched the graph since
+            # our snapshot. If the generation moved, our CSR is stale --
+            # discard it and retry. If the generation matches, the
+            # publish is atomic with respect to all writers (they all
+            # mutate _graph_generation under the same _build_lock).
+            with self._build_lock:
+                if not self._dirty:
+                    # Another thread already published while we were
+                    # building. Their publish is current; ours is stale.
+                    return
+                if self._graph_generation != snap_generation:
+                    # A concurrent writer raced ahead during our CSR
+                    # build. Retry with the newer snapshot. We do NOT
+                    # touch _adj or _dirty here, so the writer's
+                    # subsequent publish (or our next attempt) wins.
+                    continue
+                # Generation matches: our snapshot is still current.
+                self._adj = new_adj
+                self._node_type_arr = new_node_type_arr
+                self._value_indices = np.flatnonzero(
+                    new_node_type_arr == _VALUE_TYPE
+                )
+                self._do_substr = n_terms <= 10_000
+                self._dirty = False
+                return
+
+        # Optimistic retry exhausted under contention. Fall back to a
+        # synchronous build+publish that holds the lock across the CSR
+        # construction. This guarantees forward progress: writers serialize
+        # behind us for the build duration but the reader is guaranteed
+        # to see a non-stale, non-None _adj on return. Pathological
+        # writer storms are the only path here in practice.
         with self._build_lock:
             if not self._dirty:
-                # Another thread already compiled while we waited.
                 return
             edge_count = len(self._edge_src)
-            # If a sibling reader is mid-compile and changed n via an
-            # add_documents concurrent with our snapshot, recompute now.
             n = len(self._idx_to_node)
+            node_type_snap = bytes(self._node_type)
+            n_terms = len(self._entity_terms)
             if edge_count == 0:
-                weights = rows = cols = None
+                src_snap = dst_snap = w_snap = None
             else:
-                # np.array(arr.array) does a clean typed copy with no
-                # buffer-export refcount on the source. We slice to
-                # edge_count to lock in the snapshot length so a later
-                # writer append (between these three copies, e.g. during
-                # GIL release on a large allocation) cannot tear the
-                # snapshot. array.array slicing copies, not views.
                 src_snap = self._edge_src[:edge_count]
                 dst_snap = self._edge_dst[:edge_count]
                 w_snap = self._edge_weight[:edge_count]
-                node_type_snap = bytes(self._node_type)
-                n_terms = len(self._entity_terms)
-            # End of critical section -- now we can do the heavy CSR
-            # construction outside the lock. The snapshots above are
-            # already disconnected from the live arrays.
-
-        if edge_count == 0:
-            new_adj = scipy.sparse.csr_matrix((n, n), dtype=np.float32)
-        else:
-            weights = np.array(w_snap, dtype=np.float32)
-            rows = np.array(src_snap, dtype=np.int32)
-            cols = np.array(dst_snap, dtype=np.int32)
-            new_adj = scipy.sparse.csr_matrix(
-                (weights, (rows, cols)), shape=(n, n),
+            new_adj = self._build_csr(
+                edge_count, n, src_snap, dst_snap, w_snap,
             )
+            new_node_type_arr = np.frombuffer(
+                node_type_snap, dtype=np.int8,
+            ).copy()
+            self._adj = new_adj
+            self._node_type_arr = new_node_type_arr
+            self._value_indices = np.flatnonzero(
+                new_node_type_arr == _VALUE_TYPE
+            )
+            self._do_substr = n_terms <= 10_000
+            self._dirty = False
 
-        # Atomic publish of compiled state. Assignments in CPython are
-        # atomic under the GIL, so concurrent readers see either the
-        # complete old set or the complete new set of cached attrs.
-        self._adj = new_adj
-        # bytes -> int8 numpy buffer copy; no view kept on _node_type.
-        new_node_type_arr = np.frombuffer(
-            node_type_snap if edge_count > 0 else bytes(self._node_type),
-            dtype=np.int8,
-        ).copy()
-        self._node_type_arr = new_node_type_arr
-        self._value_indices = np.flatnonzero(new_node_type_arr == _VALUE_TYPE)
-        self._do_substr = (
-            n_terms if edge_count > 0 else len(self._entity_terms)
-        ) <= 10_000
-        self._dirty = False
+    @staticmethod
+    def _build_csr(edge_count, n, src_snap, dst_snap, w_snap):
+        """Build the CSR adjacency matrix from a snapshot of COO buffers.
+
+        Pure function over the snapshots -- safe to call outside any
+        lock. The buffers must already be disconnected from the live
+        array.array storage (slicing array.array yields a copy).
+        """
+        if edge_count == 0:
+            return scipy.sparse.csr_matrix((n, n), dtype=np.float32)
+        weights = np.array(w_snap, dtype=np.float32)
+        rows = np.array(src_snap, dtype=np.int32)
+        cols = np.array(dst_snap, dtype=np.int32)
+        return scipy.sparse.csr_matrix(
+            (weights, (rows, cols)), shape=(n, n),
+        )
 
     def _reset_graph_state(self) -> None:
         """Reset graph state before a full rebuild."""
