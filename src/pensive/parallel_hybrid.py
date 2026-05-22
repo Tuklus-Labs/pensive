@@ -20,7 +20,12 @@ Usage:
     l2.add_documents(documents)
 
     hybrid = ParallelHybrid(spreading_activation=sa, l2_handler=l2)
-    results = hybrid.query("What was the P99 latency?")
+    # Stage 1 (SA) is still entity-exact -- see SpreadingActivation.query()
+    # for the contract. The L2 rerank that follows is semantic so a
+    # natural-language query can still recover results via the L2
+    # fallback path, but the strongest retrieval is when the query has
+    # an entity surface form in it.
+    results = hybrid.query("2025-10-08")
 """
 import logging
 import math

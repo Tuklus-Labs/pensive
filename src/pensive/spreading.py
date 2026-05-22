@@ -9,7 +9,12 @@ Usage:
 
     sa = SpreadingActivation()
     sa.build(documents)  # List of dicts with 'content', 'id', 'value' keys
-    results = sa.query("What was the P99 latency on 2025-10-08?")
+
+    # Entity-exact: pass the entity surface form (a date, metric, ID,
+    # name, ...), NOT a natural-language question. See README
+    # "Quickstart" + the "Natural-language queries" section for the
+    # extractor-then-query pattern.
+    results = sa.query("2025-10-08")
 """
 import array
 import heapq
@@ -1383,7 +1388,15 @@ class SpreadingActivation:
         contextual intersection.
 
         Args:
-            query_text: The natural language query
+            query_text: The entity surface form to look up (e.g.
+                     ``"42ms"``, ``"2025-10-08"``, ``"sarah chen"``).
+                     This is NOT a natural-language question -- pensive
+                     does no NL parsing. A query like "What was the P99
+                     latency?" returns [] because none of those tokens
+                     are recognized entities in the graph. See README
+                     "Quickstart" and the "Natural-language queries"
+                     section for the extractor-then-query pattern that
+                     maps questions onto entity queries.
             top_k: Number of results to return
             context: Optional list of entity strings from conversation
                      context. When provided, these seed a second
@@ -1456,6 +1469,8 @@ class SpreadingActivation:
 
         Same as query() but returns (doc_id, value, score) tuples
         for use as a first-stage retriever before L2 reranking.
+        Entity-exact -- see query() and README "Quickstart" for the
+        contract; natural-language questions do not work here.
         """
         if not self._built:
             raise ValueError("Graph not built. Call build() first.")
