@@ -5,6 +5,12 @@ dist/
 build/
 venv/
 .pytest_cache/
+# PENPY-P9-MIN-5: pickled SA graphs are local-only artifacts. They
+# should never be committed (HMAC-signed pickle bodies are host-secret
+# bound and large, hundreds of MB to multiple GB). The generic `*.pkl`
+# covers them; the explicit dell_ingest.pkl line is a belt-and-braces
+# guard for the one that exists in dev trees.
 *.pkl
+dell_ingest.pkl
 *.db
 CLAUDE.md
