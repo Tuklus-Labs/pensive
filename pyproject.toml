@@ -9,10 +9,31 @@ description = "Spreading activation retrieval for document collections"
 readme = "README.md"
 license = "MIT"
 requires-python = ">=3.10"
-dependencies = ["numpy", "scipy"]
+# PENPY-P9-MIN-4: declared floors below match what the test suite has
+# actually run against. We pin lower bounds only -- no upper caps -- so
+# downstream callers can pull in newer minor/patch releases without a
+# pensive bump, but a fresh install on a system with older numpy/scipy
+# (e.g. pre-2.0 numpy where some `np.float64`/`np.float32` casting
+# semantics differ) fails fast at install time instead of producing
+# silently-wrong results at query time.
+dependencies = [
+  "numpy>=1.24",
+  "scipy>=1.10",
+]
 
 [project.optional-dependencies]
-full = ["sentence-transformers", "faiss-cpu", "rank-bm25"]
+# Same rationale on the full extras: floors track what the L2 / hybrid
+# tests have run against. sentence-transformers>=2.2 is the first
+# version with the `encode(..., convert_to_numpy=True)` API the L2
+# handler relies on; >=5 is the version where get_sentence_embedding_dimension
+# was renamed (handled gracefully but >=2.2 is the documented floor).
+# faiss-cpu>=1.7 is the first to expose IndexIVFFlat in the modern
+# Python bindings used by L2Handler. rank-bm25 is API-stable since 0.2.
+full = [
+  "sentence-transformers>=2.2",
+  "faiss-cpu>=1.7",
+  "rank-bm25>=0.2",
+]
 dev = ["pytest"]
 
 [project.scripts]
