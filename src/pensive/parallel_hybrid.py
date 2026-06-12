@@ -32,7 +32,7 @@ import math
 import time
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
-from typing import List, Dict, Any, Optional
+from typing import List, Any, Optional
 
 from .pattern_learner import PatternLearner
 
@@ -63,6 +63,26 @@ class HybridResult:
     l2_score: Optional[float]
     source: str  # 'both', 'sa', 'l2'
     rank: int
+
+
+@dataclass
+class HybridRow:
+    """Internal per-source candidate row (not public API).
+
+    The typed record that flows between _query_sa / _query_l2 /
+    _query_l2_on_candidates and the agreement-boost merge in query().
+    Raw L2 backend output (L2Result objects or legacy dicts) is
+    normalized into this exactly once, in _normalize_l2_results;
+    everything downstream is attribute access, so a typo fails loudly
+    instead of silently producing a .get() default. Exactly one of
+    sa_score/l2_score is set, depending on which stage produced the row.
+    """
+    doc_id: str
+    content: str
+    summary: str
+    rank: int
+    sa_score: Optional[float] = None
+    l2_score: Optional[float] = None
 
 
 class ParallelHybrid:
@@ -197,7 +217,7 @@ class ParallelHybrid:
             if use_global_l2:
                 l2_results = self._query_l2(query, l2_top_k)
             else:
-                candidate_ids = [r['doc_id'] for r in sa_results]
+                candidate_ids = [r.doc_id for r in sa_results]
                 l2_results = self._query_l2_on_candidates(
                     query, candidate_ids, l2_top_k
                 )
@@ -234,8 +254,8 @@ class ParallelHybrid:
             )
 
         # Build lookup tables
-        sa_by_id = {r['doc_id']: r for r in sa_results}
-        l2_by_id = {r['doc_id']: r for r in l2_results}
+        sa_by_id = {r.doc_id: r for r in sa_results}
+        l2_by_id = {r.doc_id: r for r in l2_results}
 
         # Merge with agreement boosting. Sort the union for a deterministic
         # iteration order so equal-score ties resolve identically across
@@ -269,61 +289,50 @@ class ParallelHybrid:
                 # source was more confident) as the rank-decay denominator,
                 # then add the floor so every "both" outranks every
                 # single-source result.
-                sa_rank = sa_hit['rank']
-                l2_rank = l2_hit['rank']
-                best_rank = min(sa_rank, l2_rank)
+                best_rank = min(sa_hit.rank, l2_hit.rank)
                 score = (
                     self.rank_fusion_agreement / (best_rank + 1)
                     + agreement_floor
                 )
                 source = 'both'
-                content = l2_hit.get('content') or sa_hit.get('content', '')
-                summary = l2_hit.get('summary') or sa_hit.get('summary', content[:500])
+                content = l2_hit.content or sa_hit.content
+                summary = l2_hit.summary or sa_hit.summary
 
             elif l2_hit:
-                score = self.rank_fusion_l2_only / (l2_hit['rank'] + 1)
+                score = self.rank_fusion_l2_only / (l2_hit.rank + 1)
                 source = 'l2'
-                content = l2_hit.get('content', '')
-                summary = l2_hit.get('summary', content[:500])
+                content = l2_hit.content
+                summary = l2_hit.summary
 
             else:
-                score = self.rank_fusion_sa_only / (sa_hit['rank'] + 1)
+                score = self.rank_fusion_sa_only / (sa_hit.rank + 1)
                 source = 'sa'
-                content = sa_hit.get('content', '')
-                summary = sa_hit.get('summary', content[:500])
+                content = sa_hit.content
+                summary = sa_hit.summary
 
-            candidates.append({
-                'doc_id': doc_id,
-                'content': content,
-                'summary': summary,
-                'score': score,
-                'sa_score': sa_hit['sa_score'] if sa_hit else None,
-                'l2_score': l2_hit['l2_score'] if l2_hit else None,
-                'source': source,
-            })
+            candidates.append(HybridResult(
+                doc_id=doc_id,
+                content=content,
+                summary=summary,
+                score=score,
+                sa_score=sa_hit.sa_score if sa_hit else None,
+                l2_score=l2_hit.l2_score if l2_hit else None,
+                source=source,
+                rank=-1,  # final rank assigned after sort/rerank below
+            ))
 
         # Stable, deterministic ordering: primary by descending score,
         # secondary by doc_id ascending so tied scores resolve to the
         # same final rank across runs.
-        candidates.sort(key=lambda x: (-x['score'], x['doc_id']))
+        candidates.sort(key=lambda x: (-x.score, x.doc_id))
 
         # Optional cross-encoder reranking
         if self.cross_encoder and candidates:
             candidates = self._rerank_with_cross_encoder(query, candidates[:top_k * 2])
 
-        results = [
-            HybridResult(
-                doc_id=c['doc_id'],
-                content=c['content'],
-                summary=c['summary'],
-                score=c['score'],
-                sa_score=c['sa_score'],
-                l2_score=c['l2_score'],
-                source=c['source'],
-                rank=i,
-            )
-            for i, c in enumerate(candidates[:top_k])
-        ]
+        results = candidates[:top_k]
+        for i, c in enumerate(results):
+            c.rank = i
 
         total_ms = (time.perf_counter() - t0) * 1000
         both_count = sum(1 for r in results if r.source == 'both')
@@ -344,7 +353,7 @@ class ParallelHybrid:
         top_k: int,
         context: Optional[List[str]],
         analyze: bool = False,
-    ) -> tuple[List[Dict[str, Any]], Optional[Any]]:
+    ) -> tuple[List[HybridRow], Optional[Any]]:
         """Query spreading activation."""
         if not self.sa or not getattr(self.sa, '_built', False):
             return [], None
@@ -356,13 +365,13 @@ class ParallelHybrid:
                 from .boundary import analyze_boundary_results
                 analysis = analyze_boundary_results(self.sa, query, results)
             return [
-                {
-                    'doc_id': doc_id,
-                    'content': value,
-                    'summary': value[:500],
-                    'sa_score': score,
-                    'rank': i,
-                }
+                HybridRow(
+                    doc_id=doc_id,
+                    content=value,
+                    summary=value[:500],
+                    sa_score=score,
+                    rank=i,
+                )
                 for i, (doc_id, value, score) in enumerate(results)
             ], analysis
         except Exception as e:
@@ -376,7 +385,7 @@ class ParallelHybrid:
             return False
         return sa_analysis.context_needed or sa_analysis.confidence == 'low'
 
-    def _query_l2(self, query: str, top_k: int) -> List[Dict[str, Any]]:
+    def _query_l2(self, query: str, top_k: int) -> List[HybridRow]:
         """Query L2 vector store."""
         if not self.l2:
             return []
@@ -396,7 +405,7 @@ class ParallelHybrid:
 
     def _query_l2_on_candidates(
         self, query: str, candidate_doc_ids: List[str], top_k: int
-    ) -> List[Dict[str, Any]]:
+    ) -> List[HybridRow]:
         """Query L2 over L1-selected candidates."""
         if not self.l2 or not candidate_doc_ids:
             return []
@@ -428,44 +437,50 @@ class ParallelHybrid:
             oversample_k = max(top_k * 4, top_k + len(candidate_doc_ids))
             results = self.l2.query(query, top_k=oversample_k)
             normalized = self._normalize_l2_results(results)
-            filtered = [r for r in normalized if r['doc_id'] in candidate_set]
+            filtered = [r for r in normalized if r.doc_id in candidate_set]
             # Re-rank within the filtered subset.
             for i, r in enumerate(filtered[:top_k]):
-                r['rank'] = i
+                r.rank = i
             return filtered[:top_k]
         except Exception as e:
             logger.warning("Candidate L2 query failed: %s", e)
             return []
 
     @staticmethod
-    def _normalize_l2_results(results: List[Any]) -> List[Dict[str, Any]]:
-        """Normalize L2 result objects/dicts to the hybrid schema."""
-        return [
-            {
-                'doc_id': r.document_id if hasattr(r, 'document_id') else r.get('document_id', ''),
-                'content': r.content if hasattr(r, 'content') else r.get('content', ''),
-                'summary': (r.content if hasattr(r, 'content') else r.get('content', ''))[:500],
-                'l2_score': r.score if hasattr(r, 'score') else r.get('score', 0),
-                'rank': i,
-            }
-            for i, r in enumerate(results)
-        ]
+    def _normalize_l2_results(results: List[Any]) -> List[HybridRow]:
+        """Normalize raw L2 backend output into typed HybridRow rows.
+
+        This is the one seam where untyped external shapes (L2Result
+        objects or legacy dicts) enter the hybrid layer; everything
+        downstream works with HybridRow attributes.
+        """
+        rows = []
+        for i, r in enumerate(results):
+            content = r.content if hasattr(r, 'content') else r.get('content', '')
+            rows.append(HybridRow(
+                doc_id=r.document_id if hasattr(r, 'document_id') else r.get('document_id', ''),
+                content=content,
+                summary=content[:500],
+                l2_score=r.score if hasattr(r, 'score') else r.get('score', 0),
+                rank=i,
+            ))
+        return rows
 
     def _rerank_with_cross_encoder(
-        self, query: str, candidates: List[Dict[str, Any]]
-    ) -> List[Dict[str, Any]]:
+        self, query: str, candidates: List[HybridResult]
+    ) -> List[HybridResult]:
         """Rerank using cross-encoder."""
         if not self.cross_encoder or not candidates:
             return candidates
 
         try:
-            pairs = [(query, c['content'][:512]) for c in candidates]
+            pairs = [(query, c.content[:512]) for c in candidates]
             scores = self.cross_encoder.predict(pairs)
 
             for c, score in zip(candidates, scores):
-                c['score'] = 0.4 * c['score'] + 0.6 * (score * 10)
+                c.score = 0.4 * c.score + 0.6 * (score * 10)
 
-            candidates.sort(key=lambda x: -x['score'])
+            candidates.sort(key=lambda x: -x.score)
             return candidates
 
         except Exception as e:

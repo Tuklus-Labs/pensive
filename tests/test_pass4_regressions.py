@@ -264,7 +264,7 @@ def test_l2_candidate_fallback_filters_to_candidate_set():
         top_k=5,
     )
 
-    returned_ids = {r['doc_id'] for r in results}
+    returned_ids = {r.doc_id for r in results}
     assert returned_ids == {'doc-A', 'doc-B'}, (
         f"Candidate-rerank fallback must filter to the candidate set. "
         f"Got {returned_ids!r}, expected only doc-A/doc-B. "
