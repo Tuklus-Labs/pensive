@@ -41,6 +41,10 @@ except ImportError:
 _ENTITY_TYPE = 0
 _VALUE_TYPE = 1
 
+# Shared empty results for the collect/top-k helpers (never mutated)
+_EMPTY_IDX = np.empty(0, dtype=np.int64)
+_EMPTY_SCORES = np.empty(0, dtype=np.float32)
+
 # Common English words that should not be indexed as partial entity matches.
 _STOPWORDS = frozenset({
     'a', 'an', 'the', 'and', 'or', 'but', 'in', 'on', 'at', 'to', 'for',
@@ -1162,141 +1166,44 @@ class SpreadingActivation:
             np.maximum.at(result, nbrs, score * decay * weights)
         return result
 
-    def _spread_and_collect_bipartite(self, activations: Dict[int, float],
-                                       top_k: int) -> List[Tuple[str, float]]:
-        """Combined spread + collect for bipartite graphs.
-
-        When numba is available, runs the spread and value-node collection
-        in a single JIT kernel, avoiding the numpy round-trip (~20% faster).
-        """
-        # PENPY-IMP-6: short-circuit top_k <= 0. The general (non-numpy)
-        # path correctly handles this via heapq.nlargest(0, ...) = [], but
-        # the numpy fast-path's np.argpartition(scores, -0)[-0:] degenerates
-        # to argpartition(scores, 0)[0:] = the full array, leaking ALL
-        # value nodes back to the caller. Negatives are nonsense input but
-        # the guard covers them too.
-        if top_k <= 0:
-            return []
-
-        indptr = self._adj.indptr
-        indices = self._adj.indices
-        data = self._adj.data
-        decay = self.config.decay
-        threshold = self.config.threshold
-        n = len(self._idx_to_node)
-
-        if _numba_spread_and_collect is not None:
-            n_act = len(activations)
-            act_indices = np.fromiter(activations.keys(), dtype=np.int64, count=n_act)
-            act_scores = np.fromiter(activations.values(), dtype=np.float32, count=n_act)
-            nz_global, nz_scores = _numba_spread_and_collect(
-                act_indices, act_scores, indptr, indices, data,
-                np.float32(decay), np.float32(threshold), n,
-                self._node_type_arr, np.int8(_VALUE_TYPE),
-            )
-        else:
-            result = self._spread_bipartite_raw(activations)
-            nz_all = np.flatnonzero(result >= threshold)
-            if len(nz_all) == 0:
-                return []
-            is_value = self._node_type_arr[nz_all] == _VALUE_TYPE
-            nz_global = nz_all[is_value]
-            if len(nz_global) == 0:
-                return []
-            nz_scores = result[nz_global]
-
-        if len(nz_global) == 0:
-            return []
-
-        k = min(top_k, len(nz_global))
-        if k >= len(nz_global):
-            top_idx = np.argsort(nz_scores)[::-1]
-        else:
-            top_idx = np.argpartition(nz_scores, -k)[-k:]
-            top_idx = top_idx[np.argsort(nz_scores[top_idx])[::-1]]
-
-        return [(self._node_label[nz_global[i]], float(nz_scores[i])) for i in top_idx]
-
-    def _spread_and_collect_bipartite_with_ids(
-        self, activations: Dict[int, float], top_k: int
-    ) -> List[Tuple[str, str, float]]:
-        """Like _spread_and_collect_bipartite but returns (doc_id, value, score)."""
-        # PENPY-IMP-6: see _spread_and_collect_bipartite. Same argpartition
-        # degeneracy applies to this with-ids variant.
-        if top_k <= 0:
-            return []
-
-        indptr = self._adj.indptr
-        indices = self._adj.indices
-        data = self._adj.data
-        decay = self.config.decay
-        threshold = self.config.threshold
-        n = len(self._idx_to_node)
-
-        if _numba_spread_and_collect is not None:
-            n_act = len(activations)
-            act_indices = np.fromiter(activations.keys(), dtype=np.int64, count=n_act)
-            act_scores = np.fromiter(activations.values(), dtype=np.float32, count=n_act)
-            nz_global, nz_scores = _numba_spread_and_collect(
-                act_indices, act_scores, indptr, indices, data,
-                np.float32(decay), np.float32(threshold), n,
-                self._node_type_arr, np.int8(_VALUE_TYPE),
-            )
-        else:
-            result = self._spread_bipartite_raw(activations)
-            nz_all = np.flatnonzero(result >= threshold)
-            if len(nz_all) == 0:
-                return []
-            is_value = self._node_type_arr[nz_all] == _VALUE_TYPE
-            nz_global = nz_all[is_value]
-            if len(nz_global) == 0:
-                return []
-            nz_scores = result[nz_global]
-
-        if len(nz_global) == 0:
-            return []
-
-        k = min(top_k, len(nz_global))
-        if k >= len(nz_global):
-            top_idx = np.argsort(nz_scores)[::-1]
-        else:
-            top_idx = np.argpartition(nz_scores, -k)[-k:]
-            top_idx = top_idx[np.argsort(nz_scores[top_idx])[::-1]]
-
-        results = []
-        for i in top_idx:
-            idx = nz_global[i]
-            node_id = self._idx_to_node[idx]
-            doc_id = node_id[2:] if node_id.startswith('v:') else node_id
-            results.append((doc_id, self._node_label[idx], float(nz_scores[i])))
-        return results
-
-    def _collect_from_array(self, result: np.ndarray, top_k: int
-                            ) -> List[Tuple[str, float]]:
-        """Collect top-k value nodes directly from a numpy score array.
+    def _collect_value_candidates(
+        self, result: np.ndarray
+    ) -> Tuple[np.ndarray, np.ndarray]:
+        """Threshold + value-node filter over a dense activation array.
 
         Operates on the sparse non-zero entries of the result array
         rather than indexing all value nodes. Since spreading produces
         sparse results (~0.5-1% density), this avoids O(n) fancy
         indexing on the full value node array.
-        """
-        # PENPY-IMP-6: see _spread_and_collect_bipartite. Reached via the
-        # context+bipartite branch in query() and query_with_doc_ids().
-        if top_k <= 0:
-            return []
 
-        # Find all non-zero entries above threshold (sparse)
+        Returns (global_indices, scores), unordered; both empty when
+        nothing clears the threshold.
+        """
         nz_all = np.flatnonzero(result >= self.config.threshold)
         if len(nz_all) == 0:
-            return []
-
-        # Filter to value nodes only
+            return _EMPTY_IDX, _EMPTY_SCORES
         is_value = self._node_type_arr[nz_all] == _VALUE_TYPE
         nz_global = nz_all[is_value]
         if len(nz_global) == 0:
-            return []
+            return _EMPTY_IDX, _EMPTY_SCORES
+        return nz_global, result[nz_global]
 
-        nz_scores = result[nz_global]
+    def _order_topk(
+        self, nz_global: np.ndarray, nz_scores: np.ndarray, top_k: int
+    ) -> Tuple[np.ndarray, np.ndarray]:
+        """Descending top-k selection over candidate (indices, scores).
+
+        PENPY-IMP-6: top_k <= 0 must return empty here. The numpy
+        fast-path's np.argpartition(scores, -0)[-0:] degenerates to
+        argpartition(scores, 0)[0:] = the full array, leaking ALL value
+        nodes back to the caller (the general non-numpy path handles 0
+        correctly via heapq.nlargest(0, ...) = []). Negatives are
+        nonsense input but the guard covers them too. Callers also guard
+        early to skip the spread work; this is the backstop so no future
+        caller can reach argpartition with k=0.
+        """
+        if top_k <= 0 or len(nz_global) == 0:
+            return _EMPTY_IDX, _EMPTY_SCORES
 
         k = min(top_k, len(nz_global))
         if k >= len(nz_global):
@@ -1305,40 +1212,96 @@ class SpreadingActivation:
             top_idx = np.argpartition(nz_scores, -k)[-k:]
             top_idx = top_idx[np.argsort(nz_scores[top_idx])[::-1]]
 
-        return [(self._node_label[nz_global[i]], float(nz_scores[i])) for i in top_idx]
+        return nz_global[top_idx], nz_scores[top_idx]
+
+    def _spread_candidates(
+        self, activations: Dict[int, float]
+    ) -> Tuple[np.ndarray, np.ndarray]:
+        """Bipartite spread returning thresholded value-node candidates.
+
+        When numba is available, runs the spread and value-node
+        collection in a single JIT kernel, avoiding the numpy round-trip
+        (~20% faster). Otherwise falls back to the raw numpy spread plus
+        _collect_value_candidates. Returns (global_indices, scores),
+        unordered.
+        """
+        if _numba_spread_and_collect is not None:
+            n_act = len(activations)
+            act_indices = np.fromiter(activations.keys(), dtype=np.int64, count=n_act)
+            act_scores = np.fromiter(activations.values(), dtype=np.float32, count=n_act)
+            return _numba_spread_and_collect(
+                act_indices, act_scores,
+                self._adj.indptr, self._adj.indices, self._adj.data,
+                np.float32(self.config.decay), np.float32(self.config.threshold),
+                len(self._idx_to_node),
+                self._node_type_arr, np.int8(_VALUE_TYPE),
+            )
+        return self._collect_value_candidates(self._spread_bipartite_raw(activations))
+
+    def _format_value_rows(
+        self, ordered_idx: np.ndarray, ordered_scores: np.ndarray
+    ) -> List[Tuple[str, float]]:
+        """Format ordered candidates as (value_label, score) rows."""
+        node_label = self._node_label
+        return [(node_label[g], float(s))
+                for g, s in zip(ordered_idx, ordered_scores)]
+
+    def _format_value_rows_with_ids(
+        self, ordered_idx: np.ndarray, ordered_scores: np.ndarray
+    ) -> List[Tuple[str, str, float]]:
+        """Format ordered candidates as (doc_id, value_label, score) rows."""
+        results = []
+        for g, s in zip(ordered_idx, ordered_scores):
+            node_id = self._idx_to_node[g]
+            doc_id = node_id[2:] if node_id.startswith('v:') else node_id
+            results.append((doc_id, self._node_label[g], float(s)))
+        return results
+
+    def _spread_and_collect_bipartite(self, activations: Dict[int, float],
+                                       top_k: int) -> List[Tuple[str, float]]:
+        """Combined spread + collect for bipartite graphs."""
+        # PENPY-IMP-6: early-out before spending the spread (see
+        # _order_topk for the argpartition degeneracy this defends).
+        if top_k <= 0:
+            return []
+        nz_global, nz_scores = self._spread_candidates(activations)
+        return self._format_value_rows(
+            *self._order_topk(nz_global, nz_scores, top_k))
+
+    def _spread_and_collect_bipartite_with_ids(
+        self, activations: Dict[int, float], top_k: int
+    ) -> List[Tuple[str, str, float]]:
+        """Like _spread_and_collect_bipartite but returns (doc_id, value, score)."""
+        # PENPY-IMP-6: see _order_topk.
+        if top_k <= 0:
+            return []
+        nz_global, nz_scores = self._spread_candidates(activations)
+        return self._format_value_rows_with_ids(
+            *self._order_topk(nz_global, nz_scores, top_k))
+
+    def _collect_from_array(self, result: np.ndarray, top_k: int
+                            ) -> List[Tuple[str, float]]:
+        """Collect top-k value nodes directly from a numpy score array.
+
+        Reached via the context+bipartite branch in query() and
+        query_with_doc_ids().
+        """
+        # PENPY-IMP-6: see _order_topk.
+        if top_k <= 0:
+            return []
+        nz_global, nz_scores = self._collect_value_candidates(result)
+        return self._format_value_rows(
+            *self._order_topk(nz_global, nz_scores, top_k))
 
     def _collect_from_array_with_ids(self, result: np.ndarray, top_k: int
                                       ) -> List[Tuple[str, str, float]]:
         """Like _collect_from_array but returns (doc_id, value, score)."""
-        # PENPY-IMP-6: see _spread_and_collect_bipartite.
+        # PENPY-IMP-6: see _order_topk.
         if top_k <= 0:
             return []
-
-        nz_all = np.flatnonzero(result >= self.config.threshold)
-        if len(nz_all) == 0:
-            return []
-
-        is_value = self._node_type_arr[nz_all] == _VALUE_TYPE
-        nz_global = nz_all[is_value]
-        if len(nz_global) == 0:
-            return []
-
-        nz_scores = result[nz_global]
-
-        k = min(top_k, len(nz_global))
-        if k >= len(nz_global):
-            top_idx = np.argsort(nz_scores)[::-1]
-        else:
-            top_idx = np.argpartition(nz_scores, -k)[-k:]
-            top_idx = top_idx[np.argsort(nz_scores[top_idx])[::-1]]
-
-        results = []
-        for i in top_idx:
-            idx = nz_global[i]
-            node_id = self._idx_to_node[idx]
-            doc_id = node_id[2:] if node_id.startswith('v:') else node_id
-            results.append((doc_id, self._node_label[idx], float(nz_scores[i])))
-        return results
+        nz_global, nz_scores = self._collect_value_candidates(result)
+        return self._format_value_rows_with_ids(
+            *self._order_topk(nz_global, nz_scores, top_k))
 
     def query(self, query_text: str, top_k: int = 10,
               context: Optional[List[str]] = None) -> List[Tuple[str, float]]:
