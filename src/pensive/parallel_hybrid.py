@@ -375,7 +375,12 @@ class ParallelHybrid:
                 for i, (doc_id, value, score) in enumerate(results)
             ], analysis
         except Exception as e:
-            logger.warning("SA query failed: %s", e)
+            # Degradation boundary: keep retrieval alive on a flaky SA
+            # path, but make the traceback recoverable under DEBUG so an
+            # unexpected KeyError/AttributeError from a refactor is
+            # distinguishable from an expected backend hiccup.
+            logger.warning("SA query failed: %s", e,
+                           exc_info=logger.isEnabledFor(logging.DEBUG))
             return [], None
 
     @staticmethod
@@ -400,7 +405,9 @@ class ParallelHybrid:
 
             return self._normalize_l2_results(results)
         except Exception as e:
-            logger.warning("L2 query failed: %s", e)
+            # Degradation boundary; see _query_sa for the exc_info rationale.
+            logger.warning("L2 query failed: %s", e,
+                           exc_info=logger.isEnabledFor(logging.DEBUG))
             return []
 
     def _query_l2_on_candidates(
@@ -443,7 +450,9 @@ class ParallelHybrid:
                 r.rank = i
             return filtered[:top_k]
         except Exception as e:
-            logger.warning("Candidate L2 query failed: %s", e)
+            # Degradation boundary; see _query_sa for the exc_info rationale.
+            logger.warning("Candidate L2 query failed: %s", e,
+                           exc_info=logger.isEnabledFor(logging.DEBUG))
             return []
 
     @staticmethod
@@ -484,7 +493,9 @@ class ParallelHybrid:
             return candidates
 
         except Exception as e:
-            logger.warning("Cross-encoder rerank failed: %s", e)
+            # Degradation boundary; see _query_sa for the exc_info rationale.
+            logger.warning("Cross-encoder rerank failed: %s", e,
+                           exc_info=logger.isEnabledFor(logging.DEBUG))
             return candidates
 
     def get_learned_entities(self) -> set:
