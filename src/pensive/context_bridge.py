@@ -76,7 +76,7 @@ class L1ContextBridge:
     3. L1 memory_graph neighbors (associations with query terms)
     """
 
-    def __init__(self, l1_cache, max_context_entities: int = 20,
+    def __init__(self, l1_cache: L1CacheLike, max_context_entities: int = 20,
                  recent_query_window: int = 5):
         """
         Args:
