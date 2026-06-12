@@ -234,6 +234,11 @@ results = idx.search("error 0x4F2A")  # Exact identifier matching
 | 10M docs | ~0.4ms | 30 GB | ~10 min |
 | 50M docs | ~0.45ms | 139 GB | ~28 min |
 
+The query-latency figures use the optional numba JIT spread kernel
+(`pip install numba`), which is roughly 38x faster than the pure-numpy
+path on the hot loop. Without numba, Pensive still runs correctly via a
+numpy scatter-max fallback, just slower per query.
+
 ### Long-lived processes: structural memory growth
 
 The graph is append-only: `add_documents()` extends `_idx_to_node`,
