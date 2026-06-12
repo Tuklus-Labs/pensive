@@ -675,6 +675,72 @@ class SpreadingActivation:
         """
         self._context_provider = provider
 
+    def _ingest_extracted(
+        self,
+        extracted: List[Tuple[Dict, List[Tuple[str, str]]]],
+        *,
+        fast_edges: bool,
+    ) -> None:
+        """Shared per-document graph-construction body for the three
+        ingest paths (_build_locked, add_documents,
+        _build_parallel_locked).
+
+        Caller holds self._build_lock and has already folded the batch's
+        entity counts into self.entity_freq, so specificity computed
+        here reflects post-update frequencies. For each (doc, entities)
+        pair: create the v:<id> value node, dedup entity nodes within
+        the doc, skip entities shorter than 2 chars, index newly created
+        entity nodes, and add the entity->value edge.
+
+        fast_edges=True uses _add_edge_fast (initial build into fresh
+        buffers; per-entity edge positions are backfilled later by
+        _ensure_mutable_edges). fast_edges=False uses _add_edge, which
+        maintains _entity_edge_positions so a later
+        _refresh_specificity_for_entities can rewrite old edge weights.
+        """
+        spec_power = self.config.spec_power
+        edge_weight = self.config.edge_weight
+        entity_freq = self.entity_freq
+        node_to_idx = self._node_to_idx
+        add_edge = self._add_edge_fast if fast_edges else self._add_edge
+
+        for doc, entities in extracted:
+            answer_node = f"v:{doc['id']}"
+            ans_idx = self._get_or_add_node(
+                answer_node, _VALUE_TYPE, doc['value'], 0.0
+            )
+
+            seen_in_doc = set()
+            for entity, etype in entities:
+                if len(entity) < 2:
+                    continue
+                node_id = f"e:{etype}:{entity}"
+                if node_id in seen_in_doc:
+                    continue
+                seen_in_doc.add(node_id)
+
+                # Defense-in-depth: clamp freq to >= 1. The vanilla
+                # ingest paths fold batch counts into entity_freq
+                # before this runs, so freq should always be >= 1
+                # here, but a subclass or future caller could pass
+                # `extracted` without updating `entity_freq` and a
+                # freq of 0 would blow up with ZeroDivisionError
+                # under spec_power > 0.
+                freq = max(entity_freq[entity], 1)
+                specificity = 1.0 / (freq ** spec_power)
+                is_new = node_id not in node_to_idx
+                ent_idx = self._get_or_add_node(
+                    node_id, _ENTITY_TYPE, entity, specificity
+                )
+
+                if is_new:
+                    self._index_entity_node(entity, node_id)
+
+                add_edge(
+                    ent_idx, ans_idx,
+                    specificity * edge_weight
+                )
+
     def build(self, documents: List[Dict]) -> 'SpreadingActivation':
         """
         Build the graph from documents.
@@ -717,45 +783,7 @@ class SpreadingActivation:
                 entity_freq[entity] += 1
 
         # Build graph with specificity weights
-        spec_power = self.config.spec_power
-        edge_weight = self.config.edge_weight
-        node_to_idx = self._node_to_idx
-
-        for doc, entities in extracted:
-            answer_node = f"v:{doc['id']}"
-            ans_idx = self._get_or_add_node(
-                answer_node, _VALUE_TYPE, doc['value'], 0.0
-            )
-
-            seen_in_doc = set()
-            for entity, etype in entities:
-                if len(entity) < 2:
-                    continue
-                node_id = f"e:{etype}:{entity}"
-                if node_id in seen_in_doc:
-                    continue
-                seen_in_doc.add(node_id)
-
-                # Defense-in-depth: clamp freq to >= 1. The vanilla
-                # extraction path increments entity_freq before this
-                # loop runs, so freq should always be >= 1 here, but a
-                # subclass or future caller could populate `extracted`
-                # without updating `entity_freq` and a freq of 0 would
-                # blow up with ZeroDivisionError under spec_power > 0.
-                freq = max(entity_freq[entity], 1)
-                specificity = 1.0 / (freq ** spec_power)
-                is_new = node_id not in node_to_idx
-                ent_idx = self._get_or_add_node(
-                    node_id, _ENTITY_TYPE, entity, specificity
-                )
-
-                if is_new:
-                    self._index_entity_node(entity, node_id)
-
-                self._add_edge_fast(
-                    ent_idx, ans_idx,
-                    specificity * edge_weight
-                )
+        self._ingest_extracted(extracted, fast_edges=True)
 
         self._dirty = True
         self._built = True
@@ -824,42 +852,7 @@ class SpreadingActivation:
             # Keep old edges consistent with the updated frequencies.
             self._refresh_specificity_for_entities(batch_counts.keys())
 
-            spec_power = self.config.spec_power
-            edge_weight = self.config.edge_weight
-            entity_freq = self.entity_freq
-            node_to_idx = self._node_to_idx
-
-            for doc, entities in extracted:
-                answer_node = f"v:{doc['id']}"
-                ans_idx = self._get_or_add_node(
-                    answer_node, _VALUE_TYPE, doc['value'], 0.0
-                )
-
-                seen_in_doc = set()
-                for entity, etype in entities:
-                    if len(entity) < 2:
-                        continue
-                    node_id = f"e:{etype}:{entity}"
-                    if node_id in seen_in_doc:
-                        continue
-                    seen_in_doc.add(node_id)
-
-                    # Defense-in-depth: clamp freq to >= 1. See
-                    # _build_locked for rationale.
-                    freq = max(entity_freq[entity], 1)
-                    specificity = 1.0 / (freq ** spec_power)
-                    is_new = node_id not in node_to_idx
-                    ent_idx = self._get_or_add_node(
-                        node_id, _ENTITY_TYPE, entity, specificity
-                    )
-
-                    if is_new:
-                        self._index_entity_node(entity, node_id)
-
-                    self._add_edge(
-                        ent_idx, ans_idx,
-                        specificity * edge_weight
-                    )
+            self._ingest_extracted(extracted, fast_edges=False)
 
             self._built = True
 
@@ -927,41 +920,7 @@ class SpreadingActivation:
             for entity, _ in entities:
                 entity_freq[entity] += 1
 
-        spec_power = self.config.spec_power
-        edge_weight = self.config.edge_weight
-        node_to_idx = self._node_to_idx
-
-        for doc, entities in extracted:
-            answer_node = f"v:{doc['id']}"
-            ans_idx = self._get_or_add_node(
-                answer_node, _VALUE_TYPE, doc['value'], 0.0
-            )
-
-            seen_in_doc = set()
-            for entity, etype in entities:
-                if len(entity) < 2:
-                    continue
-                node_id = f"e:{etype}:{entity}"
-                if node_id in seen_in_doc:
-                    continue
-                seen_in_doc.add(node_id)
-
-                # Defense-in-depth: clamp freq to >= 1. See _build_locked
-                # for rationale.
-                freq = max(entity_freq[entity], 1)
-                specificity = 1.0 / (freq ** spec_power)
-                is_new = node_id not in node_to_idx
-                ent_idx = self._get_or_add_node(
-                    node_id, _ENTITY_TYPE, entity, specificity
-                )
-
-                if is_new:
-                    self._index_entity_node(entity, node_id)
-
-                self._add_edge_fast(
-                    ent_idx, ans_idx,
-                    specificity * edge_weight
-                )
+        self._ingest_extracted(extracted, fast_edges=True)
 
         self._dirty = True
         self._built = True
