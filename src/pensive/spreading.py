@@ -1477,6 +1477,73 @@ class SpreadingActivation:
             'unique_entities': len(self.entity_freq),
         }
 
+    def compact(self) -> 'SpreadingActivation':
+        """Reclaim the append-only build structures in place.
+
+        The graph is append-only: add_documents() grows the COO edge
+        buffers, _entity_edge_positions, and assorted caches without
+        ever shrinking them (structural RSS growth; see the README
+        "Long-lived processes" section). compact() performs the
+        previously-documented get_save_data() -> from_save_data()
+        round-trip internally and swaps the rebuilt minimal state into
+        this instance, so a long-lived ingesting daemon no longer needs
+        to hand-roll serialize-discard-rebuild. After compacting, the
+        instance is in the same state as one freshly loaded from disk:
+        empty COO buffers, a compiled CSR, cold caches. A later
+        add_documents() re-materializes mutable edges via
+        _ensure_mutable_edges(), exactly as for a loaded graph.
+
+        Query results are identical before and after; node and edge
+        counts are preserved (duplicate COO entries, if any, are summed
+        into the CSR, matching what the manual round-trip produced).
+
+        Concurrency: the swap runs under _build_lock, so it serializes
+        with build()/add_documents() like any other writer, and the
+        compile inside get_save_data() publishes under the same
+        generation contract as always. The graph generation is bumped
+        afterwards so (n_nodes, generation)-keyed consumer caches drop
+        references to the old buffers (PENPY-IMP-5 family).
+
+        Returns:
+            self, for chaining.
+
+        Raises:
+            RuntimeError: if called before the graph is built.
+        """
+        with self._build_lock:
+            if not self._built:
+                raise RuntimeError(
+                    "compact() requires a built graph; call build() or "
+                    "add_documents() first"
+                )
+            fresh = type(self).from_save_data(self.get_save_data())
+
+            # Preserve this instance's identity-bearing state: the lock
+            # we are holding right now, the caller-installed context
+            # provider, the extractor, and the monotonic generation
+            # counter. Everything graph-shaped comes from the rebuilt
+            # instance (node storage is shared by reference via
+            # get_save_data; the win is dropping the COO buffers,
+            # _entity_edge_positions, and stale caches).
+            preserve = {
+                '_build_lock', '_context_provider', '_extractor',
+                '_graph_generation',
+            }
+            for name, value in fresh.__dict__.items():
+                if name not in preserve:
+                    setattr(self, name, value)
+
+            # Buffer swap is a mutation boundary: bump the generation
+            # and drop the boundary value-label cache, mirroring
+            # _reset_graph_state / add_documents (PENPY-IMP-5).
+            self._graph_generation += 1
+            if hasattr(self, '_boundary_value_label_index'):
+                try:
+                    delattr(self, '_boundary_value_label_index')
+                except AttributeError:
+                    pass
+        return self
+
     def get_save_data(self) -> Dict:
         """Return all state needed to serialize this graph."""
         self._compile()

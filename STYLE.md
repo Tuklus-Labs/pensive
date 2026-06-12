@@ -91,7 +91,7 @@ This is a published library and a recall-critical engine, so the budgets sit abo
 - **Query latency:** sub-millisecond on the bipartite fast path at the scales in the README table (~1ms at 1M docs, ~0.45ms at 50M). A change that regresses single-query latency on the bipartite path is a regression to justify, not absorb.
 - **Build:** parallel build stays within the README envelope (~12s at 1M docs, ~28min at 50M). `build_parallel` falls back to serial below 2000 docs; keep that threshold honest.
 - **Memory:** the scipy.sparse CSR representation is the ~90%-over-networkx win and is non-negotiable. Append-only growth is ~50 bytes/node plus edge buffers; any new structure that grows with the corpus declares its bound.
-- **Longevity:** a pure-query workload holds flat RSS indefinitely. A long-lived ingesting daemon follows the documented re-serialize-and-rebuild pattern; a `compact()` path is roadmap, not shipped.
+- **Longevity:** a pure-query workload holds flat RSS indefinitely. A long-lived ingesting daemon calls `compact()` periodically (in-place round-trip under the build lock; results identical pre/post, covered by `tests/test_compact.py`). The manual re-serialize-and-rebuild pattern still works but is no longer required.
 - **Install:** `pip install pypensive` pulls numpy + scipy only and must import and serve queries with neither numba nor `[full]` present. `[full]` is additive, never required for the core engine.
 - **Observability:** the library logs via the stdlib `logging` module under module-named loggers; it does not `print` outside the `boundary_bench.py` CLI report path (`:472` onward) and the `pensive` CLI. Keep library code silent except through `logger`.
 

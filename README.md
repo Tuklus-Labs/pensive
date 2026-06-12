@@ -251,12 +251,22 @@ buffers), so 1M incrementally-added nodes adds ~50 MB on top of the
 adjacency matrix.
 
 This is not a leak; it is the structural cost of an append-only graph
-with no eviction or compaction path. For very-long-lived processes
-that ingest forever, the recommended pattern is to periodically
-serialize the graph with `get_save_data()`, discard the old
-`SpreadingActivation` instance, and rebuild from the save -- which
-also defragments the underlying Python data structures. A dedicated
-`compact()` method is on the roadmap; track in the issue tracker.
+with no eviction path. For very-long-lived processes that ingest
+forever, call `compact()` periodically:
+
+```python
+sa.compact()   # in place; query results are identical before and after
+```
+
+`compact()` performs the serialize-and-rebuild round-trip internally
+and swaps the rebuilt state into the instance: the COO build buffers,
+per-entity edge-position tracking, and query caches are dropped, and
+the graph is left in the same state as one freshly loaded from disk.
+It takes the build lock, so it is safe to call while other threads
+query or ingest; they serialize behind it like any other write. The
+old manual pattern (serialize with `get_save_data()`, discard the
+instance, rebuild from the save) still works and produces the same
+state, but is no longer necessary.
 
 ## License
 
