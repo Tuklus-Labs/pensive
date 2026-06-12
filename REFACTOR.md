@@ -2,6 +2,18 @@
 
 Real, citable targets found by reading the source. Pensive is a hardened, 9-audit-pass engine, so most of these are duplication and ergonomics, not correctness bugs. Ordered by payoff. None of them should touch the `_compile()` concurrency contract without the care STYLE.md demands.
 
+**Status (2026-06-12): all 7 landed** on `refactor/penpy-backlog`, full suite 245 passed in 96s.
+
+1. `0cdf619` -- `_ingest_extracted` extracted from the three build loops
+2. `bd161e1` -- four spread-and-collect tails unified
+3. `6513088` -- `HybridRow` dataclass replaces internal `Dict[str, Any]` rows
+4. `d9fdef0` -- degradation-boundary warnings carry `exc_info` under DEBUG
+5. `429be8d` -- `compact()` shipped with 10 tests; README/STYLE.md updated
+6. `5760e3f` -- CLI report layer split into `boundary_bench_cli.py`
+7. `3e49d24` -- `l1_cache` annotated with the `L1CacheLike` Protocol
+
+Line references below are as of 2026-06-05 and have drifted with the fixes; the sections are kept for the rationale record.
+
 ### 1. Collapse the three near-identical build loops
 
 - **Location:** `src/pensive/spreading.py` -- `_build_locked` (~701-762), `add_documents` (~768-864), `_build_parallel_locked` (~901-968).
