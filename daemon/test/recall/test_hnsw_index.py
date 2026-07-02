@@ -15,7 +15,10 @@ stores instead.
 """
 import math
 import random
+import subprocess
+import sys
 import time
+from pathlib import Path
 
 import numpy as np
 import pytest
@@ -183,6 +186,33 @@ def test_hnsw_scores_are_descending_cosine_similarity(hnswBig, embedder):
     assert scores == sorted(scores, reverse=True)
     # Cosine similarity is bounded by 1.0 (fp32 epsilon), never inflated.
     assert scores[0] <= 1.0 + 1e-6
+
+
+def test_hnsw_scores_match_flat_scale_for_common_atoms(flatBig, hnswBig, embedder):
+    """Pin the score SCALE to flat, not just the ranking.
+
+    The top-5 agreement test compares SETS, which is invariant under any monotonic
+    transform of the score -- so a future metric or distance->similarity change
+    that preserved ranking but shifted the scale would pass every set test while
+    silently distorting RRF fusion downstream (fusion consumes the raw similarity).
+    This guards that: for every atom in BOTH indexes' top-10, hnsw's cosine
+    similarity must equal flat's score within 1e-3 (measured max delta ~2e-7)."""
+    probes = embedder.embed(_probeTexts(20))
+    pairs = 0
+    worst = 0.0
+    for q in probes:
+        flatScore = dict(flatBig.search(q, 10))
+        hnswSim = dict(hnswBig.search(q, 10))
+        for atomId in flatScore.keys() & hnswSim.keys():
+            delta = abs(flatScore[atomId] - hnswSim[atomId])
+            worst = max(worst, delta)
+            assert delta <= 1e-3
+            pairs += 1
+    # Sanity: the comparison actually ran over a meaningful number of pairs, so a
+    # degenerate empty-intersection run cannot vacuously pass.
+    assert pairs >= 20
+    print(f"\n[hnsw] score scale vs flat: {pairs} common pairs, "
+          f"max |delta| = {worst:.2e}")
 
 
 # --------------------------------------------------------------------------- #
@@ -409,3 +439,55 @@ def test_daemon_startup_uses_factory_and_selects_flat_at_shadow_scale(embedder, 
         _put(store, s)
     ctx = ServeContext(store, embedder, MODEL_ID)
     assert isinstance(ctx.index, FlatIndex)
+
+
+# A clean-room child that seeds embeddings directly (no real embedder needed),
+# selects below the default threshold, and asserts usearch stayed unimported.
+# argv[1] = daemon/src on sys.path, argv[2] = a fresh sqlite path.
+_LAZY_IMPORT_PROBE = r'''
+import sys, time
+import numpy as np
+sys.path.insert(0, sys.argv[1])
+from store.store import openStore, putAtom
+from recall.embedder import vecToBlob
+from recall.vector_index import selectIndex, FlatIndex
+
+MODEL = "BAAI/bge-small-en-v1.5"
+DIM = 384
+store = openStore(sys.argv[2])
+rng = np.random.default_rng(0)
+for i in range(5):
+    aid = putAtom(store, {"text": f"atom {i}", "kind": "atom", "project": "p",
+                          "provenance": {"source": "claude-code"}})
+    v = rng.standard_normal(DIM).astype(np.float32)
+    v /= np.linalg.norm(v)
+    store._conn.execute(
+        "INSERT INTO embeddings(atom_id, model_id, vector, embedded_at) "
+        "VALUES (?, ?, ?, ?)",
+        (aid, MODEL, vecToBlob(v), int(time.time())),
+    )
+store._conn.commit()
+
+index = selectIndex(store, MODEL)          # default 200k threshold -> FlatIndex
+assert isinstance(index, FlatIndex), type(index).__name__
+# The binding constraint: a below-threshold selection must NOT pull usearch in.
+assert "usearch" not in sys.modules, "selectIndex imported usearch below threshold"
+print("LAZY_OK")
+'''
+
+
+def test_selectindex_below_threshold_does_not_import_usearch(tmp_path):
+    """The lazy-import constraint is binding, not cosmetic: at shadow scale the
+    factory must keep usearch out of the process (so a Flat-only deploy never needs
+    the dependency). Checked in a SUBPROCESS on purpose -- this very test module
+    imports HnswIndex at the top, which pulls usearch into the pytest process, so an
+    in-process ``'usearch' not in sys.modules`` assert would ALWAYS fail (a false
+    red) or, worse, be quietly deleted to make it pass (a false green). The
+    clean-room child imports only the flat path and seeds embeddings directly."""
+    src = str(Path(__file__).resolve().parents[2] / "src")
+    proc = subprocess.run(
+        [sys.executable, "-c", _LAZY_IMPORT_PROBE, src, str(tmp_path / "lazy.db")],
+        capture_output=True, text=True,
+    )
+    assert proc.returncode == 0, f"stdout={proc.stdout!r} stderr={proc.stderr!r}"
+    assert "LAZY_OK" in proc.stdout
