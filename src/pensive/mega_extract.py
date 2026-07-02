@@ -14,6 +14,8 @@ state, making it safe for multiprocessing workers.
 import re
 from typing import Dict, FrozenSet, List, Optional, Tuple
 
+from .regex_guard import first_charset_guard
+
 
 _WORD_RE = re.compile(r'[a-zA-Z0-9]+')
 
@@ -364,4 +366,14 @@ def _build_mega(
     if not patterns:
         return None, []
     mega = '|'.join(f'(?:{r})' for r, _ in patterns)
+    # A FIRST-set lookahead guard lets the engine reject non-matching
+    # positions with one charclass test instead of attempting every
+    # branch (the leading \b in typical patterns defeats sre's own
+    # skip optimization). first_charset_guard returns None for any
+    # pattern set it cannot prove a superset for; unguarded is always
+    # correct, the guard is only speed. Group numbering is unaffected
+    # (the guard adds no capturing groups).
+    guard = first_charset_guard([r for r, _ in patterns], flags)
+    if guard is not None:
+        mega = guard + '(?:' + mega + ')'
     return re.compile(mega, flags), [et for _, et in patterns]
