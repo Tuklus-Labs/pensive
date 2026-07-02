@@ -1,0 +1,8 @@
+# Dev stores and corpus exports are UNTRACKED: they hold real atom text and must
+# never enter git history (Task 0 privacy rule). Only gate.py and BASELINE_V3.md
+# (numbers/configs, no atom text) are tracked here.
+*.db
+*.db-wal
+*.db-shm
+*.jsonl
+*.result.json
