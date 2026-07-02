@@ -38,6 +38,8 @@ if str(_SRC) not in sys.path:
     sys.path.insert(0, str(_SRC))
 
 from serve.mcp import ServeContext, buildServer, SERVER_NAME  # noqa: E402
+from serve.tee import Counters, handleTeeEmit  # noqa: E402
+from serve.shadow import runShadow, defaultShadowLogPath  # noqa: E402
 from store.store import openStore  # noqa: E402
 from recall.embedder import Embedder  # noqa: E402
 
@@ -92,25 +94,59 @@ def buildApp(ctx):
     Stateless + JSON responses keep the localhost transport simple (no session-id
     ceremony, plain JSON round-trips). The session manager's ``run()`` context is
     driven by the app lifespan so it is active for the life of the server.
+
+    Alongside the ``/mcp`` mount the app carries the Phase 3 double-write surface,
+    all localhost-only (no auth, same bind): ``POST /tee/emit`` replays a tee'd
+    emit into the v3 store, ``POST /shadow/recall`` logs a v3 answer beside the old
+    one, and ``GET /status`` exposes the four tee/shadow counters for the gate
+    check. The tee/shadow boundary handlers are synchronous and run inline on the
+    event-loop thread -- the SAME thread that created the sqlite store (and the
+    same path the MCP ``call_tool`` handler already takes) -- so the store's
+    thread affinity is preserved; they do not go through a threadpool.
     """
     from mcp.server.streamable_http_manager import StreamableHTTPSessionManager
     from starlette.applications import Starlette
-    from starlette.routing import Mount
+    from starlette.responses import JSONResponse
+    from starlette.routing import Mount, Route
 
     server = buildServer(ctx)
     manager = StreamableHTTPSessionManager(
         app=server, json_response=True, stateless=True,
     )
 
+    counters = Counters()
+    shadowLogPath = defaultShadowLogPath()
+
     async def handle_mcp(scope, receive, send):
         await manager.handle_request(scope, receive, send)
+
+    async def tee_emit(request):
+        body = await request.body()
+        status, payload = handleTeeEmit(ctx, counters, body)
+        return JSONResponse(payload, status_code=status)
+
+    async def shadow_recall(request):
+        body = await request.body()
+        status, payload = runShadow(ctx, counters, body, shadowLogPath)
+        return JSONResponse(payload, status_code=status)
+
+    async def status(request):
+        return JSONResponse({"server": SERVER_NAME, "counters": counters.snapshot()})
 
     @contextlib.asynccontextmanager
     async def lifespan(_app):
         async with manager.run():
             yield
 
-    return Starlette(routes=[Mount("/mcp", app=handle_mcp)], lifespan=lifespan)
+    return Starlette(
+        routes=[
+            Route("/tee/emit", tee_emit, methods=["POST"]),
+            Route("/shadow/recall", shadow_recall, methods=["POST"]),
+            Route("/status", status, methods=["GET"]),
+            Mount("/mcp", app=handle_mcp),
+        ],
+        lifespan=lifespan,
+    )
 
 
 def main():
