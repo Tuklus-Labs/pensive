@@ -39,10 +39,11 @@ have already happened:
 python -m build
 ```
 
-This produces a fresh sdist + wheel in `dist/`. The `MANIFEST.in`
-shipped with this repo excludes `*.db`, `*.faiss`, `*.pkl` so runtime
-artifacts (e.g. `vector_meta.db` left over from local development) do
-not end up in the tarball.
+This produces a fresh sdist + wheel in `dist/`. The
+`[tool.hatch.build.targets.sdist]` `exclude` list in `pyproject.toml`
+drops `*.db`, `*.faiss`, `*.pkl` so runtime artifacts (e.g.
+`vector_meta.db` left over from local development) do not end up in the
+tarball.
 
 ## Verify
 
@@ -66,9 +67,9 @@ tar -tzf dist/pypensive-*.tar.gz | grep -E '\.(db|faiss|pkl)$' && {
 }
 ```
 
-If the grep matches anything, the `MANIFEST.in` rules are not catching
-all classes of artifact for the current working-tree state -- audit
-and update before publishing.
+If the grep matches anything, the `pyproject.toml` sdist `exclude`
+rules are not catching all classes of artifact for the current
+working-tree state -- audit and update before publishing.
 
 ## Publish
 
