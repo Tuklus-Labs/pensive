@@ -277,6 +277,42 @@ def test_self_supersession_cycle_raises(store):
     assert "cycle" in str(exc.value)
 
 
+def test_fork_supersession_pins_deterministically_and_marks_why(store):
+    # A fork: two atoms both claim to supersede one old atom (two incoming
+    # supersedes edges). The pin (ORDER BY old_id,new_id + setdefault) must
+    # resolve to the SAME successor across runs -- the earliest-ULID one -- and
+    # the why must carry the fork marker so the ambiguity is visible downstream.
+    old = _put(store, "forked old fact")
+    succB = _put(store, "successor B")     # created first -> smaller ULID
+    succC = _put(store, "successor C")
+    supersede(store, old, succB, {"source": "claude-code"})
+    supersede(store, old, succC, {"source": "claude-code"})
+
+    out1 = assessTrust([(old, 5.0)], {old: {"bm25"}}, store, NOW)
+    out2 = assessTrust([(old, 5.0)], {old: {"bm25"}}, store, NOW)
+
+    assert len(out1) == 1 and len(out2) == 1
+    # deterministic pin across repeated calls
+    assert out1[0]["supersededBy"] == out2[0]["supersededBy"]
+    # pinned to the earliest-ULID successor (ORDER BY new_id ASC + setdefault)
+    assert out1[0]["supersededBy"] == min(succB, succC)
+    # the fork is visible in the reason
+    assert out1[0]["why"] == "superseded by newer atom (forked)"
+    assert out1[0]["shouldTrust"] is False
+    _assert_no_orphan_superseded(store, out1)
+
+
+def test_linear_chain_has_no_fork_marker(store):
+    # The counterpart: a single-successor chain must NOT carry the fork marker.
+    a = _put(store, "fact v1")
+    b = _put(store, "fact v2")
+    supersede(store, a, b, {"source": "claude-code"})
+
+    out = assessTrust([(a, 5.0)], {a: {"bm25"}}, store, NOW)
+    assert out[0]["why"] == "superseded by newer atom"
+    assert "(forked)" not in out[0]["why"]
+
+
 def test_invariant_holds_across_a_mixed_result_set(store):
     # A realistic mix: two live atoms, one superseded-with-live-successor, one
     # superseded-with-tombstoned-successor, one tombstoned outright. The

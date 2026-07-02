@@ -50,11 +50,17 @@ __all__ = [
     "W_AGREE",
     "W_GAP",
     "W_TIME",
+    "AGREE_PRIMARY",
+    "AGREE_DUAL_BONUS",
+    "AGREE_FACET",
     "GAP_TAU",
     "GAP_NEUTRAL",
     "GAP_DECISIVE",
+    "GAP_SINGLE",
     "TRUST_TAU",
     "TRUST_TIME_FLOOR",
+    "TIME_RECENT",
+    "TIME_AGED",
 ]
 
 # --- blend weights --------------------------------------------------------- #
@@ -64,6 +70,12 @@ __all__ = [
 W_AGREE = 0.5
 W_GAP = 0.3
 W_TIME = 0.2
+
+# The no-clamp-needed contract, documented as an assertion: the blend can only
+# stay in [0,1] for every sub-score in [0,1] because the weights sum to exactly
+# 1.0. The clamp in assessTrust stays as a defensive backstop; this guards the
+# invariant at import so a future weight edit that breaks it fails loudly here.
+assert W_AGREE + W_GAP + W_TIME == 1.0, "blend weights must sum to 1.0"
 
 # --- signal-agreement sub-score -------------------------------------------- #
 # The fusion-world analogue of RRF's agreement reward (fusion.py rrf docstring):
@@ -188,7 +200,8 @@ def _buildWhy(signals, gapScore, temporalScore, isTop):
 
 
 def _successorMap(store, rerankedIds):
-    """One SELECT for the relevant supersedes edges -> (successorMap, chainIds).
+    """One SELECT for the relevant supersedes edges -> (successorMap, chainIds,
+    forkedOldIds).
 
     A supersedes edge points new->old (src=new successor, dst=old superseded),
     so ``successorMap[old] = new``. A recursive CTE walks the successor chains
@@ -196,9 +209,12 @@ def _successorMap(store, rerankedIds):
     supersession cycle yields a finite edge set (the Python walk that consumes
     this map detects the cycle and raises). ``chainIds`` is every atom named by
     those edges, so the caller can fold them into the one status/time SELECT.
+    ``forkedOldIds`` is the set of old atoms with MORE THAN ONE distinct
+    successor edge -- a fork the deterministic pin resolves but downstream should
+    still be told about (via the ``why`` marker).
     """
     if not rerankedIds:
-        return {}, set()
+        return {}, set(), set()
     placeholders = ",".join("?" for _ in rerankedIds)
     rows = store._conn.execute(
         f"""
@@ -217,25 +233,32 @@ def _successorMap(store, rerankedIds):
 
     successorMap = {}
     chainIds = set()
+    successorsByOld = {}
     for oldId, newId in rows:
-        # First successor wins (rows are ORDER BY-stable); a fork -- two atoms
-        # both claiming to supersede one old atom -- is unexpected, so pin it
-        # deterministically rather than let dict insertion order decide.
+        # First successor wins (rows are ORDER BY old_id,new_id, so the pinned
+        # branch is the smallest-ULID successor -- stable across runs). A fork --
+        # two atoms both claiming to supersede one old atom -- is unexpected, so
+        # pin it deterministically rather than let dict insertion order decide.
         successorMap.setdefault(oldId, newId)
         chainIds.add(oldId)
         chainIds.add(newId)
-    return successorMap, chainIds
+        successorsByOld.setdefault(oldId, set()).add(newId)
+    forkedOldIds = {old for old, succ in successorsByOld.items() if len(succ) > 1}
+    return successorMap, chainIds, forkedOldIds
 
 
-def _liveEnd(atomId, successorMap, statusInfo):
+def _liveEnd(atomId, successorMap, forkedOldIds):
     """Walk the supersession chain from a superseded atom to its terminal node.
 
-    Returns the id of the atom the chain ends at (the one nobody supersedes),
-    which may be live, tombstoned, missing from ``statusInfo``, or -- under
-    corruption -- still superseded. Raises ValueError naming the atoms on a
-    cycle (a superseded atom revisited while walking).
+    Returns ``(terminal, forked)``: the id of the atom the chain ends at (the one
+    nobody supersedes -- may be live, tombstoned, missing, or under corruption
+    still superseded), and whether the walked path crossed a fork point (a node
+    with more than one successor edge, where the pin chose one branch). Raises
+    ValueError naming the atoms on a cycle (a superseded atom revisited while
+    walking).
     """
     seen = []
+    forked = False
     cur = atomId
     while cur in successorMap:
         if cur in seen:
@@ -243,9 +266,11 @@ def _liveEnd(atomId, successorMap, statusInfo):
             raise ValueError(
                 f"supersession cycle detected among atoms: {names}"
             )
+        if cur in forkedOldIds:
+            forked = True
         seen.append(cur)
         cur = successorMap[cur]
-    return cur
+    return cur, forked
 
 
 def assessTrust(reranked, signalHits, Store, now):
@@ -280,7 +305,7 @@ def assessTrust(reranked, signalHits, Store, now):
     rerankedIds = [atomId for atomId, _ in reranked]
 
     # One SELECT for the relevant supersedes edges (successor chains).
-    successorMap, chainIds = _successorMap(Store, rerankedIds)
+    successorMap, chainIds, forkedOldIds = _successorMap(Store, rerankedIds)
 
     # One SELECT for statuses + effective times over the reranked atoms and every
     # atom named by a chain edge (so a chain's live end can be resolved without a
@@ -332,22 +357,31 @@ def assessTrust(reranked, signalHits, Store, now):
             # A retracted atom must not surface in recall.
             continue
         elif status == "superseded":
-            end = _liveEnd(atomId, successorMap, statusInfo)
+            end, forked = _liveEnd(atomId, successorMap, forkedOldIds)
             endStatus = statusInfo.get(end, (None, None))[0]
             if endStatus != "live":
                 # Chain ends in a tombstone, a missing atom, or (corruption) a
                 # superseded terminal with no successor edge: never surface a
                 # superseded atom without a LIVE successor -- drop it entirely.
+                # (A fork whose PINNED branch ends dead also drops here; walking
+                # the other branches is deferred to the harness era.)
                 continue
             # Historical fact: keep it discoverable but never trusted. Decay the
-            # earned confidence, then cap strictly below TRUST_FLOOR.
+            # earned confidence, then cap strictly below TRUST_FLOOR. A fork on
+            # the resolved path is surfaced so the ambiguity is visible: the pin
+            # is deterministic, but it did choose one of several successors.
             capped = min(confidence, SUPERSEDED_CONF_CAP)
+            why = (
+                "superseded by newer atom (forked)"
+                if forked
+                else "superseded by newer atom"
+            )
             out.append({
                 "atomId": atomId,
                 "score": score,
                 "confidence": capped,
                 "shouldTrust": capped >= TRUST_FLOOR,   # always False by the cap
-                "why": "superseded by newer atom",
+                "why": why,
                 "supersededBy": end,
             })
         else:
