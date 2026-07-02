@@ -7,16 +7,21 @@ a store whose canonical tables are byte-for-byte identical to the original. The
 fts index regenerates because atoms are inserted through the normal triggers, and
 embeddings are re-derived later by the Phase 2 embedder.
 
-Two rules make it safe to lean on for decades:
+Three rules make it safe to lean on for decades:
 
+  * The export must be COMPLETE. ``exportJSONL`` always writes all four files (an
+    empty table yields an empty file), so a missing file is a truncated or
+    damaged export, never a legitimately empty table. ``rebuild`` refuses it up
+    front rather than silently reconstructing a store missing an entire canonical
+    table.
   * Rows are inserted in FK order -- atoms, then provenance, then edges, then
     facets -- so every foreign key resolves at insert time (edges may reference a
     provenance row, so provenance must precede edges; all three reference atoms).
     ``PRAGMA foreign_keys`` is on, so a malformed export fails loudly here rather
     than producing a silently broken store.
-  * ``rebuild`` refuses to write over an existing database. Overwriting a live
-    store mid-rebuild is exactly the irreversible loss the canonical layer exists
-    to prevent, so a pre-existing target is an error, never a clobber.
+  * ``rebuild`` refuses to write over an existing database, and if its own insert
+    pass fails it removes the half-built file it just created. Either way the
+    target path never ends up holding a partial or clobbered store.
 """
 import json
 from pathlib import Path
@@ -39,11 +44,10 @@ _LOAD_ORDER = (
 def _readRows(path):
     """Yield each JSONL line of ``path`` as a dict.
 
-    A missing file yields nothing: an empty table exports to an empty file, and a
-    rebuild must tolerate that file being absent just the same as being empty.
+    The caller guarantees the file exists (``rebuild`` checks export completeness
+    up front). An empty file yields no rows -- that is how an empty table round
+    trips.
     """
-    if not path.exists():
-        return
     with open(path, "r", encoding="utf-8", newline="") as fh:
         for line in fh:
             line = line.strip()
@@ -71,16 +75,37 @@ def rebuild(fromDir, newDbPath):
     column value is preserved verbatim from the export (ids, timestamps,
     statuses, weights, per-row ``schema_version``).
 
-    Refuses to overwrite: if ``newDbPath`` already exists, raises
-    ``FileExistsError`` rather than clobbering a possibly-live store.
+    Preconditions and cleanup, so the target path is never left in a bad state:
+
+    * If ``newDbPath`` already exists, raises ``FileExistsError`` rather than
+      clobbering a possibly-live store.
+    * The export must be complete: all four files must exist (empty files are
+      fine -- they mean empty tables). A missing file raises ``FileNotFoundError``
+      naming it, before any database is created.
+    * If the insert pass fails partway, the half-built database is removed and the
+      error re-raised, so a corrected retry is not blocked by our own leftover.
     """
     srcDir = Path(fromDir)
     target = Path(newDbPath)
+    # The guard keys on the main db file only. openStore would create newDbPath
+    # plus -wal/-shm sidecars, but checking the main file is sufficient: on a
+    # freshly created db SQLite resets any orphan WAL, so a sidecar without a main
+    # file only arises from external tampering, which is out of scope here.
     if target.exists():
         raise FileExistsError(
             f"rebuild target already exists: {target}; refusing to overwrite "
             "(canonical data must never be clobbered)"
         )
+
+    # Require a COMPLETE export before creating anything, so a truncated dump can
+    # never produce a store silently missing a whole canonical table.
+    missing = [fn for fn, _t, _c in _LOAD_ORDER if not (srcDir / fn).exists()]
+    if missing:
+        raise FileNotFoundError(
+            f"incomplete export in {srcDir}: missing {', '.join(missing)}; "
+            "refusing to rebuild a partial store"
+        )
+
     store = openStore(target)
     conn = store._conn
     try:
@@ -89,5 +114,14 @@ def rebuild(fromDir, newDbPath):
         conn.commit()
     except Exception:
         conn.rollback()
+        # The refuse-overwrite guard above proved newDbPath did not exist when
+        # this call began, so the db file and any -wal/-shm sidecar here are
+        # provably this call's own creation -- removing them can never touch
+        # pre-existing data. Leaving the path clean lets a corrected retry run
+        # instead of tripping the refuse-overwrite guard on our own leftover.
+        store.close()
+        for artifact in (target, Path(f"{target}-wal"), Path(f"{target}-shm")):
+            if artifact.exists():
+                artifact.unlink()
         raise
     return store

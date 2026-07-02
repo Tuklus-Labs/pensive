@@ -1,4 +1,6 @@
 import json
+import sqlite3
+from pathlib import Path
 
 import pytest
 
@@ -251,3 +253,79 @@ def test_export_overwrites_only_its_four_files(tmp_path):
         assert all(json.loads(l)["id"] for l in lines)
     finally:
         src.close()
+
+
+def test_rebuild_requires_complete_export(tmp_path):
+    # CRITICAL guard: a complete export always has all four files (empty tables
+    # yield empty files, which is valid), so a MISSING file is a truncated or
+    # damaged export -- never a legitimately empty table. rebuild must refuse it
+    # before creating any database, rather than silently reconstructing a store
+    # missing an entire canonical table.
+    src = openStore(tmp_path / "src.db")
+    export_dir = tmp_path / "export"
+    try:
+        _seed(src)
+        exportJSONL(src, export_dir)
+    finally:
+        src.close()
+
+    (export_dir / "edges.jsonl").unlink()  # simulate a lost/truncated export
+
+    target = tmp_path / "rebuilt.db"
+    with pytest.raises(FileNotFoundError) as exc:
+        rebuild(export_dir, target)
+    assert "edges.jsonl" in str(exc.value)  # the error names the missing file
+    # nothing was created: no partial database (or sidecars) left at the target
+    assert not target.exists()
+    assert not Path(f"{target}-wal").exists()
+    assert not Path(f"{target}-shm").exists()
+
+
+def test_rebuild_cleans_up_after_failed_insert(tmp_path):
+    # Sabotage: a malformed export row (an edge whose endpoints reference atoms
+    # that do not exist) fails the FK mid-insert, AFTER atoms/provenance have been
+    # inserted into the open transaction. rebuild must roll back, remove the
+    # half-built db it created, and re-raise -- leaving the target path clean.
+    src = openStore(tmp_path / "src.db")
+    export_dir = tmp_path / "export"
+    try:
+        _seed(src)
+        exportJSONL(src, export_dir)
+    finally:
+        src.close()
+
+    # append a dangling edge (both endpoints missing) to the exported edges file
+    bogus = {
+        "id": "0" * 26,
+        "src_atom": "NOSUCHATOM00000000000000000",
+        "dst_atom": "NOSUCHATOM11111111111111111",
+        "type": "relates",
+        "weight": 1.0,
+        "created_at": 1,
+        "provenance_id": None,
+    }
+    edges_file = export_dir / "edges.jsonl"
+    with open(edges_file, "a", encoding="utf-8", newline="") as fh:
+        fh.write(json.dumps(bogus) + "\n")
+
+    target = tmp_path / "rebuilt.db"
+    with pytest.raises(sqlite3.IntegrityError):
+        rebuild(export_dir, target)
+    # the failed attempt cleaned up after itself: no db file or sidecars remain
+    assert not target.exists()
+    assert not Path(f"{target}-wal").exists()
+    assert not Path(f"{target}-shm").exists()
+
+    # and because the path is clean, a corrected retry is NOT blocked by the
+    # refuse-overwrite guard: drop the bad line and rebuild succeeds into target.
+    kept = [
+        line
+        for line in edges_file.read_text(encoding="utf-8").splitlines(keepends=True)
+        if "NOSUCHATOM" not in line
+    ]
+    edges_file.write_text("".join(kept), encoding="utf-8")
+    rebuilt = rebuild(export_dir, target)
+    try:
+        assert atomCount(rebuilt) == 51
+    finally:
+        rebuilt.close()
