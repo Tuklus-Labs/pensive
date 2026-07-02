@@ -239,6 +239,38 @@ def test_search_with_nonpositive_k_returns_empty(embedder, store):
     assert index.search(qvec, k=-3) == []
 
 
+def test_search_normalizes_non_unit_query(embedder, store):
+    # The defensive query-normalization path: a caller may pass an un-normalized
+    # vector. Magnitude must not change the ranking, and scores must stay true
+    # cosine (<= 1.0 within fp32 epsilon), not inflate with the query's scale.
+    for s in SENTENCES[:6]:
+        _put(store, s)
+    embedMissing(store, embedder)
+    index = FlatIndex().build(store, MODEL_ID)
+
+    unit = embedder.embed([SENTENCES[0]])[0]
+    scaled = unit * 3.0  # deliberately non-unit query
+
+    unitHits = index.search(unit, k=6)
+    scaledHits = index.search(scaled, k=6)
+
+    assert [a for a, _ in scaledHits] == [a for a, _ in unitHits]
+    for (a1, s1), (a2, s2) in zip(unitHits, scaledHits):
+        assert a1 == a2
+        assert s2 <= 1.0 + 1e-6  # true cosine, not scaled up by |query|=3
+        assert math.isclose(s1, s2, rel_tol=0, abs_tol=1e-5)
+
+
+def test_search_zero_vector_query_returns_empty(embedder, store):
+    # A zero query has no direction; normalizing would divide by zero, so the
+    # guard returns [] rather than raising or emitting NaNs.
+    _put(store, SENTENCES[0])
+    embedMissing(store, embedder)
+    index = FlatIndex().build(store, MODEL_ID)
+    zero = np.zeros(DIM, dtype=np.float32)
+    assert index.search(zero, k=5) == []
+
+
 def test_blob_round_trip_is_exact(embedder):
     # Write then read back one vector; float32 values must survive bit-for-bit.
     vec = embedder.embed([SENTENCES[0]])[0]

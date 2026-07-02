@@ -90,7 +90,10 @@ class Embedder:
             normalize_embeddings=True,
             show_progress_bar=False,
         ).astype(np.float32, copy=False)
-        return [matrix[i] for i in range(matrix.shape[0])]
+        # .copy() so each returned vector owns its buffer -- a row view would
+        # alias the batch matrix, and a consumer's in-place op would silently
+        # mutate its siblings. 384 float32s per copy, negligible.
+        return [matrix[i].copy() for i in range(matrix.shape[0])]
 
 
 def embedMissing(store, embedder):

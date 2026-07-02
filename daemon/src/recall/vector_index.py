@@ -93,7 +93,9 @@ class FlatIndex(VectorIndex):
             order = np.argsort(-scores, kind="stable")
         else:
             # argpartition finds the top-k unordered in O(n), then we sort only
-            # those k. Stable sort keeps ties in atom-id order (build sorts by id).
+            # those k by descending score. Deterministic for a given input, but
+            # (unlike the k >= n branch) the selected subset is not in atom-id
+            # order, so tie order among equal scores here is unspecified.
             part = np.argpartition(-scores, k - 1)[:k]
             order = part[np.argsort(-scores[part], kind="stable")]
         return [(self._atomIds[i], float(scores[i])) for i in order]
