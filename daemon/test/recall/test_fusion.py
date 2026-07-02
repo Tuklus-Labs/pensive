@@ -140,7 +140,11 @@ def test_time_factor_floor_property_holds_for_any_age():
     assert timeFactor(0) == pytest.approx(1.0)
     assert timeFactor(10 ** 12) == FLOOR          # underflows to exactly FLOOR
     assert timeFactor(TAU) == pytest.approx(FLOOR + (1.0 - FLOOR) * (1 / 2.718281828))
-    for age in (0, 3600, TAU, 10 * TAU, 100 * TAU, 10 ** 12):
+    # negative age (future-dated atom) clamps to the freshest boost, never > 1.0
+    # and never overflows exp on an absurd far-future value.
+    assert timeFactor(-10 ** 6) == pytest.approx(1.0)
+    assert timeFactor(-(10 ** 13)) == pytest.approx(1.0)
+    for age in (-(10 ** 13), -3600, 0, 3600, TAU, 10 * TAU, 100 * TAU, 10 ** 12):
         assert FLOOR <= timeFactor(age) <= 1.0
 
 
@@ -229,6 +233,31 @@ def test_time_scope_degenerate_window_is_empty(store):
     a = _put(store, "some atom", occurredAt=1_800_000_000)
     out = applyPriors([(a, 1.0)], store, {"now": NOW, "timeScope": (5000, 1000)})
     assert out == []
+
+
+def test_apply_priors_future_dated_atom_bounded_and_no_overflow(store):
+    # A skewed/garbage occurred_at far in the future (~year 999999) is a named
+    # input class for Task 11 backfill and v3.1 bulk-import of misdated archives.
+    # It must NOT raise (exp overflow would crash the whole recall call) and must
+    # NOT out-score an otherwise-identical fresh atom: future age clamps to 0 ->
+    # timeFactor 1.0, exactly a fresh atom, never above.
+    farFuture = 32_503_680_000_000          # ~year 999999 in unix seconds
+    future = _put(store, "timestamp from the far future", occurredAt=farFuture)
+    fresh = _put(store, "recorded and occurring now", occurredAt=NOW)
+
+    out = applyPriors([(future, 1.0), (fresh, 1.0)], store, {"now": NOW})   # no raise
+    scored = dict(out)
+    assert scored[future] <= scored[fresh]
+    assert scored[future] == pytest.approx(1.0)      # clamped to freshest, not above
+
+
+def test_apply_priors_missing_now_raises_named_contract_error(store):
+    # Without timeScope the time prior needs a clock; a missing hints["now"] is a
+    # named-contract ValueError, not a bare KeyError from deep in the loop.
+    a = _put(store, "an atom", occurredAt=NOW)
+    with pytest.raises(ValueError) as exc:
+        applyPriors([(a, 1.0)], store, {})
+    assert "now" in str(exc.value)
 
 
 def test_apply_priors_empty_fused_is_empty(store):

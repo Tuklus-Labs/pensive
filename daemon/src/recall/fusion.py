@@ -82,15 +82,23 @@ def rrf(lists, k=60, weights=None):
 def timeFactor(ageSeconds):
     """Freshness multiplier for an atom ``ageSeconds`` old -> a float in [FLOOR, 1.0].
 
-    ``FLOOR + (1 - FLOOR) * exp(-ageSeconds / TAU)``: 1.0 at age 0, decaying
-    toward -- but never below -- ``FLOOR`` as age grows. The FLOOR is the whole
+    ``FLOOR + (1 - FLOOR) * exp(-age / TAU)`` with ``age = max(0, ageSeconds)``:
+    1.0 at age 0, decaying toward -- but never below -- ``FLOOR`` as age grows,
+    and never ABOVE 1.0. Clamping negative age to 0 is load-bearing on the upper
+    side: a future-dated atom (``occurred_at`` ahead of ``now`` -- a skewed clock
+    or a bulk import of misdated archives) is treated as freshest instead of
+    earning a boost > 1.0 that would break this postcondition, and the clamp also
+    keeps ``exp`` from overflowing on an absurd far-future timestamp (which would
+    otherwise raise and crash the whole recall call). The FLOOR is the lower-side
     design: it caps how much freshness can matter, so a maximally-important old
     atom (importanceFactor 2.0 * FLOOR 0.5 = 1.0) is never buried beneath a fresh
     trivial one (importanceFactor 1.0 * timeFactor 1.0 = 1.0). Age alone cannot
     win. For a very large age the exponential underflows to 0.0, so the factor
-    equals ``FLOOR`` exactly.
+    equals ``FLOOR`` exactly. Bounded in [FLOOR, 1.0] for ANY input, positive or
+    negative.
     """
-    return FLOOR + (1.0 - FLOOR) * math.exp(-ageSeconds / TAU)
+    age = max(0, ageSeconds)
+    return FLOOR + (1.0 - FLOOR) * math.exp(-age / TAU)
 
 
 def applyPriors(fused, store, hints):
@@ -105,6 +113,10 @@ def applyPriors(fused, store, hints):
       ``hints["now"]`` against its effective time ``COALESCE(occurred_at,
       created_at)``. Bounded in [FLOOR, 1.0]; see the module docstring for why
       the floor keeps old important atoms from being buried.
+
+    ``hints["now"]`` is REQUIRED whenever the time prior runs (no ``timeScope``);
+    a missing ``now`` raises ``ValueError`` naming the contract rather than
+    surfacing a bare ``KeyError`` -- the time prior has no sensible default clock.
 
     When ``hints["timeScope"] = (startUnix, endUnix)`` is present, the time prior
     is NOT applied. Instead results are RESTRICTED to atoms whose effective time
@@ -136,6 +148,13 @@ def applyPriors(fused, store, hints):
     scoped = timeScope is not None
     if scoped:
         start, end = timeScope
+    elif "now" not in hints:
+        # The time prior needs a reference clock and there is no sensible
+        # default; name the contract loudly, like the desync error below, rather
+        # than letting a bare KeyError surface from deep in the loop.
+        raise ValueError(
+            "applyPriors requires hints['now'] when timeScope is absent"
+        )
 
     out = []
     for atomId, fusedScore in fused:
@@ -152,6 +171,9 @@ def applyPriors(fused, store, hints):
             if start <= effectiveTime <= end:
                 out.append((atomId, fusedScore * importanceFactor))
         else:
+            # timeFactor clamps a negative age (future-dated atom) to the
+            # freshest boost, so a skewed occurred_at never scores above 1.0 nor
+            # overflows exp -- the raw difference is safe to hand it.
             age = hints["now"] - effectiveTime
             out.append((atomId, fusedScore * importanceFactor * timeFactor(age)))
 
