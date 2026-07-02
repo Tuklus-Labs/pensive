@@ -12,11 +12,14 @@ Two corpora, both evaluated by the same ``gate`` core:
   * chat-export  -- the ChatGPT export the harness already knows. Positional
     ground truth (next assistant turn). THIS is the apples-to-apples gate vs BM25.
   * atom corpus  -- the real ~17k Pensive atoms + narratives. No positional
-    labels exist for it, so it is scored by a SELF-SUPERVISED proxy
-    (src:-tag sibling retrieval: an atom's relevant set is the other live atoms
-    sharing one of its src: tags). This is a topical-coherence read on the real
-    serving corpus plus the real end-to-end latency, NOT a labeled accuracy claim,
-    and BASELINE_V3.md says so.
+    labels exist for it, so it is scored by a SELF-SUPERVISED PROJECT-sibling
+    proxy: an atom's relevant set is the other live atoms sharing its parsed
+    project slug (``unclassified`` excluded, that being 88% of rows = "no
+    project"). The tighter cluster keys were rejected as unusable on THIS corpus:
+    ``session_id``/``episode_id`` are entirely NULL, and ``src:`` tags exist on
+    only ~40 rows. This is a topical-coherence read on the real serving corpus
+    plus the real end-to-end latency, NOT a labeled accuracy claim, and NOT the
+    gate (the gate is the chat-export number); BASELINE_V3.md says so.
 
 The bridge from a recalled atomId back to a ground-truth document id is the
 ``bulk-import`` provenance ``source_ref`` that ``ingest.backfill`` writes: the
@@ -255,15 +258,15 @@ def buildSiblingBenchmark(records, clusterKey="tag", nQueries=500, seed=42,
                           excludeKeys=frozenset()):
     """Self-supervised sibling benchmark over export ``records``.
 
-    ``clusterKey='session'``: two atoms are siblings if they came from the same
-    work session (``session_id``) -- a focused, always-labeled topical cluster, the
-    best proxy available for the real atom corpus (src: tags exist on only ~40
-    rows, too sparse to score). ``'project'`` and ``'tag'`` are the broader/sparser
-    alternatives. An atom's relevant set is its siblings minus itself; an atom with
-    no sibling is ineligible as a query. Returns ``(queries, corpusRefs,
-    corpusTexts, eligibleCount)`` where the corpus lists cover EVERY record (the
-    full distractor set), and the queries are a seed-sampled subset of the eligible
-    atoms.
+    ``clusterKey='project'`` is what the real atom corpus is scored on: two atoms
+    are siblings if they share a parsed project slug (pass ``excludeKeys={'unclassified'}``
+    to drop the "no project" bucket). The tighter keys were rejected as unusable on
+    that corpus and are kept only for other corpora: ``'session'`` (``session_id``,
+    entirely NULL here) and ``'tag'`` (``src:`` tags, only ~40 rows). An atom's
+    relevant set is its siblings minus itself; an atom with no sibling is ineligible
+    as a query. Returns ``(queries, corpusRefs, corpusTexts, eligibleCount)`` where
+    the corpus lists cover EVERY record (the full distractor set), and the queries
+    are a seed-sampled subset of the eligible atoms.
     """
     import random
     corpusRefs = [r["sourceId"] for r in records]
@@ -388,8 +391,10 @@ def main():
     ap.add_argument("--export-dir", default=str(Path.home() / "Projects" / "chatgpt-export"))
     ap.add_argument("--db", required=True, help="dev store path (untracked)")
     ap.add_argument("--queries", type=int, default=1500)
-    ap.add_argument("--cluster-key", default="session",
-                    choices=["session", "project", "tag"])
+    # project is the only usable key on the real atom corpus (session_id NULL,
+    # src: tags on ~40 rows); pair it with --exclude-keys unclassified.
+    ap.add_argument("--cluster-key", default="project",
+                    choices=["project", "session", "tag"])
     ap.add_argument("--exclude-keys", default="",
                     help="comma-separated cluster values to treat as non-clusters "
                          "(e.g. 'unclassified')")

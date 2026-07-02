@@ -278,6 +278,50 @@ def test_backfill_tolerates_empty_tags_and_absent_optionals(store):
 # 8: the stats the report cites are true                                      #
 # --------------------------------------------------------------------------- #
 
+def test_backfill_is_idempotent_across_runs(store, records):
+    # Re-run safety (the production migration path): running the SAME export into
+    # the SAME store twice must NOT double the corpus. The guard is on the
+    # bulk-import source_ref (the original id); the second run skips every record
+    # whose ref is already present and reports it, leaving atom and facet counts
+    # exactly where run 1 left them.
+    stats1 = backfill(store, records)
+    count1 = atomCount(store)
+    entity1 = store._conn.execute(
+        "SELECT COUNT(*) FROM facets WHERE key = 'entity'"
+    ).fetchone()[0]
+    tag1 = store._conn.execute(
+        "SELECT COUNT(*) FROM facets WHERE key = 'tag'"
+    ).fetchone()[0]
+    assert stats1["ingested"] == len(records)
+    assert stats1["skipped"] == 0
+
+    stats2 = backfill(store, records)          # identical export, identical store
+    assert atomCount(store) == count1          # no doubling
+    assert stats2["ingested"] == 0
+    assert stats2["skipped"] == len(records)
+    assert store._conn.execute(
+        "SELECT COUNT(*) FROM facets WHERE key = 'entity'"
+    ).fetchone()[0] == entity1                 # facets unchanged
+    assert store._conn.execute(
+        "SELECT COUNT(*) FROM facets WHERE key = 'tag'"
+    ).fetchone()[0] == tag1
+
+
+def test_backfill_passes_through_document_chunk_kind(store):
+    # document_chunk is a real kind (the chat-export backfill uses it exclusively)
+    # but the 200-atom fixture never exercises it. Pin the passthrough directly.
+    recs = [
+        {"sourceId": "doc-1", "text": "a chunk of a longer document about aegis",
+         "kind": "document_chunk"},
+        {"sourceId": "doc-2", "text": "another chunk naming pensive once",
+         "kind": "document_chunk"},
+    ]
+    stats = backfill(store, recs)
+    assert stats["byKind"].get("document_chunk") == 2
+    a = getAtom(store, _atom_id_by_source_ref(store, "doc-1"))
+    assert a["kind"] == "document_chunk"
+
+
 def test_backfill_stats_match_the_store(store, records):
     stats = backfill(store, records)
     entityRows = store._conn.execute(

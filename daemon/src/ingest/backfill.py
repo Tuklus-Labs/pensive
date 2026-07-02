@@ -52,6 +52,14 @@ over the LOCAL ``src/pensive`` tree (never a pip-installed pypensive). A format
 change touches this module and ``facetSignal`` together; the negative pins in
 ``test_backfill`` and ``test_signals`` turn any drift into a loud failure.
 
+Re-run idempotency (the migration path runs against a real store): a record whose
+``sourceId`` already exists as a ``bulk-import`` ``source_ref`` in the store is
+SKIPPED, not re-ingested -- so running the same export twice does not silently
+double the corpus. The guard also dedups WITHIN a run (a repeated sourceId in one
+export lands once). Skips are counted and returned as ``skipped``; a record with no
+``sourceId`` (``source_ref`` NULL) has no identity to dedup on and is always
+ingested.
+
 Loudness: a record with no ``text`` has nothing to remember and RAISES rather than
 being silently skipped -- on a decades-scale store a swallowed record is memory
 lost forever. Each record is its own transaction (putAtom + its facets), so an
@@ -100,26 +108,49 @@ def backfill(store, srcExport):
     facets in the pinned convention. Facet writes are idempotent, so an entity
     named twice in one body yields exactly one facet.
 
-    Returns ``{ingested, byKind, tagFacets, entityFacets}`` where the counts equal
-    what actually landed in the store (facets are counted DEDUPED per atom, so the
-    totals match ``SELECT COUNT(*) FROM facets`` for each key -- the report cites
-    these numbers, so they must not lie).
+    Returns ``{ingested, skipped, byKind, tagFacets, entityFacets}`` where the
+    counts equal what actually landed in the store (facets are counted DEDUPED per
+    atom, so the totals match ``SELECT COUNT(*) FROM facets`` for each key -- the
+    report cites these numbers, so they must not lie). ``skipped`` counts records
+    whose ``sourceId`` was already present as a bulk-import ``source_ref`` (re-run
+    idempotency); those write nothing.
 
     Raises ``KeyError`` on a record with no ``text`` (loudness over silent skip);
     records committed before the offending one are preserved.
     """
     extractor = _getExtractor()
     ingested = 0
+    skipped = 0
     byKind = {}
     tagFacets = 0
     entityFacets = 0
+
+    # Re-run guard: existing bulk-import refs already in the store. Seeding the
+    # set from the store (one SELECT) makes a second run against the same store a
+    # no-op; adding to it as we go dedups repeats within THIS run too. NULL refs
+    # are excluded -- they carry no identity to dedup on.
+    seenRefs = {
+        row[0]
+        for row in store._conn.execute(
+            "SELECT source_ref FROM provenance "
+            "WHERE source = ? AND source_ref IS NOT NULL",
+            (_BULK_SOURCE,),
+        ).fetchall()
+    }
 
     for record in srcExport:
         # Required. A missing text is a loud KeyError, not a silent drop.
         text = record["text"]
         kind = record.get("kind") or "atom"
 
-        provenance = {"source": _BULK_SOURCE, "sourceRef": record.get("sourceId")}
+        sourceRef = record.get("sourceId")
+        # Already backfilled (prior run or earlier in this run): skip, do not
+        # double. A NULL sourceRef has no identity, so it is never deduped.
+        if sourceRef is not None and sourceRef in seenRefs:
+            skipped += 1
+            continue
+
+        provenance = {"source": _BULK_SOURCE, "sourceRef": sourceRef}
         # Carry the original session/agent when the export has them (the real
         # corpus does; the synthetic fixture does not). putAtom defaults them NULL.
         if record.get("sessionId") is not None:
@@ -148,6 +179,8 @@ def backfill(store, srcExport):
 
         ingested += 1
         byKind[kind] = byKind.get(kind, 0) + 1
+        if sourceRef is not None:
+            seenRefs.add(sourceRef)  # dedup a repeated ref later in this same run
 
         # src: tags -> tag facets, verbatim. Dedup within the record so the count
         # matches the store (the facet PK dedups too, this keeps the stat honest).
@@ -165,6 +198,7 @@ def backfill(store, srcExport):
 
     return {
         "ingested": ingested,
+        "skipped": skipped,
         "byKind": byKind,
         "tagFacets": tagFacets,
         "entityFacets": entityFacets,

@@ -85,6 +85,12 @@ atoms, of which 500 were seed-42 sampled. Relevant-set sizes 1–41 (broad). Cav
 `session_id`/`episode_id` are entirely NULL and src: tags cover only ~40 rows, so
 no tight structural cluster exists — this is a LOOSE topical-coherence proxy, not
 a labeled accuracy claim, and NOT the gate (the gate is the chat-export number).
+Circularity caveat: the project slug lives both IN the atom text (the
+`[claude] on <slug>` prefix is kept verbatim) AND is the relevance label, and it
+can also fire the entity-facet boost — so any system that keys on the literal slug
+token is mildly flattered here, inflating the proxy delta somewhat. The chat-export
+gate is immune to this: its records carry `project=None`, and its ground truth is
+positional (next assistant turn), not any in-text label.
 
 ## Recall latency (informational; formal latency gate is later)
 
