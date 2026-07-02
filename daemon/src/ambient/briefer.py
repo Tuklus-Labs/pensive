@@ -60,7 +60,7 @@ No :func:`recall` model dependency -- the brief is pure store math.
 import time
 
 from recall.payload import estimateTokens, tier0Handle, tier1Entry
-from recall.fusion import timeFactor
+from recall.fusion import importanceFactor, timeFactor
 
 __all__ = [
     "brief",
@@ -184,10 +184,11 @@ def _activeRanked(store, now, excludeIds):
 
     Draws the ``ACTIVE_CANDIDATE_CAP`` most-recent live atoms, drops the ones
     already shown elsewhere (pins, loose ends), scores each with fusion's own math
-    -- ``importanceFactor = 1.0 + min(importance, 1.0)`` (the exact formula from
-    :func:`recall.fusion.applyPriors`) times :func:`recall.fusion.timeFactor` --
-    and returns ``[(atomId, project, score)]`` best-first. The sort is stable, so
-    equal scores keep the recency order the SQL imposed."""
+    -- :func:`recall.fusion.importanceFactor` times
+    :func:`recall.fusion.timeFactor`, the exact prior
+    :func:`recall.fusion.applyPriors` uses -- and returns ``[(atomId, project,
+    score)]`` best-first. The sort is stable, so equal scores keep the recency
+    order the SQL imposed."""
     rows = store._conn.execute(
         "SELECT id, project, importance, COALESCE(occurred_at, created_at) "
         "FROM atoms WHERE status = 'live' "
@@ -199,8 +200,7 @@ def _activeRanked(store, now, excludeIds):
     for atomId, project, importance, effectiveTime in rows:
         if atomId in excludeIds:
             continue
-        importanceFactor = 1.0 + min(importance, 1.0)
-        score = importanceFactor * timeFactor(now - effectiveTime)
+        score = importanceFactor(importance) * timeFactor(now - effectiveTime)
         scored.append((atomId, project, score))
     scored.sort(key=lambda t: -t[2])
     return scored

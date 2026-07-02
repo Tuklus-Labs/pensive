@@ -148,6 +148,9 @@ def buildApp(ctx):
             except (TypeError, ValueError):
                 return JSONResponse(
                     {"error": "budget must be an integer"}, status_code=400)
+            if budget < 1:
+                return JSONResponse(
+                    {"error": "budget must be >= 1"}, status_code=400)
         text = brief(ctx.store, {"agent": agent, "budget": budget})
         return JSONResponse({"brief": text, "agent": agent, "budget": budget})
 

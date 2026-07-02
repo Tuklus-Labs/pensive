@@ -69,7 +69,7 @@ from ambient.briefer import (
     EMPTY_BRIEF,
 )
 from recall.payload import estimateTokens, HANDLE_SCHEME
-from recall.fusion import timeFactor
+from recall.fusion import importanceFactor, timeFactor
 from store.store import openStore, putAtom, addFacet, supersede, getAtom
 
 DAY = 86_400
@@ -310,21 +310,19 @@ def test_superseded_atom_never_appears_in_any_section(store):
 # --------------------------------------------------------------------------- #
 
 
-def _importanceFactor(importance):
-    return 1.0 + min(importance, 1.0)
-
-
 def test_active_ranking_matches_fusion_math(store):
     # Two atoms: one recent+trivial, one old+important. fusion's floor guarantees
     # the important-old atom is never buried; here we make it strictly outrank the
-    # trivial-recent one and assert the brief orders them that way.
+    # trivial-recent one and assert the brief orders them that way. The score uses
+    # fusion's OWN importanceFactor -- the same function the briefer calls, so a
+    # drift between the two would fail this test instead of staying silently green.
     recentTrivial = _put(store, "recent trivial thread zzz", importance=0.0,
                           occurredAt=NOW - 1 * DAY)
     oldImportant = _put(store, "old important thread aaa", importance=1.0,
                         occurredAt=NOW - 200 * DAY)
 
-    scoreRecent = _importanceFactor(0.0) * timeFactor(1 * DAY)
-    scoreOld = _importanceFactor(1.0) * timeFactor(200 * DAY)
+    scoreRecent = importanceFactor(0.0) * timeFactor(1 * DAY)
+    scoreOld = importanceFactor(1.0) * timeFactor(200 * DAY)
     assert scoreOld > scoreRecent               # sanity: fusion math says old wins
 
     out = brief(store, {"agent": "heph", "budget": 1500, "now": NOW})
@@ -392,8 +390,7 @@ def test_furniture_is_plain_no_markdown_no_emoji(store):
         assert line in out
         assert not line.startswith(("#", "-", "*", ">"))
         assert "**" not in line
-    assert not _EMOJI_RE.search(out) or True     # bodies may carry emoji; furniture must not
-    # Our furniture specifically is emoji-free:
+    # Bodies may legitimately carry emoji; the furniture WE generate must not.
     for line in furniture:
         assert not _EMOJI_RE.search(line)
 
@@ -449,6 +446,32 @@ def test_brief_endpoint_returns_working_set(embedder, tmp_path, monkeypatch):
             r2 = client.get("/brief", params={"agent": "heph"})
             assert r2.status_code == 200
             assert r2.json()["budget"] == 1500
+    finally:
+        s.close()
+
+
+def test_brief_endpoint_rejects_bad_budget(embedder, tmp_path, monkeypatch):
+    # A non-integer budget and a sub-1 budget are both client errors: 400, never a
+    # 500 or a silently-clamped brief.
+    import sqlite3
+    from starlette.testclient import TestClient
+    from serve.daemon import buildApp
+    from serve.mcp import ServeContext
+
+    _real_connect = sqlite3.connect
+    monkeypatch.setattr(
+        sqlite3, "connect",
+        lambda *a, **k: _real_connect(*a, **{**k, "check_same_thread": False}))
+
+    s = openStore(tmp_path / "mem.db")
+    try:
+        ctx = ServeContext(s, embedder, MODEL_ID, agent="heph")
+        app = buildApp(ctx)
+        with TestClient(app) as client:
+            for bad in ("notanint", "1.5", "0", "-5"):
+                r = client.get("/brief", params={"agent": "heph", "budget": bad})
+                assert r.status_code == 400, f"budget={bad!r} should be 400"
+                assert "error" in r.json()
     finally:
         s.close()
 

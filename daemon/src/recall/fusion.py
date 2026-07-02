@@ -27,7 +27,7 @@ Stdlib + ``math`` only; the fusion stage is dependency-free by design.
 """
 import math
 
-__all__ = ["rrf", "applyPriors", "timeFactor", "FLOOR", "TAU"]
+__all__ = ["rrf", "applyPriors", "timeFactor", "importanceFactor", "FLOOR", "TAU"]
 
 # --- time-prior constants (named so the floor property is legible) --------- #
 
@@ -101,14 +101,28 @@ def timeFactor(ageSeconds):
     return FLOOR + (1.0 - FLOOR) * math.exp(-age / TAU)
 
 
+def importanceFactor(importance):
+    """Importance multiplier -> a float in [1.0, 2.0].
+
+    ``1.0 + min(importance, 1.0)``: importance is earned (0.0 by default) and
+    capped at 1.0, so the factor is bounded in [1.0, 2.0] and a runaway importance
+    value cannot dominate. It is the importance half of the ``importanceFactor *
+    timeFactor`` prior; paired with :func:`timeFactor` (bounded [FLOOR, 1.0]) the
+    two guarantee a maximally-important old atom (2.0 * 0.5 = 1.0) is never buried
+    beneath a fresh trivial one (1.0 * 1.0 = 1.0). The single place this formula
+    lives -- :func:`applyPriors` and the ambient briefer both call it, so the
+    ranking math never forks."""
+    return 1.0 + min(importance, 1.0)
+
+
 def applyPriors(fused, store, hints):
     """Bias fused scores by importance and time -> ``[(atomId, score)]`` best-first.
 
     Each score becomes ``fusedScore * importanceFactor * timeFactor`` where:
 
-    - ``importanceFactor = 1.0 + min(importance, 1.0)`` -- importance is earned
-      (0.0 by default) and capped at 1.0, so the factor is bounded in [1.0, 2.0]
-      and a runaway importance value cannot dominate.
+    - ``importanceFactor`` (:func:`importanceFactor`) -- ``1.0 + min(importance,
+      1.0)``: importance is earned (0.0 by default) and capped at 1.0, so the
+      factor is bounded in [1.0, 2.0] and a runaway importance value cannot dominate.
     - ``timeFactor`` is :func:`timeFactor` of the atom's age, measured from
       ``hints["now"]`` against its effective time ``COALESCE(occurred_at,
       created_at)``. Bounded in [FLOOR, 1.0]; see the module docstring for why
@@ -164,18 +178,18 @@ def applyPriors(fused, store, hints):
                 "(index/store desync)"
             )
         importance, effectiveTime = info[atomId]
-        importanceFactor = 1.0 + min(importance, 1.0)
+        impFactor = importanceFactor(importance)
         if scoped:
             # Window restriction replaces the time prior. start > end satisfies
             # nothing, so a degenerate window naturally yields [].
             if start <= effectiveTime <= end:
-                out.append((atomId, fusedScore * importanceFactor))
+                out.append((atomId, fusedScore * impFactor))
         else:
             # timeFactor clamps a negative age (future-dated atom) to the
             # freshest boost, so a skewed occurred_at never scores above 1.0 nor
             # overflows exp -- the raw difference is safe to hand it.
             age = hints["now"] - effectiveTime
-            out.append((atomId, fusedScore * importanceFactor * timeFactor(age)))
+            out.append((atomId, fusedScore * impFactor * timeFactor(age)))
 
     out.sort(key=lambda kv: -kv[1])
     return out
