@@ -1,0 +1,18 @@
+{
+  "backend": "onnxruntime_go (yalue, ORT 1.27 CPU) + sugarme/tokenizer",
+  "candidate": "go_ort",
+  "device": "cpu",
+  "embed_dim": 384,
+  "embed_model": "BAAI/bge-small-en-v1.5",
+  "embed_throughput_atoms_per_s": 18.7,
+  "embed_total_ms": 26694.5,
+  "load_s": 1.445,
+  "n_atoms": 500,
+  "rerank_error": "sugarme/tokenizer Metaspace panic on SentencePiece tokenizer: runtime error: slice bounds out of range [877:876]",
+  "rerank_latency_ms_per_pair": null,
+  "rerank_model": "BAAI/bge-reranker-base",
+  "rerank_pairs": 10,
+  "rerank_total_ms": null,
+  "runtime": "go",
+  "top_score": null
+}

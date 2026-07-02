@@ -1,0 +1,22 @@
+# Realistic benchmark sample: intentionally untracked. Sourced from a real
+# Engram dump that contains third-party sensitive content (names, emails,
+# financial/legal docs). Stays on disk for reproduction; regen recipe in RESULTS.md.
+sample_atoms.jsonl
+
+# Large model weights / onnx exports (multi-GB, re-fetchable) — see README.md
+models/
+tj_models/
+
+# Node deps and the onnxruntime shared lib / tarball / compiled Go binary
+ts_bun/node_modules/
+go_ort/lib/
+go_ort/ort_lib/
+go_ort/ort127.tgz
+go_ort/spike_go
+
+# stray onnx / shared objects / tarballs if placed elsewhere
+*.onnx
+*.onnx.data
+*.so
+*.so.*
+*.tgz

@@ -1,0 +1,15 @@
+{
+  "candidate": "python_ref",
+  "device": "cpu",
+  "embed_model": "BAAI/bge-small-en-v1.5",
+  "rerank_model": "BAAI/bge-reranker-base",
+  "embed_dim": 384,
+  "n_atoms": 500,
+  "load_s": 2.143,
+  "embed_throughput_atoms_per_s": 22.4,
+  "embed_total_ms": 22329.6,
+  "rerank_pairs": 10,
+  "rerank_latency_ms_per_pair": 91.97,
+  "rerank_total_ms": 919.7,
+  "top_score": 0.0001
+}
