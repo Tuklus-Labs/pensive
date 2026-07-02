@@ -59,13 +59,21 @@ class Store:
             self._conn.close()
             self._closed = True
 
+    def _metaTableExists(self):
+        row = self._conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'meta'"
+        ).fetchone()
+        return row is not None
+
     def _readVersion(self):
-        try:
-            row = self._conn.execute(
-                "SELECT value FROM meta WHERE key = 'schema_version'"
-            ).fetchone()
-        except sqlite3.OperationalError:
-            return None  # meta table does not exist yet (fresh file)
+        # A fresh file has no meta table yet; that is the only "not initialized"
+        # signal. Probe for it explicitly so genuine operational errors (locked
+        # db, I/O, corruption) propagate instead of being misread as a fresh file.
+        if not self._metaTableExists():
+            return None
+        row = self._conn.execute(
+            "SELECT value FROM meta WHERE key = 'schema_version'"
+        ).fetchone()
         if row is None:
             return None
         return int(row[0])

@@ -27,11 +27,14 @@ def migrate(store):
             f"supports (max {CURRENT_SCHEMA_VERSION}); refusing to open"
         )
 
+    dirty = False
     if version < 1:
         # v0 -> v1: baseline. Tables already exist; record that we are at v1.
         store._setVersion(1)
         version = 1
+        dirty = True
 
-    # future: if version < 2: _upgrade_1_to_2(store); version = 2
+    # future: if version < 2: _upgrade_1_to_2(store); version = 2; dirty = True
 
-    store._commit()
+    if dirty:  # a no-op re-open of an up-to-date db writes nothing
+        store._commit()

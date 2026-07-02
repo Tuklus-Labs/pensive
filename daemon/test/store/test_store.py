@@ -79,3 +79,16 @@ def test_double_close_is_safe(tmp_path):
     s = openStore(tmp_path / "mem.db")
     s.close()
     s.close()  # must not raise
+
+
+def test_open_refuses_future_schema_version(tmp_path):
+    # A database recorded at a version newer than this build must be refused,
+    # not silently mis-opened or downgraded (forward-only / never-unrecoverable).
+    dbfile = tmp_path / "mem.db"
+    s = openStore(dbfile)
+    s._conn.execute("UPDATE meta SET value = '2' WHERE key = 'schema_version'")
+    s._conn.commit()
+    s.close()
+
+    with pytest.raises(RuntimeError):
+        openStore(dbfile)
