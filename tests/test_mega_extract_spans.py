@@ -34,7 +34,7 @@ def test_extract_with_spans_sorted_by_position():
     assert starts == sorted(starts)
 
 
-# --- Literal pattern extraction tests ---
+# Literal pattern extraction tests
 
 def test_split_literal_patterns_extracts_simple_words():
     """Pure alphanumeric alternation patterns get extracted as literals."""

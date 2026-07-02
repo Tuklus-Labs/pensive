@@ -24,9 +24,7 @@ from pensive.l2 import L2Handler, L2Config, L2Result
 from pensive.parallel_hybrid import ParallelHybrid
 
 
-# --------------------------------------------------------------------------
 # Shared fixture: a populated L2Handler with 3 small docs.
-# --------------------------------------------------------------------------
 
 
 @pytest.fixture(scope="module")
@@ -45,9 +43,7 @@ def populated_l2():
     return l2
 
 
-# --------------------------------------------------------------------------
 # L2Handler.batch_query
-# --------------------------------------------------------------------------
 
 
 def test_batch_query_returns_list_per_input(populated_l2):
@@ -86,9 +82,7 @@ def test_batch_query_single_input_returns_single_list(populated_l2):
     assert isinstance(results[0], list)
 
 
-# --------------------------------------------------------------------------
 # L2Handler.size / L2Handler.clear
-# --------------------------------------------------------------------------
 
 
 def test_size_zero_on_empty_handler():
@@ -124,9 +118,7 @@ def test_clear_empties_handler():
     assert l2.size == 1, f"after add post-clear, size={l2.size}, expected 1"
 
 
-# --------------------------------------------------------------------------
 # ParallelHybrid.shutdown
-# --------------------------------------------------------------------------
 
 
 def test_parallel_hybrid_shutdown_does_not_hang():
@@ -194,9 +186,7 @@ def test_parallel_hybrid_shutdown_no_executor_safe():
     ph.shutdown()
 
 
-# --------------------------------------------------------------------------
 # ParallelHybrid.get_learned_entities
-# --------------------------------------------------------------------------
 
 
 def test_get_learned_entities_empty_when_no_pattern_learner():

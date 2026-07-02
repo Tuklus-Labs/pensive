@@ -7,7 +7,7 @@ from pensive.spreading import SpreadingActivation
 from pensive.ingestion.pipeline import _default_key_path, _load_or_create_key
 
 
-# ------------- NaN bypass in rank fusion invariant -------------
+# NaN bypass in rank fusion invariant
 
 def test_rank_fusion_rejects_nan():
     with pytest.raises(ValueError, match="NaN"):
@@ -18,7 +18,7 @@ def test_rank_fusion_rejects_nan():
         ParallelHybrid(rank_fusion_sa_only=float("nan"))
 
 
-# ------------- XDG_CONFIG_HOME empty-string -------------
+# XDG_CONFIG_HOME empty-string
 
 def test_empty_xdg_config_home_falls_back_to_home(monkeypatch, tmp_path):
     fake_home = tmp_path / "home"
@@ -40,7 +40,7 @@ def test_whitespace_xdg_config_home_falls_back(monkeypatch, tmp_path):
     assert str(p).startswith(str(fake_home))
 
 
-# ------------- Key file bytes returned unchanged -------------
+# Key file bytes returned unchanged
 # secrets.token_bytes(32) can legitimately end in whitespace bytes
 # (0x09/0x0a/0x0b/0x0c/0x0d/0x20). Stripping those on load would silently
 # desync the on-disk key from the in-memory key and break HMAC verification
@@ -59,7 +59,7 @@ def test_key_file_bytes_returned_verbatim(monkeypatch, tmp_path):
     assert k == raw, "key file bytes must be returned unchanged (no rstrip)"
 
 
-# ------------- build() exception safety + lock acquisition -------------
+# build() exception safety + lock acquisition
 
 def test_build_exception_resets_state():
     """If build raises partway through, _built stays False."""
@@ -95,7 +95,7 @@ def test_build_parallel_exception_resets_state():
     assert sa._built is False
 
 
-# ------------- build_lock exists -------------
+# build_lock exists
 
 def test_build_lock_present():
     sa = SpreadingActivation()

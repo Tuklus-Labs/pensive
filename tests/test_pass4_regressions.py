@@ -206,9 +206,7 @@ def test_case_insensitive_literal_alternation_still_works():
         )
 
 
-# ---------------------------------------------------------------------------
 # PENPY-IMP-1: L2 candidate-rerank fallback must respect the candidate set
-# ---------------------------------------------------------------------------
 
 
 class _LegacyL2Result:
@@ -303,9 +301,7 @@ def test_l2_candidate_fallback_empty_candidate_set_returns_empty():
     )
 
 
-# ---------------------------------------------------------------------------
 # PENPY-IMP-3: boundary.analyze_boundary must handle None/empty queries
-# ---------------------------------------------------------------------------
 
 
 def test_analyze_boundary_handles_none_query():
@@ -348,9 +344,7 @@ def test_analyze_boundary_handles_none_query():
     assert full.analysis.confidence == "none"
 
 
-# ---------------------------------------------------------------------------
 # PENPY-IMP-4: boost_identifier_matches must not mutate caller's input ranks
-# ---------------------------------------------------------------------------
 
 
 def test_boost_identifier_matches_does_not_mutate_input_rank():

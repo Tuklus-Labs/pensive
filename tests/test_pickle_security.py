@@ -165,7 +165,6 @@ def test_malicious_pickle_blocked_without_trusted(tmp_path):
         IngestPipeline.load_graph(str(dest))
 
 
-# ---------------------------------------------------------------------------
 # CRIT-1 -- Pickle key precedence: on-disk key wins over PENSIVE_PICKLE_KEY.
 #
 # Rule guarded: the env var must NEVER be able to override an existing
@@ -174,7 +173,6 @@ def test_malicious_pickle_blocked_without_trusted(tmp_path):
 # under that key, bypassing HMAC verification and reaching pickle.loads.
 # Disk-first precedence forces an attacker to overwrite a 0600 file in
 # the user's config dir before they can swap the trust anchor.
-# ---------------------------------------------------------------------------
 
 
 def test_disk_key_wins_over_env_var(tmp_path, monkeypatch):
@@ -260,9 +258,7 @@ def test_hostile_env_does_not_unlock_disk_signed_file(tmp_path, monkeypatch):
     )
 
 
-# ---------------------------------------------------------------------------
 # IMP-3 / IMP-2 -- atomic key file write + parent dir mode 0700
-# ---------------------------------------------------------------------------
 
 
 def test_persisted_key_is_0600(tmp_path, monkeypatch):
@@ -288,9 +284,7 @@ def test_persisted_key_is_0600(tmp_path, monkeypatch):
     )
 
 
-# ---------------------------------------------------------------------------
 # IMP-4 -- load_graph max_size cap
-# ---------------------------------------------------------------------------
 
 
 def test_load_graph_rejects_oversized_file(tmp_path, monkeypatch):

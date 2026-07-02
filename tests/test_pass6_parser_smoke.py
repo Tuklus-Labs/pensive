@@ -29,9 +29,7 @@ from pensive.ingestion.parsers.google import (
 )
 
 
-# --------------------------------------------------------------------------
 # FacebookParser
-# --------------------------------------------------------------------------
 
 
 def test_facebook_parser_yields_documents_from_inbox_thread(tmp_path):
@@ -71,9 +69,7 @@ def test_facebook_parser_yields_documents_from_inbox_thread(tmp_path):
         assert d.content, "FacebookParser yielded empty content"
 
 
-# --------------------------------------------------------------------------
 # GoogleCalendarParser
-# --------------------------------------------------------------------------
 
 
 def test_google_calendar_parser_yields_event_documents(tmp_path):
@@ -108,9 +104,7 @@ def test_google_calendar_parser_yields_event_documents(tmp_path):
     )
 
 
-# --------------------------------------------------------------------------
 # YouTubeCommentsParser
-# --------------------------------------------------------------------------
 
 
 def test_youtube_comments_parser_yields_documents_from_csv(tmp_path):
@@ -145,9 +139,7 @@ def test_youtube_comments_parser_yields_documents_from_csv(tmp_path):
         assert d.content, "YouTubeCommentsParser yielded empty content"
 
 
-# --------------------------------------------------------------------------
 # GoogleMapsParser
-# --------------------------------------------------------------------------
 
 
 def test_google_maps_parser_yields_documents_from_geojson(tmp_path):
@@ -198,9 +190,7 @@ def test_google_maps_parser_yields_documents_from_geojson(tmp_path):
         )
 
 
-# --------------------------------------------------------------------------
 # SentenceAwareChunker
-# --------------------------------------------------------------------------
 
 
 def test_sentence_aware_chunker_returns_all_sentences():

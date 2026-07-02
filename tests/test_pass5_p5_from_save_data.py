@@ -93,9 +93,7 @@ def test_p5_imp2_load_graph_wraps_oob_as_value_error(tmp_path):
         IngestPipeline.load_graph(str(out))
 
 
-# --------------------------------------------------------------------------
 # PENPY-P6-MIN-1: parallel-array length consistency on load
-# --------------------------------------------------------------------------
 #
 # check_format only validates the CSR adjacency. It does NOT verify that
 # node_type / idx_to_node / node_label have the same length as n_nodes.

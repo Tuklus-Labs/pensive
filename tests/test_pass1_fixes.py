@@ -39,9 +39,7 @@ from pensive.ingestion.query_gen import QueryGenerator
 from pensive.ingestion.parsers.chatgpt import ChatGPTParser
 
 
-# ---------------------------------------------------------------------------
 # IMP-12 -- version bump
-# ---------------------------------------------------------------------------
 
 
 def test_version_bumped_to_match_pyproject():
@@ -57,9 +55,7 @@ def test_version_bumped_to_match_pyproject():
     )
 
 
-# ---------------------------------------------------------------------------
 # CRIT-3 -- SpreadingConfig validation
-# ---------------------------------------------------------------------------
 
 
 @pytest.mark.parametrize(
@@ -96,9 +92,7 @@ def test_spreading_config_accepts_valid_defaults():
     assert cfg.max_hops >= 0
 
 
-# ---------------------------------------------------------------------------
 # CRIT-2 -- freq>=1 defense-in-depth on 1.0/(freq**spec_power)
-# ---------------------------------------------------------------------------
 
 
 def test_zero_frequency_does_not_zerodivide_in_build():
@@ -163,9 +157,7 @@ def test_query_does_not_zerodivide_with_zero_freq():
     assert isinstance(results, list)
 
 
-# ---------------------------------------------------------------------------
 # IMP-8 -- query() handles empty / whitespace text
-# ---------------------------------------------------------------------------
 
 
 @pytest.mark.parametrize("empty_query", ["", None])
@@ -202,9 +194,7 @@ def test_query_with_doc_ids_empty_returns_empty(empty_query):
     )
 
 
-# ---------------------------------------------------------------------------
 # IMP-1 -- email parser populates query field via query_gen.for_email
-# ---------------------------------------------------------------------------
 
 
 def test_query_generator_for_email_returns_nonempty_natural_text():
@@ -275,9 +265,7 @@ def test_email_parser_yields_documents_with_query_populated(tmp_path):
         )
 
 
-# ---------------------------------------------------------------------------
 # CRIT-4 + IMP-11 -- ParallelHybrid tier ordering and deterministic order
-# ---------------------------------------------------------------------------
 
 
 class _StubSA:
@@ -442,9 +430,7 @@ def test_rank_fusion_deterministic_across_runs():
     )
 
 
-# ---------------------------------------------------------------------------
 # IMP-6 -- ChatGPTParser MAX_THREAD_PATH cap
-# ---------------------------------------------------------------------------
 
 
 def test_chatgpt_parser_caps_thread_path(tmp_path):
@@ -536,9 +522,7 @@ def test_chatgpt_parser_rejects_oversized_file(tmp_path):
     )
 
 
-# ---------------------------------------------------------------------------
 # IMP-7 -- pensive build CLI --force flag
-# ---------------------------------------------------------------------------
 
 
 def test_cli_build_refuses_overwrite_without_force(tmp_path, monkeypatch):
@@ -581,9 +565,7 @@ def test_cli_build_refuses_overwrite_without_force(tmp_path, monkeypatch):
     )
 
 
-# ---------------------------------------------------------------------------
 # IMP-9 -- L2Handler grown-region zero initialization
-# ---------------------------------------------------------------------------
 
 
 def test_l2_grown_region_is_zero_not_garbage():
@@ -625,9 +607,7 @@ def test_l2_grown_region_is_zero_not_garbage():
     assert np.allclose(s._emb_array[5], embedding[0])
 
 
-# ---------------------------------------------------------------------------
 # IMP-10 -- pattern_learner cache invalidation on add_documents
-# ---------------------------------------------------------------------------
 
 
 def test_pattern_learner_cache_invalidated_on_add_documents():

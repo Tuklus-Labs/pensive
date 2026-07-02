@@ -13,9 +13,7 @@ from pensive.mega_extract import MegaExtractor
 from pensive.patterns import SYNTHETIC_PATTERNS
 
 
-# -----------------------------------------------------------------
 # PENPY-IMP-5: boundary value-label cache stale after build()-rebuild
-# -----------------------------------------------------------------
 
 
 def test_imp5_boundary_cache_invalidates_on_rebuild_same_n_nodes():
@@ -151,9 +149,7 @@ def test_imp5_reset_clears_cache_attribute_belt_and_suspenders():
     )
 
 
-# -----------------------------------------------------------------
 # PENPY-IMP-6: query(top_k=0) returns all results in bipartite paths
-# -----------------------------------------------------------------
 
 
 @pytest.fixture
@@ -230,9 +226,7 @@ def test_imp6_query_top_k_negative_returns_empty(sa_5_docs_shared_entity):
     )
 
 
-# -----------------------------------------------------------------
 # PENPY-MIN-4: MegaExtractor IndexError on named-group patterns
-# -----------------------------------------------------------------
 
 
 def test_min4_named_group_pattern_rejected_at_construction():
