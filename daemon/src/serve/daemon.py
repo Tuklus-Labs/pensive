@@ -40,6 +40,7 @@ if str(_SRC) not in sys.path:
 from serve.mcp import ServeContext, buildServer, SERVER_NAME  # noqa: E402
 from serve.tee import Counters, handleTeeEmit  # noqa: E402
 from serve.shadow import runShadow, defaultShadowLogPath  # noqa: E402
+from ambient.briefer import brief, DEFAULT_BUDGET  # noqa: E402
 from store.store import openStore  # noqa: E402
 from recall.embedder import Embedder  # noqa: E402
 
@@ -133,6 +134,23 @@ def buildApp(ctx):
     async def status(request):
         return JSONResponse({"server": SERVER_NAME, "counters": counters.snapshot()})
 
+    async def brief_endpoint(request):
+        # The Phase 4 session-start working set as a VIEW over the store. GET so a
+        # SessionStart hook can curl it; agent + budget are query params. brief()
+        # performs zero writes, so this handler is read-only like /status.
+        agent = request.query_params.get("agent")
+        budgetRaw = request.query_params.get("budget")
+        if budgetRaw in (None, ""):
+            budget = DEFAULT_BUDGET
+        else:
+            try:
+                budget = int(budgetRaw)
+            except (TypeError, ValueError):
+                return JSONResponse(
+                    {"error": "budget must be an integer"}, status_code=400)
+        text = brief(ctx.store, {"agent": agent, "budget": budget})
+        return JSONResponse({"brief": text, "agent": agent, "budget": budget})
+
     @contextlib.asynccontextmanager
     async def lifespan(_app):
         async with manager.run():
@@ -143,6 +161,7 @@ def buildApp(ctx):
             Route("/tee/emit", tee_emit, methods=["POST"]),
             Route("/shadow/recall", shadow_recall, methods=["POST"]),
             Route("/status", status, methods=["GET"]),
+            Route("/brief", brief_endpoint, methods=["GET"]),
             Mount("/mcp", app=handle_mcp),
         ],
         lifespan=lifespan,
