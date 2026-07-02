@@ -161,6 +161,21 @@ def test_bm25_boolean_and_hyphen_tokens_are_literal_not_operators(store):
     assert hyphen in hyphenIds
 
 
+def test_bm25_caps_huge_query_and_still_matches_early_tokens(store):
+    # Task 18's drift watcher posts conversation TAILS into recall as raw
+    # queries, so a multi-thousand-token input is designed-in, not hypothetical.
+    # The sanitizer caps at the first _MAX_QUERY_TOKENS tokens: the query must
+    # return without error and the early (leading) tokens must still match.
+    doc = _put(store, "biofouling titanium hull acoustic modem")
+    early = "biofouling titanium hull"
+    filler = " ".join(f"filler{i}" for i in range(5000))
+    query = early + " " + filler
+
+    hits = bm25(store, query, 200)     # 5000+ tokens must not raise
+    ids = [atomId for atomId, _ in hits]
+    assert doc in ids
+
+
 # --------------------------------------------------------------------------- #
 # dense                                                                       #
 # --------------------------------------------------------------------------- #
@@ -289,6 +304,24 @@ def test_facet_entity_hint_boosts_atoms_with_matching_entity_facet(store):
     assert hit in res["boostSet"]
     assert miss not in res["boostSet"]
     assert res["filterSet"] is None      # no project/time hint -> no filter
+
+
+def test_facet_entity_boost_ignores_divergent_value_format(store):
+    # Pin the entity convention negatively: value is the lowercase surface form
+    # extract() returns. A writer that stores a type-prefixed value or the wrong
+    # case must NOT be silently boosted -- this turns a future writer/reader
+    # format drift into a loud test failure instead of silently dead boosts.
+    canonical = _put(store, "atom with canonical entity facet")
+    addFacet(store, canonical, "entity", "pensive")
+    wrongCase = _put(store, "atom with uppercase entity facet")
+    addFacet(store, wrongCase, "entity", "PENSIVE")
+    typePrefixed = _put(store, "atom with type-prefixed entity facet")
+    addFacet(store, typePrefixed, "entity", "project:pensive")
+
+    res = facetSignal(store, {"query": "tell me about pensive"})
+    assert canonical in res["boostSet"]      # matches the documented format
+    assert wrongCase not in res["boostSet"]  # divergent case -> no boost
+    assert typePrefixed not in res["boostSet"]  # divergent format -> no boost
 
 
 def test_facet_entity_boost_excludes_superseded(store):

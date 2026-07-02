@@ -57,6 +57,16 @@ _DEFAULT_K = 200
 # the stored text. Unicode-aware by default for str patterns (matches café).
 _TOKEN_RE = re.compile(r"\w+", re.UNICODE)
 
+# Cap the sanitized MATCH expression at the first N tokens. Task 18's drift
+# watcher posts conversation TAILS into recall as raw queries, so multi-thousand-
+# token inputs are a designed-in case, not an edge. An unbounded "t" OR "t" ...
+# expression is the one remaining hole in the never-throws guarantee: FTS5 caps
+# the phrase-term count per MATCH expression (build/config dependent -- this box
+# tolerates 100k, a stricter build does not), and thousands of OR terms are
+# pointless for candidate-stage recall regardless. Take the FIRST N tokens (order
+# preserved) so the leading/early tokens still drive the match.
+_MAX_QUERY_TOKENS = 64
+
 # Pattern compilation is not free, so build the extractor once, lazily -- Task 7
 # imports this module for bm25/dense without ever touching facetSignal, and
 # should not pay the compile cost on import.
@@ -77,13 +87,17 @@ def _sanitizeFtsQuery(query):
     literal), doubling any embedded quote for safety even though ``\\w+`` never
     yields one. Operators (AND/OR/NOT/NEAR), hyphens, parens, and ``*`` inside a
     quoted phrase are literal text, so the result can never be an FTS5 syntax
-    error. Tokens are joined with ``OR`` (see module docstring: recall-first).
-    Returns None when there is no token at all (empty, whitespace, or
-    punctuation/emoji-only input) so the caller returns [] without querying.
+    error. Tokens are joined with ``OR`` (see module docstring: recall-first) and
+    capped at the first ``_MAX_QUERY_TOKENS`` so a huge paste cannot blow the
+    FTS5 expression limit. Returns None when there is no token at all (empty,
+    whitespace, or punctuation/emoji-only input) so the caller returns [] without
+    querying.
     """
     tokens = _TOKEN_RE.findall(query)
     if not tokens:
         return None
+    if len(tokens) > _MAX_QUERY_TOKENS:
+        tokens = tokens[:_MAX_QUERY_TOKENS]
     quoted = ['"' + t.replace('"', '""') + '"' for t in tokens]
     return " OR ".join(quoted)
 
