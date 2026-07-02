@@ -7,11 +7,21 @@ connection independently enforces the invariants SQLite tracks per-connection
 needs to be set once by ``schema.sql``.
 """
 import sqlite3
+import time
 from pathlib import Path
 
 from store.migrate import migrate, CURRENT_SCHEMA_VERSION
+from util.ulid import ulid
 
-__all__ = ["openStore", "Store", "migrate", "CURRENT_SCHEMA_VERSION"]
+__all__ = [
+    "openStore",
+    "Store",
+    "migrate",
+    "CURRENT_SCHEMA_VERSION",
+    "putAtom",
+    "getAtom",
+    "atomCount",
+]
 
 _SCHEMA_PATH = Path(__file__).resolve().parent / "schema.sql"
 
@@ -87,3 +97,118 @@ class Store:
 
     def _commit(self):
         self._conn.commit()
+
+
+def _now():
+    """Current wall clock in unix seconds (UTC). Epoch seconds are inherently
+    UTC, so no timezone handling is needed."""
+    return int(time.time())
+
+
+def putAtom(store, atomInput):
+    """Write one atom and its single provenance row in one transaction.
+
+    ``atomInput`` is a dict shaped ``{text, kind, project?, occurredAt?,
+    importance?, provenance: {source, sessionId?, agent?, sourceRef?}}``.
+    ``text``, ``kind`` and ``provenance.source`` are required; the ``?`` fields
+    default to NULL (importance to 0.0). ``created_at`` (atom) and
+    ``recorded_at`` (provenance) are stamped to now, ``status`` to ``'live'``,
+    ``schema_version`` to current. Returns the generated atom ULID.
+
+    The two inserts are one transaction: the atom row goes in first, then the
+    provenance row. If the provenance insert fails (e.g. a NULL source hits the
+    NOT NULL constraint) the whole thing rolls back, so a half-written atom with
+    no provenance can never be committed.
+    """
+    conn = store._conn
+    now = _now()
+    atomId = ulid()
+    prov = atomInput["provenance"]
+    try:
+        conn.execute(
+            "INSERT INTO atoms(id, text, kind, project, created_at, occurred_at, "
+            "importance, status, schema_version) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                atomId,
+                atomInput["text"],
+                atomInput["kind"],
+                atomInput.get("project"),
+                now,
+                atomInput.get("occurredAt"),
+                atomInput.get("importance", 0.0),
+                "live",
+                CURRENT_SCHEMA_VERSION,
+            ),
+        )
+        conn.execute(
+            "INSERT INTO provenance(id, atom_id, source, session_id, agent, "
+            "source_ref, recorded_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (
+                ulid(),
+                atomId,
+                prov["source"],
+                prov.get("sessionId"),
+                prov.get("agent"),
+                prov.get("sourceRef"),
+                now,
+            ),
+        )
+        conn.commit()
+    except Exception:
+        # The atom insert already ran inside this transaction; rollback undoes it
+        # (and its fts trigger row) so the failed put leaves the store untouched.
+        conn.rollback()
+        raise
+    return atomId
+
+
+def getAtom(store, atomId):
+    """Return the atom ``atomId`` as a dict with its provenance list, or None.
+
+    The returned shape is ``{id, text, kind, project, createdAt, occurredAt,
+    importance, status, schemaVersion, provenance: [ {id, atomId, source,
+    sessionId, agent, sourceRef, recordedAt}, ... ]}``. Provenance rows are
+    ordered by their ULID, i.e. write order. Missing atom -> None.
+    """
+    conn = store._conn
+    atomRow = conn.execute(
+        "SELECT id, text, kind, project, created_at, occurred_at, importance, "
+        "status, schema_version FROM atoms WHERE id = ?",
+        (atomId,),
+    ).fetchone()
+    if atomRow is None:
+        return None
+    provRows = conn.execute(
+        "SELECT id, atom_id, source, session_id, agent, source_ref, recorded_at "
+        "FROM provenance WHERE atom_id = ? ORDER BY id",
+        (atomId,),
+    ).fetchall()
+    return {
+        "id": atomRow[0],
+        "text": atomRow[1],
+        "kind": atomRow[2],
+        "project": atomRow[3],
+        "createdAt": atomRow[4],
+        "occurredAt": atomRow[5],
+        "importance": atomRow[6],
+        "status": atomRow[7],
+        "schemaVersion": atomRow[8],
+        "provenance": [
+            {
+                "id": p[0],
+                "atomId": p[1],
+                "source": p[2],
+                "sessionId": p[3],
+                "agent": p[4],
+                "sourceRef": p[5],
+                "recordedAt": p[6],
+            }
+            for p in provRows
+        ],
+    }
+
+
+def atomCount(store):
+    """Number of atom rows currently in the store."""
+    return store._conn.execute("SELECT COUNT(*) FROM atoms").fetchone()[0]
