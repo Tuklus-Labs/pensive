@@ -115,9 +115,16 @@ def handleTeeEmit(ctx, counters, rawBody):
         return 400, {"error": "tee: 'args' must be a JSON object"}
 
     # dispatch() already contains handler exceptions and returns (text, isError),
-    # so a v3 store error surfaces as isError rather than a raised exception -- the
-    # boundary stays contained without a second try/except around the write.
-    text, isError = dispatch(ctx, tool, args)
+    # so a v3 store error surfaces as isError. The try/except is belt-and-suspenders
+    # for an UNMODELED raise (a bug in dispatch, an error before it returns): the
+    # boundary must still count it as teeFailed and return a clean 500, never let a
+    # raw exception escape to Starlette (which would 500 with the counter stuck at
+    # "received but not failed").
+    try:
+        text, isError = dispatch(ctx, tool, args)
+    except Exception as exc:  # noqa: BLE001 -- contained boundary, must not bleed
+        counters._inc("teeFailed")
+        return 500, {"error": f"tee dispatch failed: {exc}"}
     if isError:
         counters._inc("teeFailed")
         return 500, {"error": text}

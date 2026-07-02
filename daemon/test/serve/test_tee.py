@@ -244,6 +244,24 @@ def test_tee_forced_v3_write_error_is_contained_and_counted(ctx, counters, monke
     assert not hasattr(ctx, "oldStore") and not hasattr(ctx, "legacyStore")
 
 
+def test_tee_dispatch_raise_is_contained_and_counted(ctx, counters, monkeypatch):
+    # dispatch() is designed not to raise, but defend against an UNMODELED raise:
+    # it must still be counted as teeFailed and returned as a clean 500, never leak
+    # a raw exception to Starlette (which would 500 with teeReceived incremented but
+    # teeFailed stuck at zero).
+    import serve.tee as tee
+
+    def _boom(*a, **k):
+        raise RuntimeError("dispatch blew up unexpectedly")
+
+    monkeypatch.setattr(tee, "dispatch", _boom)
+
+    status, body = handleTeeEmit(ctx, counters, _emitBody())   # must not raise
+
+    assert status == 500 and "error" in body
+    assert counters.teeReceived == 1 and counters.teeFailed == 1
+
+
 def test_tee_malformed_payload_400_and_keeps_serving(ctx, counters):
     bad_bodies = [
         b"not json at all",                                   # unparseable
@@ -309,6 +327,7 @@ def test_shadow_recall_logs_one_line_full_schema(ctx, counters, tmp_path, _reran
 
     assert rec["query"] == "acoustic modem range"
     assert isinstance(rec["ts"], str) and rec["ts"]            # a timestamp present
+    assert "project" in rec and rec["project"] is None         # unscoped query -> null
     # Old answer stored WHOLE -- byte-for-byte equal to the input, not truncated.
     assert rec["old"]["resultText"] == oldText
     v3 = rec["v3"]
@@ -364,6 +383,44 @@ def test_shadow_payload_shape_matches_engram_forward(ctx, counters, tmp_path, _r
     assert status == 200 and resp["ok"] is True
     rec = json.loads(logPath.read_text(encoding="utf-8").splitlines()[0])
     assert rec["old"]["resultText"] == "No memories found for query: biofouling"
+
+
+def test_shadow_records_and_scopes_project(ctx, counters, tmp_path, _rerankerWarm):
+    # project makes the A/B apples-to-apples: the shadow recall is scoped to the
+    # same project the old pensive_recall used, and the line records that scope.
+    # Two atoms with the SAME query-matching text in different projects; a
+    # project="aegis" shadow must record "aegis" AND return only aegis atoms.
+    _put(ctx.store, "the shared spreading activation topic appears here", project="aegis")
+    _put(ctx.store, "the shared spreading activation topic appears here", project="pensive")
+    ctx.reindex()
+
+    logPath = tmp_path / "shadow.jsonl"
+    body = json.dumps({
+        "query": "shared spreading activation topic",
+        "oldResultText": "old", "project": "aegis",
+    }).encode("utf-8")
+    status, _ = runShadow(ctx, counters, body, logPath)
+    assert status == 200
+
+    rec = json.loads(logPath.read_text(encoding="utf-8").splitlines()[0])
+    assert rec["project"] == "aegis"                          # scope recorded
+    ids = rec["v3"]["ids"]
+    assert ids                                                # v3 found the aegis atom
+    for aid in ids:                                           # scoped: never the pensive one
+        assert getAtom(ctx.store, aid)["project"] == "aegis"
+
+
+def test_shadow_empty_project_normalizes_to_null(ctx, counters, tmp_path, _rerankerWarm):
+    # The legacy default project="" must mean "whole store" (mirroring the old
+    # server's `if project:`), and the line records null, not "".
+    _put(ctx.store, "an unscoped note about depth")
+    ctx.reindex()
+    logPath = tmp_path / "shadow.jsonl"
+    body = json.dumps({"query": "depth", "oldResultText": "old", "project": ""}).encode()
+    status, _ = runShadow(ctx, counters, body, logPath)
+    assert status == 200
+    rec = json.loads(logPath.read_text(encoding="utf-8").splitlines()[0])
+    assert rec["project"] is None
 
 
 # --------------------------------------------------------------------------- #
@@ -450,6 +507,55 @@ def test_counters_snapshot_reflects_activity(ctx, counters, tmp_path, _rerankerW
     assert snap == {
         "teeReceived": 2, "teeFailed": 1, "shadowLogged": 1, "shadowFailed": 0,
     }
+
+
+def test_http_surface_end_to_end_moves_counters(embedder, _rerankerWarm, tmp_path, monkeypatch):
+    # Drive the REAL Starlette app end to end: routing, request-body parsing, JSON
+    # responses, and the closure-shared Counters that GET /status reports. This is
+    # the in-process HTTP surface the live daemon serves (the live cross-process
+    # end-to-end is the controller's Phase 3 gate).
+    #
+    # Starlette's TestClient runs the ASGI app in a portal thread, so the store's
+    # sqlite connection must tolerate cross-thread use -- open it
+    # check_same_thread=False for THIS test only. The live daemon creates and uses
+    # its store on the single uvicorn event-loop thread, so it never needs this.
+    import sqlite3
+    from starlette.testclient import TestClient
+    from serve.daemon import buildApp
+
+    _real_connect = sqlite3.connect
+    monkeypatch.setattr(
+        sqlite3, "connect",
+        lambda *a, **k: _real_connect(*a, **{**k, "check_same_thread": False}))
+    monkeypatch.setenv("PENSIVE_V3_SHADOW_LOG", str(tmp_path / "shadow.jsonl"))
+
+    s = openStore(tmp_path / "mem.db")
+    try:
+        _put(s, "acoustic modems trade range for data rate at the surface buoy")
+        c = ServeContext(s, embedder, MODEL_ID, agent="heph")
+        app = buildApp(c)
+        with TestClient(app) as client:
+            assert client.get("/status").json()["counters"] == {
+                "teeReceived": 0, "teeFailed": 0, "shadowLogged": 0, "shadowFailed": 0}
+
+            r1 = client.post("/tee/emit", content=_emitBody())
+            assert r1.status_code == 200 and r1.json()["ok"] is True
+
+            r2 = client.post("/shadow/recall",
+                             content=_shadowBody("acoustic modem range", "old answer"))
+            assert r2.status_code == 200 and r2.json()["ok"] is True
+
+            r3 = client.post("/tee/emit", content=b"garbage")     # contained 400
+            assert r3.status_code == 400
+
+            # The closure-shared counters moved, visible on the status surface.
+            assert client.get("/status").json()["counters"] == {
+                "teeReceived": 2, "teeFailed": 1, "shadowLogged": 1, "shadowFailed": 0}
+        # The tee'd emit really landed in the v3 store.
+        assert s._conn.execute(
+            "SELECT COUNT(*) FROM atoms WHERE project = 'pensive'").fetchone()[0] == 1
+    finally:
+        s.close()
 
 
 def test_default_shadow_log_path_honors_env(monkeypatch, tmp_path):
