@@ -308,10 +308,11 @@ dominated by phases 3, 5, and the test suites.
 
 ## 14. Open questions carried into the plan
 
-- Repo: new `~/Projects/pensive-v3` (working name; registry check at
-  scaffold time) vs a v3/ tree in the existing repo. Recommendation:
-  new repo, since the daemon is not the library; the library's
-  extractor and boundary math get vendored or imported.
+- Repo: RESOLVED 2026-07-02. The daemon lives in this repo as a
+  `daemon/` subtree; v3 is the pensive project's next major, not a new
+  project (registry check ran; Gary kept the pensive name; no new
+  project name created). The daemon imports the library's extractor,
+  boundary math, and eval harness directly.
 - Embedding model at launch: bge-small-en-v1.5 (on disk, 384d) is the
   spike default; nomic-embed-text-v1.5 evaluated during phase 3 via
   the re-embed pipeline it forces us to build anyway.
