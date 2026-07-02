@@ -3,11 +3,11 @@
 ``VectorIndex`` is the interface Phase 2 recall searches against. It is kept
 deliberately minimal -- ``build`` then ``search`` -- so that the Task 15
 usearch-HNSW index can drop in behind the same two methods and a size-threshold
-switch can pick between them without either caller or the interface knowing which
-concrete index it holds. Nothing here leaks a flat-scan assumption: ``search``
-takes a query vector and a ``k`` and returns ranked ``(atomId, score)`` pairs;
-how those are found (linear scan vs. approximate graph traversal) is the
-implementation's business.
+switch (:func:`selectIndex`) can pick between them without either caller or the
+interface knowing which concrete index it holds. Nothing here leaks a flat-scan
+assumption: ``search`` takes a query vector and a ``k`` and returns ranked
+``(atomId, score)`` pairs; how those are found (linear scan vs. approximate graph
+traversal) is the implementation's business.
 
 Scores are cosine similarity in ``[-1, 1]``, higher is better. Stored vectors are
 unit-normalized by the embedder, so the flat implementation's cosine reduces to a
@@ -19,7 +19,14 @@ import numpy as np
 
 from recall.embedder import blobToVec
 
-__all__ = ["VectorIndex", "FlatIndex"]
+__all__ = ["VectorIndex", "FlatIndex", "selectIndex", "HNSW_THRESHOLD"]
+
+# Above this many embedded LIVE atoms, the exact flat scan's O(n)-per-query cost
+# stops being free and :func:`selectIndex` switches to the approximate HNSW index.
+# The plan's default; a named constant so a change is loud and tests can pin it.
+# Serving today is far below it (shadow scale), so the switch is a scale path, not
+# a behavior change now.
+HNSW_THRESHOLD = 200_000
 
 
 class VectorIndex(abc.ABC):
@@ -99,3 +106,36 @@ class FlatIndex(VectorIndex):
             part = np.argpartition(-scores, k - 1)[:k]
             order = part[np.argsort(-scores[part], kind="stable")]
         return [(self._atomIds[i], float(scores[i])) for i in order]
+
+
+def _countEmbeddedLive(store, modelId):
+    """Count embedded LIVE atoms for ``modelId`` -- the size the switch keys on.
+
+    Mirrors the build-time filter EXACTLY (``embeddings`` joined to LIVE ``atoms``
+    for this model), so the count equals the number of vectors either index would
+    actually load. A raw ``embeddings`` row count would over-count superseded atoms
+    that are never in the index and could pick HNSW for a store that is small once
+    the dead rows are excluded.
+    """
+    return store._conn.execute(
+        "SELECT COUNT(*) FROM embeddings e "
+        "JOIN atoms a ON a.id = e.atom_id "
+        "WHERE e.model_id = ? AND a.status = 'live'",
+        (modelId,),
+    ).fetchone()[0]
+
+
+def selectIndex(store, modelId):
+    """Build and return the right ``VectorIndex`` for the store's current size.
+
+    Below :data:`HNSW_THRESHOLD` embedded live atoms, an exact ``FlatIndex``; at or
+    above it, the approximate ``HnswIndex``. Returns the index already BUILT, so a
+    caller (daemon startup) swaps one ``FlatIndex().build(...)`` call for this and
+    is otherwise unchanged. ``HnswIndex`` is imported lazily so that importing this
+    module -- and using ``FlatIndex`` at shadow scale -- never requires usearch.
+    """
+    if _countEmbeddedLive(store, modelId) >= HNSW_THRESHOLD:
+        from recall.hnsw_index import HnswIndex
+
+        return HnswIndex().build(store, modelId)
+    return FlatIndex().build(store, modelId)

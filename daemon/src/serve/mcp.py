@@ -43,7 +43,7 @@ from mcp.types import CallToolResult, TextContent, Tool
 
 from recall.engine import recall
 from recall.embedder import embedMissing
-from recall.vector_index import FlatIndex
+from recall.vector_index import FlatIndex, selectIndex
 from recall.payload import assembleTier2
 from store.store import (
     putAtom,
@@ -98,9 +98,12 @@ class ServeContext:
     ``reindex`` embeds any not-yet-embedded live atoms and rebuilds the dense
     index, so an atom written by an emit/correct becomes recallable by BOTH the
     lexical (query-time) and dense (index) signals on the next call. It runs at
-    construction and after every mutating tool. At v3 scale a full ``FlatIndex``
-    rebuild per emit is the known cost the Task 15 HNSW incremental index retires;
-    for the shadow daemon it is correct and cheap enough.
+    construction and after every mutating tool. The concrete index comes from
+    ``selectIndex``, the Task 15 size switch: at shadow scale it returns the exact
+    ``FlatIndex`` (serving behavior unchanged), and only past ``HNSW_THRESHOLD``
+    would it hand back the approximate HNSW index. A full rebuild per emit is the
+    known cost an incremental index would later retire; for the shadow daemon it is
+    correct and cheap enough.
     """
 
     def __init__(self, store, embedder, modelId, agent=None,
@@ -115,9 +118,12 @@ class ServeContext:
         self.reindex()
 
     def reindex(self):
-        """Embed missing live atoms and rebuild the dense index from the store."""
+        """Embed missing live atoms and rebuild the dense index from the store.
+
+        The index type is chosen by ``selectIndex`` from the store's current size,
+        so the daemon rides the flat->HNSW switch automatically as it grows."""
         embedMissing(self.store, self.embedder)
-        self.index = FlatIndex().build(self.store, self.modelId)
+        self.index = selectIndex(self.store, self.modelId)
 
 
 # --------------------------------------------------------------------------- #
