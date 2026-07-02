@@ -18,16 +18,12 @@ from typing import Dict, Iterator, List, Optional
 
 from ..base import SADocument, BaseParser
 from ..chunker import SentenceAwareChunker
-from ..query_gen import QueryGenerator
+from ._defaults import DEFAULT_CHUNKER, DEFAULT_QUERY_GEN
 
 logger = logging.getLogger(__name__)
 
 # Content types that represent internal model reasoning, not user-facing text.
 _SKIP_CONTENT_TYPES = frozenset({'thoughts', 'reasoning_recap'})
-
-# Module-level singletons -- both classes are stateless, no need to re-instantiate per parser.
-_DEFAULT_CHUNKER = SentenceAwareChunker()
-_DEFAULT_QUERY_GEN = QueryGenerator()
 
 
 class ChatGPTParser(BaseParser):
@@ -59,8 +55,8 @@ class ChatGPTParser(BaseParser):
         max_file_size: Optional[int] = None,
     ):
         self.export_dir = export_dir
-        self.chunker = chunker or _DEFAULT_CHUNKER
-        self.query_gen = _DEFAULT_QUERY_GEN
+        self.chunker = chunker or DEFAULT_CHUNKER
+        self.query_gen = DEFAULT_QUERY_GEN
         self.max_file_size = (
             max_file_size if max_file_size is not None
             else self.DEFAULT_MAX_FILE_SIZE
@@ -68,10 +64,6 @@ class ChatGPTParser(BaseParser):
 
     def source_name(self) -> str:
         return 'chatgpt'
-
-    # ------------------------------------------------------------------
-    # Public API
-    # ------------------------------------------------------------------
 
     def parse(self) -> Iterator[SADocument]:
         """Yield SADocuments from every conversation in the export."""
@@ -102,10 +94,6 @@ class ChatGPTParser(BaseParser):
 
         for conv in conversations:
             yield from self._process_conversation(conv)
-
-    # ------------------------------------------------------------------
-    # Conversation processing
-    # ------------------------------------------------------------------
 
     def _process_conversation(self, conv: dict) -> Iterator[SADocument]:
         """Extract the active thread and yield documents for each message."""
@@ -148,10 +136,6 @@ class ChatGPTParser(BaseParser):
                         'msg_index': msg_index,
                     },
                 )
-
-    # ------------------------------------------------------------------
-    # Thread extraction
-    # ------------------------------------------------------------------
 
     def _extract_thread(self, conv: dict) -> List[dict]:
         """Walk the conversation tree to recover the active thread.
@@ -227,7 +211,7 @@ class ChatGPTParser(BaseParser):
 
             author = msg.get('author') or {}
             role = author.get('role', 'unknown')
-            # Skip system messages — they are preamble/instructions, not conversation
+            # Skip system messages: they are preamble/instructions, not conversation.
             if role == 'system':
                 continue
 
@@ -243,10 +227,6 @@ class ChatGPTParser(BaseParser):
             })
 
         return thread
-
-    # ------------------------------------------------------------------
-    # Text extraction
-    # ------------------------------------------------------------------
 
     @staticmethod
     def _extract_text(msg: dict) -> Optional[str]:
@@ -275,17 +255,13 @@ class ChatGPTParser(BaseParser):
         if not isinstance(parts, (list, tuple)):
             return None
 
-        # Filter to string parts only — dicts are images, tool calls, etc.
+        # Keep only string parts; dicts are images, tool calls, etc.
         text_parts = [p for p in parts if isinstance(p, str)]
         if not text_parts:
             return None
 
         text = ' '.join(text_parts).strip()
         return text if text else None
-
-    # ------------------------------------------------------------------
-    # Helpers
-    # ------------------------------------------------------------------
 
     @staticmethod
     def _get_conv_id(conv: dict) -> str:

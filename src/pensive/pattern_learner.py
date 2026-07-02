@@ -251,7 +251,7 @@ def integrate_with_sa(sa, learner: PatternLearner):
     original_add_documents = sa.add_documents
 
     # Mutable single-cell containers (so the inner closures can
-    # mutate them without the `nonlocal` dance — list/dict cells are
+    # mutate them without the `nonlocal` dance; list/dict cells are
     # rebindable through ``[0]`` indexing).
     _cache: Dict[str, object] = {
         'value_labels': [],

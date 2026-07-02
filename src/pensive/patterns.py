@@ -7,7 +7,7 @@ Provides categorized pattern sets for different data domains:
 - INFRA_PATTERNS: Synthetic benchmark patterns (rooms, servers, companies - backward compat)
 
 Usage:
-    from AEGIS.Pensive.spreading_activation.patterns import REAL_DATA_PATTERNS, SYNTHETIC_PATTERNS
+    from pensive.patterns import REAL_DATA_PATTERNS, SYNTHETIC_PATTERNS
 
     # For natural language / real-world data:
     sa = SpreadingActivation(patterns=REAL_DATA_PATTERNS)
@@ -21,9 +21,7 @@ from typing import List, Tuple
 # EntityPattern: (regex, entity_type, case_insensitive)
 EntityPattern = Tuple[str, str, bool]
 
-# ---------------------------------------------------------------------------
 # BASE_PATTERNS - Universal patterns for any data source
-# ---------------------------------------------------------------------------
 BASE_PATTERNS: List[EntityPattern] = [
     # Dates
     (r'\b(\d{4}-\d{2}-\d{2})\b', 'date', True),
@@ -46,9 +44,7 @@ BASE_PATTERNS: List[EntityPattern] = [
     (r'\b(v?\d+\.\d+(?:\.\d+)?(?:-[a-zA-Z0-9.]+)?)\b', 'version', True),
 ]
 
-# ---------------------------------------------------------------------------
 # NL_PATTERNS - Natural language / real-world data patterns
-# ---------------------------------------------------------------------------
 NL_PATTERNS: List[EntityPattern] = [
     # Gary's projects
     (r'\b(aegis|pensive|kairos|panoptes|lenora|hermes|kesagake|mud[\s-]?puppy|flywheel)\b', 'project', True),
@@ -92,11 +88,9 @@ NL_PATTERNS: List[EntityPattern] = [
     # negative lookahead for common non-name bigrams).
 ]
 
-# ---------------------------------------------------------------------------
 # GENERAL_PATTERNS - Domain-agnostic entity patterns
 # Works on any English text without hardcoded vocabularies.
 # Designed to supplement NL_PATTERNS or INFRA_PATTERNS.
-# ---------------------------------------------------------------------------
 GENERAL_PATTERNS: List[EntityPattern] = [
     # Locations: "City Office/HQ/Center/Lab/Hub" - match BEFORE person to avoid overlap
     (r'\b([A-Z][a-z]+(?:\s+[A-Z][a-z]+)?\s+(?:Office|HQ|Center|Lab|Hub|Campus|Annex|R&D))\b', 'location', False),
@@ -116,10 +110,8 @@ GENERAL_PATTERNS: List[EntityPattern] = [
     (r'\(([A-Z][A-Za-z\s]+?(?:Engineering|Operations|Analytics|Services|Resources|Security|Marketing|Finance|Sales|Legal|QA|DevOps|SRE))\)', 'department', False),
 ]
 
-# ---------------------------------------------------------------------------
 # INFRA_PATTERNS - Synthetic benchmark / infrastructure patterns
 # (backward compatible with original PATTERNS from optimized_spread.py)
-# ---------------------------------------------------------------------------
 INFRA_PATTERNS: List[EntityPattern] = [
     # Room codes
     (r'\b([A-Z]-\d{2,4})\b', 'room', False),
@@ -185,9 +177,7 @@ def build_pattern_set(*pattern_lists: List[EntityPattern]) -> List[EntityPattern
     return merged
 
 
-# ---------------------------------------------------------------------------
 # Convenience pattern sets
-# ---------------------------------------------------------------------------
 
 # For natural language sources (real conversations, notes, docs)
 REAL_DATA_PATTERNS: List[EntityPattern] = build_pattern_set(BASE_PATTERNS, NL_PATTERNS, GENERAL_PATTERNS)

@@ -897,7 +897,6 @@ class SpreadingActivation:
 
     def _build_parallel_locked(self, documents, workers, mp):
         """Internal: caller holds self._build_lock."""
-        # Reset
         self._reset_graph_state()
 
         # Scale workers to doc count to avoid fork overhead dominating

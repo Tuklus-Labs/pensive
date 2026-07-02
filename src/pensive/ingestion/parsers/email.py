@@ -14,13 +14,9 @@ from hashlib import sha256
 
 from ..base import SADocument, BaseParser
 from ..chunker import SentenceAwareChunker
-from ..query_gen import QueryGenerator
+from ._defaults import DEFAULT_CHUNKER, DEFAULT_QUERY_GEN
 
 logger = logging.getLogger(__name__)
-
-# Module-level singletons -- both classes are stateless, no need to re-instantiate per parser.
-_DEFAULT_CHUNKER = SentenceAwareChunker()
-_DEFAULT_QUERY_GEN = QueryGenerator()
 
 
 class EmailJSONLParser(BaseParser):
@@ -34,8 +30,8 @@ class EmailJSONLParser(BaseParser):
             chunker: Optional chunker instance. Defaults to SentenceAwareChunker().
         """
         self.path = Path(jsonl_path)
-        self.chunker = chunker or _DEFAULT_CHUNKER
-        self.query_gen = _DEFAULT_QUERY_GEN
+        self.chunker = chunker or DEFAULT_CHUNKER
+        self.query_gen = DEFAULT_QUERY_GEN
 
     def source_name(self) -> str:
         return 'email'

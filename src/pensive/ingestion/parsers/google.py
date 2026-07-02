@@ -13,12 +13,9 @@ from pathlib import Path
 from typing import Iterator
 
 from ..base import SADocument, BaseParser
-from ..query_gen import QueryGenerator
+from ._defaults import DEFAULT_QUERY_GEN
 
 logger = logging.getLogger(__name__)
-
-# Module-level singleton -- QueryGenerator is stateless.
-_DEFAULT_QUERY_GEN = QueryGenerator()
 
 
 class GoogleCalendarParser(BaseParser):
@@ -31,7 +28,7 @@ class GoogleCalendarParser(BaseParser):
     def __init__(self, takeout_dir: str):
         self.takeout_dir = Path(takeout_dir)
         self.calendar_dir = self.takeout_dir / 'Calendar'
-        self.query_gen = _DEFAULT_QUERY_GEN
+        self.query_gen = DEFAULT_QUERY_GEN
 
     def source_name(self) -> str:
         return 'google_calendar'
@@ -201,7 +198,7 @@ class YouTubeCommentsParser(BaseParser):
     def __init__(self, takeout_dir: str):
         self.takeout_dir = Path(takeout_dir)
         self.comments_dir = self.takeout_dir / 'YouTube and YouTube Music' / 'comments'
-        self.query_gen = _DEFAULT_QUERY_GEN
+        self.query_gen = DEFAULT_QUERY_GEN
 
     def source_name(self) -> str:
         return 'youtube_comments'
