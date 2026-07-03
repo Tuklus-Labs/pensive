@@ -40,6 +40,7 @@ if str(_SRC) not in sys.path:
 from serve.mcp import ServeContext, buildServer, SERVER_NAME  # noqa: E402
 from serve.tee import Counters, handleTeeEmit  # noqa: E402
 from serve.shadow import runShadow, defaultShadowLogPath  # noqa: E402
+from serve import viz  # noqa: E402
 from ambient.briefer import brief, DEFAULT_BUDGET  # noqa: E402
 from store.store import openStore  # noqa: E402
 from recall.embedder import Embedder  # noqa: E402
@@ -159,16 +160,22 @@ def buildApp(ctx):
         async with manager.run():
             yield
 
-    return Starlette(
+    app = Starlette(
         routes=[
             Route("/tee/emit", tee_emit, methods=["POST"]),
             Route("/shadow/recall", shadow_recall, methods=["POST"]),
             Route("/status", status, methods=["GET"]),
             Route("/brief", brief_endpoint, methods=["GET"]),
+            Route("/viz", viz.staticPage, methods=["GET"]),
+            Route("/viz/events", viz.eventsEndpoint, methods=["GET"]),
+            Route("/viz/graph", viz.graphEndpoint, methods=["GET"]),
+            Route("/viz/history", viz.historyEndpoint, methods=["GET"]),
             Mount("/mcp", app=handle_mcp),
         ],
         lifespan=lifespan,
     )
+    app.state.ctx = ctx
+    return app
 
 
 def main():

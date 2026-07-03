@@ -45,6 +45,7 @@ from recall.engine import recall
 from recall.embedder import embedMissing
 from recall.vector_index import FlatIndex, selectIndex
 from recall.payload import assembleTier2
+from serve import viz
 from store.store import (
     putAtom,
     getAtom,
@@ -206,7 +207,9 @@ def _returnedAtomIds(out):
 
 def _logReturnedRecall(ctx, out, query, sourceRef):
     try:
-        logRecall(ctx.store, _returnedAtomIds(out), query=query, sourceRef=sourceRef)
+        atomIds = _returnedAtomIds(out)
+        logRecall(ctx.store, atomIds, query=query, sourceRef=sourceRef)
+        viz.emitRecallEvent(ctx, query, atomIds, sourceRef)
     except Exception:  # noqa: BLE001 -- recall serving wins over telemetry
         ctx.recallLogErrors += 1
 
