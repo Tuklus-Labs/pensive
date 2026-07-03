@@ -71,7 +71,12 @@ Loudness audit: every assertion below includes a rule-naming failure message.
 
 from store.store import addEdge, openStore, putAtom
 
-from eval.assoc_experiment import assocSignal, compareMetrics
+from eval.assoc_experiment import (
+    assocSignal,
+    compareMetrics,
+    gateWithAssoc,
+    _experimentReport,
+)
 
 
 def _put(store, text):
@@ -244,3 +249,191 @@ def test_compare_metrics_reports_deltas_and_subset():
         "temporal-neighborhood subset violated: metadata kind should isolate "
         f"the first query and improve MRR by 0.5, report={report}"
     )
+
+
+def test_experiment_report_uses_captured_temporal_subset_rankings():
+    # risk: temporal-subset-real-rankings
+    queries = [
+        {"query": "temporal one", "relevant": {"a"}, "own": set(), "metadata": {"kind": "temporal-neighborhood"}},
+        {"query": "ordinary two", "relevant": {"b"}, "own": set(), "metadata": {"kind": "ordinary"}},
+    ]
+    baseline = {"r_at_1": 0.5, "r_at_5": 1.0, "r_at_10": 1.0, "r_at_20": 1.0, "mrr_at_10": 0.75, "n": 2}
+    assoc = {"r_at_1": 1.0, "r_at_5": 1.0, "r_at_10": 1.0, "r_at_20": 1.0, "mrr_at_10": 1.0, "n": 2}
+    bm25 = {"r_at_1": 0.0, "r_at_5": 0.0, "r_at_10": 0.0, "r_at_20": 0.0, "mrr_at_10": 0.0, "n": 2}
+    baseline_rankings = [["x", "a"], ["b"]]
+    assoc_rankings = [["a"], ["b"]]
+
+    report = _experimentReport(
+        2, {"ingested": 2}, baseline, assoc, bm25, queries,
+        baseline_rankings, assoc_rankings,
+    )
+
+    assert report["temporal_neighborhood"]["baseline"]["mrr_at_10"] == 0.5, (
+        "temporal-subset-real-rankings violated: subset baseline must come "
+        f"from captured rankings, report={report}"
+    )
+    assert report["temporal_neighborhood"]["delta"]["mrr_at_10"] == 0.5, (
+        "temporal-subset-real-rankings violated: subset delta must be "
+        f"hand-computed from real rankings, report={report}"
+    )
+
+
+def test_experiment_report_marks_unannotated_temporal_subset_unavailable():
+    # risk: temporal-subset-unavailable
+    queries = [
+        {"query": "ordinary one", "relevant": {"a"}, "own": set()},
+    ]
+    metrics = {"r_at_1": 1.0, "r_at_5": 1.0, "r_at_10": 1.0, "r_at_20": 1.0, "mrr_at_10": 1.0, "n": 1}
+
+    report = _experimentReport(
+        1, {"ingested": 1}, metrics, metrics, metrics, queries, [["a"]], [["a"]]
+    )
+
+    subset = report["temporal_neighborhood"]
+    assert subset["status"] == "UNAVAILABLE", (
+        "temporal-subset-unavailable violated: unannotated runs must not "
+        f"fabricate zero metrics, subset={subset}"
+    )
+    assert subset["baseline"] is None and subset["assoc"] is None and subset["delta"] is None, (
+        "temporal-subset-unavailable violated: unavailable subset must use "
+        f"None metric fields instead of zeros, subset={subset}"
+    )
+
+
+def test_assoc_signal_never_emits_dead_neighbors(tmp_path):
+    # risk: live-only-emit
+    store = _open(tmp_path)
+    try:
+        seed = _put(store, "seed")
+        through = _put(store, "through")
+        dead_candidate = _put(store, "dead candidate")
+        store._conn.execute("UPDATE atoms SET status = 'tombstone' WHERE id = ?", (dead_candidate,))
+        store._conn.commit()
+        addEdge(store, {"src": seed, "dst": through, "type": "facet"})
+        addEdge(store, {"src": through, "dst": dead_candidate, "type": "facet"})
+
+        ranked = assocSignal(store, [seed], k=10)
+
+        assert dead_candidate not in [atom_id for atom_id, _score in ranked], (
+            "live-only-emit violated: tombstoned candidate surfaced in assoc "
+            f"results, ranked={ranked}, dead_candidate={dead_candidate}"
+        )
+    finally:
+        store.close()
+
+
+def test_assoc_signal_dead_through_node_still_conducts_live_neighbors(tmp_path):
+    # risk: conduct-but-not-emit
+    store = _open(tmp_path)
+    try:
+        seed = _put(store, "seed")
+        through = _put(store, "dead through")
+        live_candidate = _put(store, "live candidate")
+        store._conn.execute("UPDATE atoms SET status = 'superseded' WHERE id = ?", (through,))
+        store._conn.commit()
+        addEdge(store, {"src": seed, "dst": through, "type": "facet"})
+        addEdge(store, {"src": through, "dst": live_candidate, "type": "facet"})
+
+        ranked = assocSignal(store, [seed], k=10)
+
+        assert ranked == [(live_candidate, 0.5)], (
+            "conduct-but-not-emit violated: dead through-node should conduct "
+            f"to live second-hop candidate without being emitted, ranked={ranked}"
+        )
+    finally:
+        store.close()
+
+
+def test_assoc_signal_mirrored_edges_contribute_once_with_max_weight(tmp_path):
+    # risk: logical-edge-dedupe
+    store = _open(tmp_path)
+    try:
+        seed = _put(store, "seed")
+        through = _put(store, "through")
+        candidate = _put(store, "candidate")
+        addEdge(store, {"src": seed, "dst": through, "type": "facet", "weight": 0.25})
+        addEdge(store, {"src": through, "dst": seed, "type": "facet", "weight": 0.75})
+        addEdge(store, {"src": through, "dst": candidate, "type": "facet", "weight": 1.0})
+
+        ranked = assocSignal(store, [seed], k=10)
+
+        assert ranked == [(candidate, 0.375)], (
+            "logical-edge-dedupe violated: mirrored seed-through rows should "
+            f"contribute once at max weight 0.75 over degree 2, ranked={ranked}"
+        )
+    finally:
+        store.close()
+
+
+def test_assoc_signal_distinct_edge_types_between_same_nodes_count_separately(tmp_path):
+    # risk: logical-edge-type-separation
+    store = _open(tmp_path)
+    try:
+        seed = _put(store, "seed")
+        through = _put(store, "through")
+        candidate = _put(store, "candidate")
+        addEdge(store, {"src": seed, "dst": through, "type": "facet", "weight": 1.0})
+        addEdge(store, {"src": seed, "dst": through, "type": "causes", "weight": 1.0})
+        addEdge(store, {"src": through, "dst": candidate, "type": "facet", "weight": 1.0})
+
+        ranked = assocSignal(store, [seed], k=10)
+
+        assert ranked == [(candidate, 1.0)], (
+            "logical-edge-type-separation violated: two genuine edge types "
+            f"between the same endpoints should both contribute, ranked={ranked}"
+        )
+    finally:
+        store.close()
+
+
+def test_gate_with_assoc_passes_when_without_arm_matches_gate_baseline(monkeypatch):
+    # risk: arm-parity-correct-clone
+    baseline = {"r_at_1": 1.0, "r_at_5": 1.0, "r_at_10": 1.0, "r_at_20": 1.0, "mrr_at_10": 1.0, "n": 1, "low_confidence_rate": 0.0}
+    assoc = {"r_at_1": 0.0, "r_at_5": 0.0, "r_at_10": 0.0, "r_at_20": 0.0, "mrr_at_10": 0.0, "n": 1, "low_confidence_rate": 0.0}
+
+    monkeypatch.setattr("eval.assoc_experiment.gate_mod.gate", lambda store, index, embedder, queries: baseline)
+    monkeypatch.setattr(
+        "eval.assoc_experiment._baselineWithRankings",
+        lambda store, index, embedder, queries, recallK=None: (baseline, [["a"]]),
+    )
+    monkeypatch.setattr(
+        "eval.assoc_experiment._assocWithRankings",
+        lambda store, index, embedder, queries, recallK=None: (assoc, [["b"]]),
+    )
+
+    result = gateWithAssoc(object(), object(), object(), [{"query": "q", "relevant": {"a"}, "own": set()}])
+
+    assert result == (assoc, [["b"]]), (
+        "arm-parity-correct-clone violated: matching without-arm clone should "
+        f"allow assoc run through, result={result}"
+    )
+
+
+def test_gate_with_assoc_raises_when_without_arm_diverges_from_gate_baseline(monkeypatch):
+    # risk: arm-parity-divergent-clone
+    baseline = {"r_at_1": 1.0, "r_at_5": 1.0, "r_at_10": 1.0, "r_at_20": 1.0, "mrr_at_10": 1.0, "n": 1, "low_confidence_rate": 0.0}
+    divergent = dict(baseline, r_at_1=0.0)
+    assoc = dict(baseline)
+
+    monkeypatch.setattr("eval.assoc_experiment.gate_mod.gate", lambda store, index, embedder, queries: baseline)
+    monkeypatch.setattr(
+        "eval.assoc_experiment._baselineWithRankings",
+        lambda store, index, embedder, queries, recallK=None: (divergent, [["x"]]),
+    )
+    monkeypatch.setattr(
+        "eval.assoc_experiment._assocWithRankings",
+        lambda store, index, embedder, queries, recallK=None: (assoc, [["a"]]),
+    )
+
+    try:
+        gateWithAssoc(object(), object(), object(), [{"query": "q", "relevant": {"a"}, "own": set()}])
+    except RuntimeError as exc:
+        assert "gate.py baseline" in str(exc) and "experiment clone" in str(exc), (
+            "arm-parity-divergent-clone violated: mismatch error must name "
+            f"both metric sets, error={exc}"
+        )
+    else:
+        raise AssertionError(
+            "arm-parity-divergent-clone violated: gateWithAssoc must abort "
+            "when the without-arm clone diverges from gate.py baseline"
+        )

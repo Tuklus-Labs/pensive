@@ -34,6 +34,15 @@ MODEL_ID = gate_mod.MODEL_ID
 ASSOC_SEED_K = 20
 ASSOC_SIGNAL_K = 200
 SPEC_POWER = 1.0
+_PARITY_KEYS = (
+    "r_at_1",
+    "r_at_5",
+    "r_at_10",
+    "r_at_20",
+    "mrr_at_10",
+    "n",
+    "low_confidence_rate",
+)
 
 
 def assocSignal(store, seedAtomIds, k):
@@ -52,6 +61,13 @@ def assocSignal(store, seedAtomIds, k):
     must pay for every extra neighbor. The walk is deterministic: no sampling,
     score-descending order, atom-id tie-break, and seeds/through nodes excluded
     from the returned candidates.
+
+    Edges use logical undirected semantics for this eval walk. Mirrored physical
+    rows between the same endpoints and type are one logical edge at max weight;
+    genuinely different types between the same endpoints remain separate
+    contributions. Dead atoms conduct but never emit: walking through a
+    tombstoned/superseded node preserves neighborhood structure, while returning
+    it as a candidate would violate live-only recall.
     """
     if k <= 0:
         return []
@@ -62,16 +78,21 @@ def assocSignal(store, seedAtomIds, k):
 
     scores = defaultdict(float)
     for seed in seeds:
-        for through, firstWeight in _neighbors(store, seed):
+        for through, firstWeight, _firstType, _throughLive in _neighbors(store, seed):
             if through in seedSet:
                 continue
             throughNeighbors = _neighbors(store, through)
-            degree = len({neighbor for neighbor, _weight in throughNeighbors})
+            degree = len({
+                neighbor for neighbor, _weight, _edgeType, _neighborLive
+                in throughNeighbors
+            })
             if degree == 0:
                 continue
             damping = degree ** SPEC_POWER
-            for candidate, secondWeight in throughNeighbors:
+            for candidate, secondWeight, _secondType, candidateLive in throughNeighbors:
                 if candidate in seedSet or candidate == through:
+                    continue
+                if not candidateLive:
                     continue
                 contribution = (firstWeight * secondWeight) / damping
                 scores[candidate] += contribution
@@ -112,22 +133,41 @@ def compareMetrics(queries, baselineRankings, assocRankings):
         }
     else:
         report["temporal_neighborhood"] = {
+            "status": "UNAVAILABLE",
             "assumption": (
-                "not reported: gate query records expose no metadata marking "
+                "unavailable: gate query records expose no metadata marking "
                 "what-else-was-in-flight temporal-neighborhood queries"
             ),
-            "n": 0,
+            "baseline": None,
+            "assoc": None,
+            "delta": None,
         }
     return report
 
 
-def gateWithAssoc(store, index, embedder, queries, recallK=gate_mod._RECALL_K):
-    """Run gate.py's scoring loop with the eval-only association recall."""
-    return _gateWithRecall(
-        store, queries,
-        lambda query, k: _recallWithAssoc(store, index, embedder, query, k=k),
-        recallK,
+def gateWithAssoc(
+    store,
+    index,
+    embedder,
+    queries,
+    recallK=gate_mod._RECALL_K,
+    gateBaseline=None,
+    returnBaselineRankings=False,
+):
+    """Run the assoc arm after proving the cloned no-assoc gate is in parity."""
+    baseline = gateBaseline
+    if baseline is None:
+        baseline = gate_mod.gate(store, index, embedder, queries)
+    baselineClone, baselineRankings = _baselineWithRankings(
+        store, index, embedder, queries, recallK
     )
+    _assertGateParity(baseline, baselineClone)
+    assoc, assocRankings = _assocWithRankings(
+        store, index, embedder, queries, recallK
+    )
+    if returnBaselineRankings:
+        return assoc, baselineRankings, assocRankings
+    return assoc, assocRankings
 
 
 def runChat(exportDir, dbPath, nQueries, embedder, log):
@@ -138,9 +178,16 @@ def runChat(exportDir, dbPath, nQueries, embedder, log):
     store, index, stats = _prepareStore(dbPath, records, embedder, log)
     try:
         baseline = gate_mod.gate(store, index, embedder, queries)
-        assoc = gateWithAssoc(store, index, embedder, queries)
+        assoc, baselineRankings, assocRankings = gateWithAssoc(
+            store, index, embedder, queries,
+            gateBaseline=baseline,
+            returnBaselineRankings=True,
+        )
         bm25 = gate_mod.bm25Baseline(corpusRefs, corpusTexts, queries)
-        return _experimentReport(len(records), stats, baseline, assoc, bm25, queries)
+        return _experimentReport(
+            len(records), stats, baseline, assoc, bm25, queries,
+            baselineRankings, assocRankings,
+        )
     finally:
         store.close()
 
@@ -158,9 +205,16 @@ def runAtoms(exportPath, dbPath, clusterKey, nQueries, embedder, log,
     store, index, stats = _prepareStore(dbPath, records, embedder, log)
     try:
         baseline = gate_mod.gate(store, index, embedder, queries)
-        assoc = gateWithAssoc(store, index, embedder, queries)
+        assoc, baselineRankings, assocRankings = gateWithAssoc(
+            store, index, embedder, queries,
+            gateBaseline=baseline,
+            returnBaselineRankings=True,
+        )
         bm25 = gate_mod.bm25Baseline(corpusRefs, corpusTexts, queries)
-        report = _experimentReport(len(records), stats, baseline, assoc, bm25, queries)
+        report = _experimentReport(
+            len(records), stats, baseline, assoc, bm25, queries,
+            baselineRankings, assocRankings,
+        )
         report["cluster_key"] = clusterKey
         report["eligible_queries"] = eligible
         return report
@@ -210,19 +264,45 @@ def main():
 
 
 def _neighbors(store, atomId):
-    seen = set()
-    out = []
+    byLogicalEdge = {}
     for edge in edgesFrom(store, atomId):
-        key = (edge["id"], edge["dstAtom"])
-        if key not in seen:
-            seen.add(key)
-            out.append((edge["dstAtom"], edge["weight"]))
+        neighbor = edge["dstAtom"]
+        key = _logicalEdgeKey(atomId, neighbor, edge["type"])
+        current = byLogicalEdge.get(key)
+        weight = edge["weight"] if current is None else max(current[1], edge["weight"])
+        byLogicalEdge[key] = (neighbor, weight, edge["type"])
     for edge in edgesTo(store, atomId):
-        key = (edge["id"], edge["srcAtom"])
-        if key not in seen:
-            seen.add(key)
-            out.append((edge["srcAtom"], edge["weight"]))
-    return out
+        neighbor = edge["srcAtom"]
+        key = _logicalEdgeKey(atomId, neighbor, edge["type"])
+        current = byLogicalEdge.get(key)
+        weight = edge["weight"] if current is None else max(current[1], edge["weight"])
+        byLogicalEdge[key] = (neighbor, weight, edge["type"])
+
+    statuses = _atomStatuses(
+        store,
+        [neighbor for neighbor, _weight, _type in byLogicalEdge.values()],
+    )
+    out = []
+    for neighbor, weight, edgeType in byLogicalEdge.values():
+        out.append((neighbor, weight, edgeType, statuses.get(neighbor) == "live"))
+    return sorted(out, key=lambda item: (item[0], item[2]))
+
+
+def _logicalEdgeKey(atomId, neighbor, edgeType):
+    left, right = sorted((atomId, neighbor))
+    return left, right, edgeType
+
+
+def _atomStatuses(store, atomIds):
+    ids = sorted(set(atomIds))
+    if not ids:
+        return {}
+    placeholders = ",".join("?" for _id in ids)
+    rows = store._conn.execute(
+        f"SELECT id, status FROM atoms WHERE id IN ({placeholders})",
+        ids,
+    ).fetchall()
+    return {row[0]: row[1] for row in rows}
 
 
 def _metricsForRankings(queries, rankings):
@@ -257,9 +337,47 @@ def _isTemporalNeighborhoodQuery(query):
     )
 
 
-def _gateWithRecall(store, queries, recallFn, recallK):
+def _baselineWithRankings(store, index, embedder, queries,
+                          recallK=gate_mod._RECALL_K):
+    return _gateWithRecall(
+        store, queries,
+        lambda query, k: gate_mod.recall(store, index, embedder, query, k=k),
+        recallK,
+        captureRankings=True,
+    )
+
+
+def _assocWithRankings(store, index, embedder, queries,
+                       recallK=gate_mod._RECALL_K):
+    return _gateWithRecall(
+        store, queries,
+        lambda query, k: _recallWithAssoc(store, index, embedder, query, k=k),
+        recallK,
+        captureRankings=True,
+    )
+
+
+def _assertGateParity(gateBaseline, experimentClone):
+    baseline = _parityMetrics(gateBaseline)
+    clone = _parityMetrics(experimentClone)
+    if baseline != clone:
+        raise RuntimeError(
+            "arm parity guard failed: gate.py baseline metrics "
+            f"{baseline} != experiment clone metrics {clone}; aborting "
+            "without emitting an assoc experiment report"
+        )
+
+
+def _parityMetrics(metrics):
+    # Latency percentiles are timing observations, not deterministic scoring
+    # semantics; the parity guard compares the gate-quality metric contract.
+    return {key: metrics.get(key) for key in _PARITY_KEYS if key in metrics}
+
+
+def _gateWithRecall(store, queries, recallFn, recallK, captureRankings=False):
     refOf = gate_mod._atomToSourceRef(store)
     hits = []
+    rankings = []
     latencies = []
     lowConf = 0
     for q in queries:
@@ -276,10 +394,13 @@ def _gateWithRecall(store, queries, recallFn, recallK):
             ranked.append(ref)
             if len(ranked) >= gate_mod._SCORE_DEPTH:
                 break
+        rankings.append(ranked)
         hits.append(gate_mod._rankOfFirstRelevant(ranked, q["relevant"]))
     out = gate_mod._metricsFromHits(hits)
     out.update(gate_mod._percentiles(latencies))
     out["low_confidence_rate"] = lowConf / (len(queries) or 1)
+    if captureRankings:
+        return out, rankings
     return out
 
 
@@ -366,14 +487,23 @@ def _prepareStore(dbPath, records, embedder, log):
     return store, index, stats
 
 
-def _experimentReport(corpusDocs, stats, baseline, assoc, bm25, queries):
+def _experimentReport(
+    corpusDocs,
+    stats,
+    baseline,
+    assoc,
+    bm25,
+    queries,
+    baselineRankings,
+    assocRankings,
+):
     comparison = {
         "baseline": baseline,
         "assoc": assoc,
         "delta": _delta(assoc, baseline),
     }
     comparison["temporal_neighborhood"] = compareMetrics(
-        queries, [[] for _ in queries], [[] for _ in queries]
+        queries, baselineRankings, assocRankings
     )["temporal_neighborhood"]
     return {
         "corpus_docs": corpusDocs,
@@ -382,6 +512,11 @@ def _experimentReport(corpusDocs, stats, baseline, assoc, bm25, queries):
         "v3_baseline": baseline,
         "v3_plus_assoc": assoc,
         "delta": comparison["delta"],
+        "assoc_seed_k": ASSOC_SEED_K,
+        "assoc_damping_formula": (
+            "weight(s,t) * weight(t,c) / degree(t)^SPEC_POWER; "
+            f"SPEC_POWER={SPEC_POWER}; degree=count(unique incident neighbors)"
+        ),
         "temporal_neighborhood": comparison["temporal_neighborhood"],
     }
 
