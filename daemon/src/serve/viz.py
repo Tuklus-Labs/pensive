@@ -13,6 +13,7 @@ NEIGHBOR_CAP = 40
 HISTORY_LIMIT_CAP = 200
 EVENT_RING_MAX = 256
 SSE_SEND_TIMEOUT = 0.25
+SSE_PING_INTERVAL = 15
 _STATIC_PATH = Path(__file__).resolve().parent / "static" / "viz.html"
 _STATIC_HTML = None
 
@@ -69,13 +70,19 @@ def _liveAtomRows(ctx, atomIds):
 
 
 def _facetNeighborRows(ctx, key, value):
+    degree = ctx.store._conn.execute(
+        "SELECT COUNT(*) FROM facets WHERE key = ? AND value = ?",
+        (key, value),
+    ).fetchone()[0]
+    if degree <= 1 or degree > HUB_CAP:
+        return [], degree
     return ctx.store._conn.execute(
         "SELECT a.id, a.kind, a.text, a.importance, a.status "
         "FROM facets f JOIN atoms a ON a.id = f.atom_id "
         "WHERE f.key = ? AND f.value = ? AND a.status = 'live' "
-        "ORDER BY a.id",
-        (key, value),
-    ).fetchall()
+        "ORDER BY a.id LIMIT ?",
+        (key, value, HUB_CAP),
+    ).fetchall(), degree
 
 
 def buildGraphPayload(ctx, atomIds):
@@ -98,9 +105,8 @@ def buildGraphPayload(ctx, atomIds):
             (seedId,),
         ).fetchall()
         for key, value in facets:
-            rows = _facetNeighborRows(ctx, key, value)
-            degree = len(rows)
-            if degree <= 1 or degree > HUB_CAP:
+            rows, degree = _facetNeighborRows(ctx, key, value)
+            if not rows:
                 continue
             weight = 1.0 / degree
             for neighbor in rows:
@@ -201,9 +207,15 @@ def _sseFrame(payload):
     return f"data: {data}\n\n".encode("utf-8")
 
 
-async def sendSsePayload(send, payload, timeout=SSE_SEND_TIMEOUT):
+async def sendSsePayload(send, payload, timeout=None):
+    if timeout is None:
+        timeout = SSE_SEND_TIMEOUT
     try:
-        await asyncio.wait_for(send(_sseFrame(payload)), timeout=timeout)
+        await asyncio.wait_for(send({
+            "type": "http.response.body",
+            "body": payload,
+            "more_body": True,
+        }), timeout=timeout)
         return True
     except (asyncio.TimeoutError, OSError, RuntimeError):
         return False
@@ -227,26 +239,19 @@ class VizEventResponse(Response):
         lastSeq = self.ctx.vizSeq
         lastPing = time.monotonic()
 
-        async def send_payload(payload):
-            await send({
-                "type": "http.response.body",
-                "body": _sseFrame(payload),
-                "more_body": True,
-            })
-
         while True:
             if await self._disconnected(receive):
                 break
             events = [event for event in list(self.ctx.vizEvents) if event["seq"] > lastSeq]
             if events:
                 for event in events:
-                    ok = await sendSsePayload(send_payload, event)
+                    ok = await sendSsePayload(send, _sseFrame(event))
                     if not ok:
                         return
                     lastSeq = event["seq"]
                 lastPing = time.monotonic()
-            elif time.monotonic() - lastPing > 15:
-                ok = await sendSsePayload(send_payload, {"type": "ping", "ts": time.time()})
+            elif time.monotonic() - lastPing > SSE_PING_INTERVAL:
+                ok = await sendSsePayload(send, b": ping\n\n")
                 if not ok:
                     return
                 lastPing = time.monotonic()

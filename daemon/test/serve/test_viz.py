@@ -86,6 +86,65 @@ def _request(ctx, params=None):
     )
 
 
+def _http_scope(path, query_string=b""):
+    return {
+        "type": "http",
+        "asgi": {"version": "3.0"},
+        "http_version": "1.1",
+        "method": "GET",
+        "scheme": "http",
+        "path": path,
+        "raw_path": path.encode("ascii"),
+        "query_string": query_string,
+        "headers": [],
+        "client": ("127.0.0.1", 50123),
+        "server": ("127.0.0.1", 5999),
+    }
+
+
+async def _asgi_messages(app, path, query_string=b""):
+    messages = []
+
+    async def receive():
+        return {"type": "http.request", "body": b"", "more_body": False}
+
+    async def send(message):
+        messages.append(message)
+
+    await app(_http_scope(path, query_string), receive, send)
+    return messages
+
+
+def _body(messages):
+    return b"".join(
+        message.get("body", b"")
+        for message in messages
+        if message["type"] == "http.response.body"
+    )
+
+
+def _headers(message):
+    return {key.lower(): value for key, value in message["headers"]}
+
+
+async def _stream_response_until_body(response, after_start=None):
+    messages = []
+
+    async def receive():
+        await asyncio.sleep(3600)
+        return {"type": "http.request", "body": b"", "more_body": False}
+
+    async def send(message):
+        messages.append(message)
+        if message["type"] == "http.response.start" and after_start:
+            after_start()
+        if message["type"] == "http.response.body" and message.get("body"):
+            raise RuntimeError("client closed after first body")
+
+    await response(_http_scope("/viz/events"), receive, send)
+    return messages
+
+
 def test_event_ring_is_bounded_and_evicts_oldest(ctx):
     viz.ensureVizState(ctx, maxlen=2)
 
@@ -179,10 +238,39 @@ def test_graph_derives_live_facet_neighbors_with_caps_and_weights(ctx):
     assert {edge["facet"]["key"] for edge in graph["edges"]} == {"entity", "tag"}, (
         f"facet filter invariant violated: edges={graph['edges']}"
     )
+    assert all(edge["facet"]["value"] != "hub" for edge in graph["edges"]), (
+        f"hub facet invariant violated: edges={graph['edges']}"
+    )
     rare_edge = next(edge for edge in graph["edges"] if edge["to"] == rare_neighbor)
     assert rare_edge["weight"] == pytest.approx(0.5), (
         f"specificity weight invariant violated: edge={rare_edge}"
     )
+
+
+def test_graph_skips_hub_facet_before_row_fetch(ctx):
+    root = _put(ctx.store, "root")
+    addFacet(ctx.store, root, "entity", "hub")
+    for i in range(viz.HUB_CAP + 1):
+        hub_id = _put(ctx.store, f"hub {i}")
+        addFacet(ctx.store, hub_id, "entity", "hub")
+    row_fetches = []
+
+    def trace(statement):
+        if (
+            "FROM facets f JOIN atoms a ON a.id = f.atom_id" in statement
+            and "f.value = 'hub'" in statement
+        ):
+            row_fetches.append(statement)
+
+    ctx.store._conn.set_trace_callback(trace)
+    try:
+        graph = viz.buildGraphPayload(ctx, [root])
+    finally:
+        ctx.store._conn.set_trace_callback(None)
+
+    assert row_fetches == [], f"hub row fetch invariant violated: {row_fetches}"
+    assert graph["nodes"] == [next(node for node in graph["nodes"] if node["id"] == root)]
+    assert graph["edges"] == [], f"hub neighbor invariant violated: edges={graph['edges']}"
 
 
 def test_graph_caps_input_atoms(ctx):
@@ -248,10 +336,122 @@ def test_daemon_wires_viz_routes_and_static_page(ctx):
     assert json.loads(graph.body)["nodes"] == []
 
 
-def test_sse_sender_drops_slow_client():
-    async def slow_send(_payload):
-        await asyncio.sleep(0.05)
+def test_app_dispatches_viz_routes_without_testclient(ctx):
+    served = _put(ctx.store, "served")
+    _recall_log(ctx.store, [served], "served query")
+    app = buildApp(ctx)
 
-    result = asyncio.run(viz.sendSsePayload(slow_send, {"type": "ping"}, timeout=0.001))
+    page = asyncio.run(_asgi_messages(app, "/viz"))
+    malformed = asyncio.run(_asgi_messages(app, "/viz/graph", b"atoms=,,"))
+    history = asyncio.run(_asgi_messages(app, "/viz/history", b"limit=5000"))
 
-    assert result is False, f"sse slow-client invariant violated: result={result}"
+    assert page[0]["status"] == 200
+    assert _headers(page[0])[b"content-type"].startswith(b"text/html")
+    assert b"Pensive activation" in _body(page)
+    assert malformed[0]["status"] == 400
+    assert json.loads(_body(malformed))["error"] == (
+        "atoms query param must contain at least one atom id"
+    )
+    history_payload = json.loads(_body(history))
+    assert history_payload["limit"] == viz.HISTORY_LIMIT_CAP
+    assert history_payload["events"][0]["query"] == "served query"
+
+
+def test_app_dispatches_viz_events_streaming_headers(ctx):
+    app = buildApp(ctx)
+    messages = []
+
+    async def receive():
+        await asyncio.sleep(3600)
+        return {"type": "http.request", "body": b"", "more_body": False}
+
+    async def send(message):
+        messages.append(message)
+        if message["type"] == "http.response.start":
+            raise RuntimeError("stop after headers")
+
+    with pytest.raises(RuntimeError, match="stop after headers"):
+        asyncio.run(app(_http_scope("/viz/events"), receive, send))
+
+    assert messages[0]["status"] == 200
+    headers = _headers(messages[0])
+    assert headers[b"content-type"].startswith(b"text/event-stream")
+    assert headers[b"cache-control"] == b"no-cache"
+
+
+def test_sse_event_is_framed_once_on_real_asgi_path(ctx, monkeypatch):
+    response = viz.VizEventResponse(ctx)
+    emitted = False
+
+    async def connected(_receive):
+        nonlocal emitted
+        if not emitted:
+            emitted = True
+            viz.emitRecallEvent(ctx, "wire query", ["atom-a"], "mcp.recall")
+        return False
+
+    monkeypatch.setattr(response, "_disconnected", connected)
+
+    messages = asyncio.run(_stream_response_until_body(response))
+
+    bodies = [
+        message["body"]
+        for message in messages
+        if message["type"] == "http.response.body" and message.get("body")
+    ]
+    assert len(bodies) == 1
+    assert bodies[0].startswith(b"data: ") and bodies[0].endswith(b"\n\n")
+    assert bodies[0].count(b"data: ") == 1
+    payload = json.loads(bodies[0][len(b"data: "):-2])
+    assert payload["query"] == "wire query"
+    assert payload["atomIds"] == ["atom-a"]
+
+def test_sse_ping_is_framed_once_on_real_asgi_path(ctx, monkeypatch):
+    monkeypatch.setattr(viz, "SSE_PING_INTERVAL", 0)
+
+    messages = asyncio.run(_stream_response_until_body(viz.VizEventResponse(ctx)))
+
+    bodies = [
+        message["body"]
+        for message in messages
+        if message["type"] == "http.response.body" and message.get("body")
+    ]
+    assert bodies == [b": ping\n\n"]
+
+
+def test_sse_sender_drops_slow_client_through_real_asgi_path(ctx, monkeypatch):
+    monkeypatch.setattr(viz, "SSE_SEND_TIMEOUT", 0.001)
+    response = viz.VizEventResponse(ctx)
+    emitted = False
+    sent = []
+
+    async def connected(_receive):
+        nonlocal emitted
+        if not emitted:
+            emitted = True
+            viz.emitRecallEvent(ctx, "slow query", ["slow"], "mcp.recall")
+        return False
+
+    monkeypatch.setattr(response, "_disconnected", connected)
+
+    async def receive():
+        await asyncio.sleep(3600)
+        return {"type": "http.request", "body": b"", "more_body": False}
+
+    async def send(message):
+        sent.append(message)
+        if message["type"] == "http.response.body":
+            await asyncio.sleep(0.5)
+
+    asyncio.run(asyncio.wait_for(
+        response(_http_scope("/viz/events"), receive, send),
+        timeout=1,
+    ))
+
+    assert [message["type"] for message in sent] == [
+        "http.response.start",
+        "http.response.body",
+    ], (
+        f"sse slow-client invariant violated: sent={sent}"
+    )
+    assert sent[1]["more_body"] is True

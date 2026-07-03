@@ -128,7 +128,6 @@
     const nodes = new Map();
     const edges = new Map();
     const pulses = [];
-    const queries = [];
     let width = 1;
     let height = 1;
     let dpr = 1;
@@ -140,6 +139,7 @@
     let mouse = {x: -9999, y: -9999};
     let source = null;
     let reconnectDelay = 700;
+    let statusNote = "";
     const ember = [255, 138, 36];
     const NODE_BUDGET = 400;
 
@@ -208,16 +208,21 @@
     async function fetchGraph(atomIds) {
       if (!atomIds || !atomIds.length) return;
       const ids = atomIds.slice(0, 30).map(encodeURIComponent).join(",");
-      const res = await fetch("/viz/graph?atoms=" + ids);
-      if (!res.ok) return;
-      upsertGraph(await res.json());
+      try {
+        const res = await fetch("/viz/graph?atoms=" + ids);
+        if (!res.ok) throw new Error("graph " + res.status);
+        upsertGraph(await res.json());
+        statusNote = "";
+      } catch (err) {
+        statusNote = "graph fetch failed: " + (err && err.message ? err.message : "unknown");
+        setStatus();
+      }
     }
 
     async function handleEvent(event, fromReplay) {
       eventCount++;
       setStatus();
       queryEl.textContent = event.query || "";
-      queries.push({text: event.query || "", t: performance.now()});
       await fetchGraph(event.atomIds || []);
       ignite(event.atomIds || []);
       if (fromReplay) wake();
@@ -267,7 +272,8 @@
 
     function setStatus() {
       const mode = replaying ? "replaying" : (connected ? "connected" : "reconnecting");
-      statusEl.textContent = mode + " - " + eventCount + " events - " + nodes.size + " nodes";
+      const note = statusNote ? " - " + statusNote : "";
+      statusEl.textContent = mode + " - " + eventCount + " events - " + nodes.size + " nodes" + note;
       replayBtn.disabled = replaying;
     }
 
@@ -276,14 +282,17 @@
       setStatus();
       try {
         const res = await fetch("/viz/history?limit=40");
-        if (!res.ok) return;
+        if (!res.ok) throw new Error("history " + res.status);
         const payload = await res.json();
+        statusNote = "";
         const rows = (payload.events || []).slice().reverse();
         for (const row of rows) {
           if (!replaying) break;
           await handleEvent({query: row.query, atomIds: [row.atom_id], sourceRef: "recall_log"}, true);
           await new Promise(resolve => setTimeout(resolve, 1500));
         }
+      } catch (err) {
+        statusNote = "replay failed: " + (err && err.message ? err.message : "unknown");
       } finally {
         replaying = false;
         setStatus();
