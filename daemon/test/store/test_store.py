@@ -20,7 +20,10 @@ def tableExists(store, name):
 def test_open_creates_schema_at_current_version(tmp_path):
     s = openStore(tmp_path / "mem.db")
     try:
-        assert CURRENT_SCHEMA_VERSION == 1
+        # Deliberate pin: a schema migration must consciously bump this
+        # assertion (v2 = Task 19 lifecycle: recall_log, proposals,
+        # idx_prov_source_ref).
+        assert CURRENT_SCHEMA_VERSION == 2
         assert s.schemaVersion() == CURRENT_SCHEMA_VERSION
         assert tableExists(s, "atoms")
         assert tableExists(s, "edges")
@@ -61,7 +64,7 @@ def test_reopen_preserves_version_and_data(tmp_path):
 
     s2 = openStore(dbfile)
     try:
-        assert s2.schemaVersion() == 1  # unchanged across re-open
+        assert s2.schemaVersion() == CURRENT_SCHEMA_VERSION  # unchanged across re-open
         row = s2._conn.execute(
             "SELECT text FROM atoms WHERE id = ?", ("01ABCDEF",)
         ).fetchone()
@@ -86,7 +89,10 @@ def test_open_refuses_future_schema_version(tmp_path):
     # not silently mis-opened or downgraded (forward-only / never-unrecoverable).
     dbfile = tmp_path / "mem.db"
     s = openStore(dbfile)
-    s._conn.execute("UPDATE meta SET value = '2' WHERE key = 'schema_version'")
+    s._conn.execute(
+        "UPDATE meta SET value = ? WHERE key = 'schema_version'",
+        (str(CURRENT_SCHEMA_VERSION + 1),),
+    )
     s._conn.commit()
     s.close()
 

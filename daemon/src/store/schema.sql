@@ -30,6 +30,7 @@ CREATE TABLE IF NOT EXISTS provenance (
   recorded_at INTEGER NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_prov_atom ON provenance(atom_id);
+CREATE INDEX IF NOT EXISTS idx_prov_source_ref ON provenance(source_ref);
 
 CREATE TABLE IF NOT EXISTS edges (
   id            TEXT PRIMARY KEY,         -- ULID
@@ -58,6 +59,31 @@ CREATE TABLE IF NOT EXISTS embeddings (
   embedded_at INTEGER NOT NULL,
   PRIMARY KEY (atom_id, model_id)
 );
+
+CREATE TABLE IF NOT EXISTS recall_log (
+  id           TEXT PRIMARY KEY,
+  atom_id      TEXT NOT NULL REFERENCES atoms(id),
+  query        TEXT,
+  source_ref   TEXT,
+  weight       REAL NOT NULL DEFAULT 1.0,
+  recorded_at  INTEGER NOT NULL,
+  processed_at INTEGER
+);
+CREATE INDEX IF NOT EXISTS idx_recall_log_unprocessed
+  ON recall_log(processed_at, atom_id);
+
+CREATE TABLE IF NOT EXISTS supersession_proposals (
+  id          TEXT PRIMARY KEY,
+  old_atom_id TEXT NOT NULL REFERENCES atoms(id),
+  new_atom_id TEXT NOT NULL REFERENCES atoms(id),
+  similarity  REAL NOT NULL,
+  reason      TEXT NOT NULL,
+  status      TEXT NOT NULL DEFAULT 'proposed',
+  created_at  INTEGER NOT NULL,
+  UNIQUE(old_atom_id, new_atom_id)
+);
+CREATE INDEX IF NOT EXISTS idx_supersession_proposals_status
+  ON supersession_proposals(status);
 
 CREATE VIRTUAL TABLE IF NOT EXISTS fts USING fts5(
   text, content='atoms', content_rowid='rowid'
