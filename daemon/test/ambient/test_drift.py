@@ -256,6 +256,31 @@ def test_recent_context_suppresses_atom_id_or_text(store):
     )
 
 
+def test_top_visible_hit_suppresses_without_lower_score_fallback(store):
+    embedder = FakeEmbedder()
+    visibleId = _put(store, "visible best memory should not be reinjected")
+    otherId = _put(store, "lower score cousin must not inject")
+    visibleAtom = getAtom(store, visibleId)
+    otherAtom = getAtom(store, otherId)
+    index = OrderedIndex([(visibleId, 0.99), (otherId, 0.98)])
+
+    injection = onTail(
+        store,
+        index,
+        embedder,
+        otherAtom["text"],
+        {"now": 1_000.0, "recentContext": [{"atomId": visibleId}]},
+    )
+
+    assert injection is None, (
+        f"best-hit contract violated: visible top hit fell through to lower hit "
+        f"visibleId={visibleId} otherId={otherId} injection={injection!r}"
+    )
+    assert visibleAtom is not None, (
+        f"test setup invariant violated: visible atom missing id={visibleId}"
+    )
+
+
 def test_cooldown_lives_in_caller_ctx_not_module_state(store):
     embedder = FakeEmbedder()
     atomId = _put(store, "pensive drift watcher injects only high confidence memory")
@@ -370,6 +395,42 @@ def test_adversarial_input_shapes_return_none(store, monkeypatch):
     injection = onTail(store, OrderedIndex([(atomId, 0.99)]), embedder, atom["text"], {"now": 1_000.0})
     assert injection is None, (
         f"input-shape contract violated: atom text None injected {injection!r}"
+    )
+
+
+def test_top_stale_hit_suppresses_without_lower_score_fallback(store):
+    embedder = FakeEmbedder()
+    validId = _put(store, "valid fallback must not inject after stale top hit")
+    validAtom = getAtom(store, validId)
+    index = OrderedIndex([("missing", 0.99), (validId, 0.98)])
+
+    injection = onTail(store, index, embedder, validAtom["text"], {"now": 1_000.0})
+
+    assert injection is None, (
+        f"best-hit contract violated: stale top hit fell through to lower hit "
+        f"validId={validId} injection={injection!r}"
+    )
+
+
+def test_top_text_none_hit_suppresses_without_lower_score_fallback(store, monkeypatch):
+    embedder = FakeEmbedder()
+    textNoneId = _put(store, "text none top hit must suppress")
+    validId = _put(store, "valid fallback must not inject after text none top hit")
+    validAtom = getAtom(store, validId)
+
+    def fakeGetAtom(store, atomId):
+        if atomId == textNoneId:
+            return {"id": textNoneId, "text": None}
+        return getAtom(store, atomId)
+
+    monkeypatch.setattr(drift, "getAtom", fakeGetAtom)
+    index = OrderedIndex([(textNoneId, 0.99), (validId, 0.98)])
+
+    injection = onTail(store, index, embedder, validAtom["text"], {"now": 1_000.0})
+
+    assert injection is None, (
+        f"best-hit contract violated: text-None top hit fell through to lower hit "
+        f"textNoneId={textNoneId} validId={validId} injection={injection!r}"
     )
 
 

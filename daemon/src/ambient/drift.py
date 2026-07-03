@@ -61,7 +61,7 @@ MAX_TAIL_CHARS = 2_000
 
 
 def onTail(store, index, embedder, tailText, ctx):
-    """Return one memory injection for a high-confidence drift hit, else None."""
+    """Return one memory injection for the best sane drift hit, else None."""
     if not isinstance(ctx, dict) or not isinstance(tailText, str):
         return None
     if not tailText.strip():
@@ -92,9 +92,9 @@ def onTail(store, index, embedder, tailText, ctx):
 
         atom = getAtom(store, atomId)
         if atom is None or not isinstance(atom.get("text"), str):
-            continue
+            return None
         if _alreadyInContext(atom["id"], atom["text"], ctx.get("recentContext")):
-            continue
+            return None
 
         ctx["driftLastInjectedAt"] = now
         ctx["driftClockSource"] = clockSource
