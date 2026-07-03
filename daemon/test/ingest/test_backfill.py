@@ -257,6 +257,49 @@ def test_backfill_carries_session_agent_and_created_at_for_historical_imports(st
     assert prov["agent"] == "claude"
 
 
+def test_backfill_rolls_back_partial_record_and_rerun_ingests_it(store):
+    rec = {
+        "sourceId": "crash-after-put",
+        "text": "a crash during backfill mentions pensive",
+        "kind": "atom",
+        "createdAt": 1_600_500_000,
+        "tags": ["src:crash"],
+    }
+
+    class SabotageConn:
+        def __init__(self, conn):
+            self._conn = conn
+
+        def execute(self, sql, *args, **kwargs):
+            if sql.startswith("UPDATE atoms SET created_at"):
+                raise RuntimeError("sabotage after atom/provenance insert")
+            return self._conn.execute(sql, *args, **kwargs)
+
+        def __getattr__(self, name):
+            return getattr(self._conn, name)
+
+    realConn = store._conn
+    store._conn = SabotageConn(realConn)
+    with pytest.raises(RuntimeError, match="sabotage"):
+        backfill(store, [rec])
+
+    assert atomCount(store) == 0
+    assert _atom_id_by_source_ref(store, "crash-after-put") is None
+    assert store._conn.execute("SELECT COUNT(*) FROM facets").fetchone()[0] == 0
+
+    store._conn = realConn
+    stats = backfill(store, [rec])
+
+    assert stats["ingested"] == 1
+    atomId = _atom_id_by_source_ref(store, "crash-after-put")
+    assert atomId is not None
+    atom = getAtom(store, atomId)
+    assert atom["createdAt"] == 1_600_500_000
+    assert {f["value"] for f in facetsOf(store, atomId) if f["key"] == "tag"} == {
+        "src:crash"
+    }
+
+
 def test_backfill_tolerates_empty_tags_and_absent_optionals(store):
     # tags=[] and no project/occurredAt/importance: ingest succeeds, no tag
     # facets, defaults applied -- an atom with nothing but text is still memory.
