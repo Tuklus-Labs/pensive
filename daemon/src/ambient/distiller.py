@@ -129,15 +129,20 @@ _HOUSE_SYSTEM_PROMPT = (
 class OrnithModelClient:
     """Stage-2 summarizer against the local llama-server OpenAI-compatible endpoint.
 
-    UNTESTED-LIVE: implemented against the documented endpoint
-    (:data:`ORNITH_BASE_URL`, model :data:`ORNITH_MODEL`) discovered read-only from
-    the Hermes integration notes, but the test suite never instantiates it -- it
-    injects a fake. Stdlib ``urllib`` only, so importing the distiller pulls in no
-    HTTP dependency.
+    Live-probed 2026-07-02 (Phase 4 gate prep). The server runs with reasoning
+    enabled (``--reasoning on --reasoning-budget -1``), so the model thinks in
+    ``reasoning_content`` BEFORE emitting ``content``; a small ``max_tokens``
+    is consumed entirely by reasoning and ``content`` comes back empty with
+    ``finish_reason == "length"``. The 8192 default matches the Hermes config
+    bound for this same model/server. Empty content on a length finish raises
+    (budget failure, not a considered SKIP) so the distiller counts the span
+    as errored instead of silently dropping it. Stdlib ``urllib`` only, so
+    importing the distiller pulls in no HTTP dependency; the test suite still
+    injects a fake.
     """
 
     def __init__(self, baseUrl=ORNITH_BASE_URL, model=ORNITH_MODEL,
-                 timeout=120, maxTokens=512):
+                 timeout=120, maxTokens=8192):
         self.baseUrl = baseUrl.rstrip("/")
         self.model = model
         self.timeout = timeout
@@ -165,7 +170,13 @@ class OrnithModelClient:
             headers={"Content-Type": "application/json"}, method="POST")
         with urllib.request.urlopen(req, timeout=self.timeout) as resp:
             body = json.loads(resp.read().decode("utf-8"))
-        content = body["choices"][0]["message"]["content"].strip()
+        choice = body["choices"][0]
+        content = (choice["message"].get("content") or "").strip()
+        if not content and choice.get("finish_reason") == "length":
+            raise RuntimeError(
+                "ornith spent the whole token budget on reasoning_content "
+                f"(max_tokens={self.maxTokens}); no atom text produced"
+            )
         if content == "SKIP" or not content:
             return {"text": None, "kind": "atom"}
         return {"text": content, "kind": "atom"}
