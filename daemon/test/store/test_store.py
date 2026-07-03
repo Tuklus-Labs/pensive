@@ -6,7 +6,8 @@ from store.store import openStore, CURRENT_SCHEMA_VERSION
 
 
 EXPECTED_TABLES = [
-    "meta", "atoms", "provenance", "edges", "facets", "embeddings", "fts",
+    "meta", "atoms", "provenance", "edges", "facets", "embeddings",
+    "recall_log", "supersession_proposals", "fts",
 ]
 
 

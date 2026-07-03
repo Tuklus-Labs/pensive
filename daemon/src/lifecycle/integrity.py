@@ -2,6 +2,10 @@
 
 The scan returns a plain dict. Nerve-center publishing is deliberately an
 injectable caller concern; this module has no socket or HTTP dependency.
+
+Embedding coverage gaps are warnings, not hard failures: freshly inserted atoms
+legitimately lack embedding rows until the next reindex/embedMissing pass, so a
+hard failure would false-alarm on every scan between capture and reindex.
 """
 import hashlib
 
@@ -55,6 +59,20 @@ def _embeddingCoverage(conn):
             "missingLiveAtoms": live - embedded,
         }
     return coverage
+
+
+def _warnings(report):
+    warnings = []
+    for modelId, coverage in report["embeddingCoverage"].items():
+        if coverage["missingLiveAtoms"] > 0:
+            warnings.append({
+                "type": "embeddingCoverage",
+                "modelId": modelId,
+                "liveAtoms": coverage["liveAtoms"],
+                "embeddedLiveAtoms": coverage["embeddedLiveAtoms"],
+                "missingLiveAtoms": coverage["missingLiveAtoms"],
+            })
+    return warnings
 
 
 def _orphanRows(conn, table):
@@ -113,8 +131,14 @@ def _checksums(conn):
     }
 
 
-def integrityScan(store):
-    """Return a plain integrity report and raise only for operational faults."""
+def integrityScan(store, emit=None):
+    """Return a plain integrity report and raise only for operational faults.
+
+    ``ok`` covers only hard canonical invariants: orphan rows, supersession
+    cycles/dangling endpoints, checksum/FTS anomalies. Embedding coverage gaps
+    live in ``warnings`` because fresh atoms are validly unembedded until the
+    next reindex/embedMissing pass.
+    """
     conn = store._conn
     report = {
         "checksums": _checksums(conn),
@@ -132,4 +156,7 @@ def integrityScan(store):
         or report["supersessionChains"]["cycles"]
         or report["checksums"]["ftsMissingAtoms"]
     )
+    report["warnings"] = _warnings(report)
+    if emit is not None:
+        emit(report)
     return report

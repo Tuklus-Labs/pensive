@@ -1,10 +1,13 @@
 """Supersession proposal job.
 
 This job proposes only. It never calls ``store.supersede()``, never writes
-``supersedes`` edges, and never changes atom status. The v3.1 verbatim seam is
-bound here now: any atom with provenance from ``person-import`` or a
-``person-*`` source is excluded from proposals entirely, because a person's own
-words are not candidates for automatic supersession.
+``supersedes`` edges, and never changes atom status. Proposals are
+high-similarity same-facet recall-shaped candidates, not verified
+contradictions. Semantic contradiction/update modeling is explicitly deferred
+for later ornith-assisted proposal annotation; v3.0 mitigation is limited to
+cheap noise filters: no person-* provenance, no identical text, no low
+similarity, and no proposals without shared entity/tag/src facets. Tag and src
+facets intentionally participate because they are useful recall scopes.
 """
 import math
 import time

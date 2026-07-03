@@ -9,7 +9,7 @@ dropped only by a separate explicit operation outside this module.
 import struct
 import time
 
-__all__ = ["reembed"]
+__all__ = ["dropOldModel", "reembed"]
 
 
 def _vecToBlob(vec):
@@ -23,6 +23,12 @@ def reembed(store, newModelId, embedder):
     ``newModelId`` are inserted, old model rows remain untouched, and atoms,
     edges, facets, and provenance are never modified.
     """
+    embedderModelId = getattr(embedder, "modelId", None)
+    if embedderModelId is not None and embedderModelId != newModelId:
+        raise ValueError(
+            f"embedder modelId {embedderModelId!r} does not match newModelId "
+            f"{newModelId!r}"
+        )
     conn = store._conn
     rows = conn.execute(
         "SELECT a.id, a.text FROM atoms a "
@@ -59,3 +65,34 @@ def reembed(store, newModelId, embedder):
         conn.rollback()
         raise
     return inserted
+
+
+def dropOldModel(store, oldModelId, activeModelId):
+    """Delete embeddings for ``oldModelId`` after structural safety checks."""
+    if oldModelId == activeModelId:
+        raise ValueError("refusing to drop the active model")
+
+    conn = store._conn
+    live = conn.execute("SELECT COUNT(*) FROM atoms WHERE status = 'live'").fetchone()[0]
+    covered = conn.execute(
+        "SELECT COUNT(*) FROM embeddings e "
+        "JOIN atoms a ON a.id = e.atom_id "
+        "WHERE e.model_id = ? AND a.status = 'live'",
+        (activeModelId,),
+    ).fetchone()[0]
+    if covered != live:
+        raise ValueError(
+            f"active model coverage is incomplete: {covered}/{live} live atoms"
+        )
+
+    try:
+        cursor = conn.execute(
+            "DELETE FROM embeddings WHERE model_id = ?",
+            (oldModelId,),
+        )
+        deleted = cursor.rowcount
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    return deleted
