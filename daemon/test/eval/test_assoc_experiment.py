@@ -11,6 +11,12 @@ Risk model:
     test_assoc_signal_damps_hub_paths_below_specific_paths.
   - row: deterministic-order - equal inputs produce byte-for-byte identical
     ranked tuples. Covered by test_assoc_signal_is_deterministic.
+  - row: derived-facet-back-edges - shared entity/tag facets create association
+    neighbors even when no physical edge rows exist. Covered by
+    test_assoc_signal_finds_facet_cooccurrence_neighbors_without_edges.
+  - row: retrieval-parity - precomputed facet degrees preserve the legacy
+    facets-only atom ids and scores. Covered by
+    test_assoc_signal_matches_legacy_facet_scores_with_precomputed_degrees.
 - State transitions: N/A - assocSignal is a read-only query over a fixed store.
 - Boundaries:
   - row: k-limit - output length is capped after deterministic ranking. Covered
@@ -19,6 +25,12 @@ Risk model:
     test_assoc_signal_handles_empty_store.
   - row: no-edges - seeds without incident edges return an empty list. Covered by
     test_assoc_signal_handles_seed_with_no_edges.
+  - row: hub-cap - facets above HUB_CAP return no derived neighbors. Covered by
+    test_assoc_signal_skips_facet_hubs_without_edges.
+  - row: hub-cap-query-bound - per-query assoc lookup uses the precomputed
+    degree map rather than counting hub degree in the seed loop. Covered by
+    test_assoc_signal_uses_precomputed_facet_degrees_to_skip_hubs and
+    test_gate_with_assoc_precomputes_facet_degrees_once_per_run.
 - Malformed inputs: N/A - this harness helper is internal; callers pass store
   and atom ids from the gate.
 - Concurrency: N/A - no mutation, no shared caches, no sampling.
@@ -28,6 +40,16 @@ Risk model:
   - row: harness-runner - the experiment runner compares baseline and
     assoc-augmented metrics using gate.py's metric path without touching serving
     recall/fusion. Covered by test_compare_metrics_reports_deltas_and_subset.
+  - row: arm-parity-correct-clone - assoc experiment only runs after the cloned
+    without-arm path matches gate.py metrics. Covered by
+    test_gate_with_assoc_passes_when_without_arm_matches_gate_baseline.
+  - row: arm-parity-divergent-clone - metric divergence aborts before reporting.
+    Covered by test_gate_with_assoc_raises_when_without_arm_diverges_from_gate_baseline.
+  - row: facets-only-arm-differs - a physical-edge-free facet graph can affect
+    the assoc candidate pool. Covered by
+    test_gate_with_assoc_differs_on_facets_only_candidate_pool.
+  - row: assoc-arm-inertness - byte-identical rankings abort with graph
+    diagnostics. Covered by test_gate_with_assoc_raises_when_assoc_arm_is_inert.
 - Regression traps:
   - boundary: empty collection treated as missing collection - covered by empty
     and no-edge tests.
@@ -45,10 +67,19 @@ Coverage matrix:
 - two-hop-only -> test_assoc_signal_finds_specific_two_hop_neighbor
 - specificity-damping -> test_assoc_signal_damps_hub_paths_below_specific_paths
 - deterministic-order -> test_assoc_signal_is_deterministic
+- derived-facet-back-edges -> test_assoc_signal_finds_facet_cooccurrence_neighbors_without_edges
+- retrieval-parity -> test_assoc_signal_matches_legacy_facet_scores_with_precomputed_degrees
 - k-limit -> test_assoc_signal_respects_k_after_ranking
 - empty-store -> test_assoc_signal_handles_empty_store
 - no-edges -> test_assoc_signal_handles_seed_with_no_edges
+- hub-cap -> test_assoc_signal_skips_facet_hubs_without_edges
+- hub-cap-query-bound -> test_assoc_signal_uses_precomputed_facet_degrees_to_skip_hubs,
+  test_gate_with_assoc_precomputes_facet_degrees_once_per_run
 - harness-runner -> test_compare_metrics_reports_deltas_and_subset
+- arm-parity-correct-clone -> test_gate_with_assoc_passes_when_without_arm_matches_gate_baseline
+- arm-parity-divergent-clone -> test_gate_with_assoc_raises_when_without_arm_diverges_from_gate_baseline
+- facets-only-arm-differs -> test_gate_with_assoc_differs_on_facets_only_candidate_pool
+- assoc-arm-inertness -> test_gate_with_assoc_raises_when_assoc_arm_is_inert
 
 Sabotage log:
 - finds_specific_two_hop_neighbor: Mutating the walk to return hop-1 nodes would
@@ -65,6 +96,10 @@ Sabotage log:
   the exact tuple-list comparison catches that.
 - compare_metrics: Dropping the assoc path or subset filter changes the exact
   delta/subset fields; weakening to key-presence would miss wrong metrics.
+- hub_cap_query_bound: Recomputing facet degrees inside assocSignal despite a
+  provided map raises; weakening to only check [] would miss the perf lie.
+- retrieval_parity: Changing precompute threading, damping, or merge rules
+  changes the exact tuple list; weakening to ids-only would miss score drift.
 
 Loudness audit: every assertion below includes a rule-naming failure message.
 """
@@ -77,6 +112,7 @@ from eval.assoc_experiment import (
     compareMetrics,
     gateWithAssoc,
     _experimentReport,
+    _precomputeFacetDegrees,
     _recallWithAssoc,
 )
 
@@ -172,6 +208,77 @@ def test_assoc_signal_skips_facet_hubs_without_edges(tmp_path):
             "hub-cap violated: facet degree above HUB_CAP should be skipped "
             f"rather than producing near-zero hub candidates, ranked={ranked}, "
             f"hub_degree={len(hub_neighbors) + 1}, HUB_CAP={HUB_CAP}"
+        )
+    finally:
+        store.close()
+
+
+def test_assoc_signal_uses_precomputed_facet_degrees_to_skip_hubs(tmp_path, monkeypatch):
+    # risk: hub-cap-query-bound
+    store = _open(tmp_path)
+    try:
+        seed = _put(store, "seed")
+        addFacet(store, seed, "entity", "too-common")
+        for i in range(HUB_CAP):
+            addFacet(store, _put(store, f"hub neighbor {i}"), "entity", "too-common")
+
+        facet_degrees = _precomputeFacetDegrees(store)
+
+        def fail_if_recomputed(_store):
+            raise AssertionError(
+                "hub-cap-query-bound violated: assocSignal recomputed facet "
+                "degrees inside the per-query path instead of using the "
+                "precomputed degree map"
+            )
+
+        monkeypatch.setattr(
+            "eval.assoc_experiment._precomputeFacetDegrees",
+            fail_if_recomputed,
+        )
+
+        ranked = assocSignal(store, [seed], k=10, facetDegrees=facet_degrees)
+
+        assert ranked == [], (
+            "hub-cap-query-bound violated: facet above HUB_CAP should be "
+            f"skipped by degree-map lookup before neighbor expansion, "
+            f"ranked={ranked}, degree={facet_degrees[('entity', 'too-common')]}"
+        )
+    finally:
+        store.close()
+
+
+def test_assoc_signal_matches_legacy_facet_scores_with_precomputed_degrees(tmp_path):
+    # risk: retrieval-parity
+    store = _open(tmp_path)
+    try:
+        seed = _put(store, "seed")
+        entity_neighbor = _put(store, "entity neighbor")
+        shared_neighbor = _put(store, "entity and tag neighbor")
+        tag_neighbor = _put(store, "tag neighbor")
+
+        addFacet(store, seed, "entity", "rare-entity")
+        addFacet(store, entity_neighbor, "entity", "rare-entity")
+        addFacet(store, shared_neighbor, "entity", "rare-entity")
+        addFacet(store, seed, "tag", "shared-tag")
+        addFacet(store, shared_neighbor, "tag", "shared-tag")
+        addFacet(store, tag_neighbor, "tag", "shared-tag")
+
+        ranked = assocSignal(
+            store, [seed], k=10,
+            facetDegrees=_precomputeFacetDegrees(store),
+        )
+
+        expected = [
+            (shared_neighbor, (1 / 3) + (1 / 3)),
+            (entity_neighbor, 1 / 3),
+            (tag_neighbor, 1 / 3),
+        ]
+        expected = sorted(expected, key=lambda item: (-item[1], item[0]))
+
+        assert ranked == expected, (
+            "retrieval-parity violated: precomputed facet degrees must produce "
+            "the same atom ids and inverse-degree scores as the legacy "
+            f"facets-only logic, ranked={ranked}"
         )
     finally:
         store.close()
@@ -454,20 +561,40 @@ def test_assoc_signal_distinct_edge_types_between_same_nodes_count_separately(tm
 
 def test_gate_with_assoc_passes_when_without_arm_matches_gate_baseline(monkeypatch):
     # risk: arm-parity-correct-clone
-    baseline = {"r_at_1": 1.0, "r_at_5": 1.0, "r_at_10": 1.0, "r_at_20": 1.0, "mrr_at_10": 1.0, "n": 1, "low_confidence_rate": 0.0}
-    assoc = {"r_at_1": 0.0, "r_at_5": 0.0, "r_at_10": 0.0, "r_at_20": 0.0, "mrr_at_10": 0.0, "n": 1, "low_confidence_rate": 0.0}
+    baseline = {
+        "r_at_1": 1.0,
+        "r_at_5": 1.0,
+        "r_at_10": 1.0,
+        "r_at_20": 1.0,
+        "mrr_at_10": 1.0,
+        "n": 1,
+        "low_confidence_rate": 0.0,
+    }
+    assoc = dict(baseline, r_at_1=0.0)
 
-    monkeypatch.setattr("eval.assoc_experiment.gate_mod.gate", lambda store, index, embedder, queries: baseline)
+    monkeypatch.setattr(
+        "eval.assoc_experiment.gate_mod.gate",
+        lambda store, index, embedder, queries: baseline,
+    )
     monkeypatch.setattr(
         "eval.assoc_experiment._baselineWithRankings",
         lambda store, index, embedder, queries, recallK=None: (baseline, [["a"]]),
     )
+
+    def assoc_with_rankings(store, index, embedder, queries, recallK=None,
+                            facetDegrees=None):
+        return assoc, [["b"]]
+
     monkeypatch.setattr(
         "eval.assoc_experiment._assocWithRankings",
-        lambda store, index, embedder, queries, recallK=None: (assoc, [["b"]]),
+        assoc_with_rankings,
     )
 
-    result = gateWithAssoc(object(), object(), object(), [{"query": "q", "relevant": {"a"}, "own": set()}])
+    result = gateWithAssoc(
+        object(), object(), object(),
+        [{"query": "q", "relevant": {"a"}, "own": set()}],
+        facetDegrees={},
+    )
 
     assert result == (assoc, [["b"]]), (
         "arm-parity-correct-clone violated: matching without-arm clone should "
@@ -488,7 +615,7 @@ def test_gate_with_assoc_raises_when_without_arm_diverges_from_gate_baseline(mon
     )
     monkeypatch.setattr(
         "eval.assoc_experiment._assocWithRankings",
-        lambda store, index, embedder, queries, recallK=None: (assoc, [["a"]]),
+        lambda store, index, embedder, queries, recallK=None, facetDegrees=None: (assoc, [["a"]]),
     )
 
     try:
@@ -503,6 +630,58 @@ def test_gate_with_assoc_raises_when_without_arm_diverges_from_gate_baseline(mon
             "arm-parity-divergent-clone violated: gateWithAssoc must abort "
             "when the without-arm clone diverges from gate.py baseline"
         )
+
+
+def test_gate_with_assoc_precomputes_facet_degrees_once_per_run(monkeypatch):
+    # risk: hub-cap-query-bound
+    baseline = {
+        "r_at_1": 1.0,
+        "r_at_5": 1.0,
+        "r_at_10": 1.0,
+        "r_at_20": 1.0,
+        "mrr_at_10": 1.0,
+        "n": 1,
+        "low_confidence_rate": 0.0,
+    }
+    assoc = dict(baseline, r_at_1=0.0)
+    expected_degrees = {("entity", "shared"): 2}
+    calls = []
+    captured = []
+
+    monkeypatch.setattr(
+        "eval.assoc_experiment.gate_mod.gate",
+        lambda store, index, embedder, queries: baseline,
+    )
+    monkeypatch.setattr(
+        "eval.assoc_experiment._baselineWithRankings",
+        lambda store, index, embedder, queries, recallK=None: (baseline, [["a"]]),
+    )
+
+    def precompute(_store):
+        calls.append("precompute")
+        return expected_degrees
+
+    def assoc_with_rankings(store, index, embedder, queries, recallK=None,
+                            facetDegrees=None):
+        captured.append(facetDegrees)
+        return assoc, [["b"]]
+
+    monkeypatch.setattr("eval.assoc_experiment._precomputeFacetDegrees", precompute)
+    monkeypatch.setattr("eval.assoc_experiment._assocWithRankings", assoc_with_rankings)
+
+    gateWithAssoc(
+        object(), object(), object(),
+        [{"query": "q", "relevant": {"b"}, "own": set()}],
+    )
+
+    assert calls == ["precompute"], (
+        "hub-cap-query-bound violated: gateWithAssoc should precompute facet "
+        f"degrees exactly once per assoc run, calls={calls}"
+    )
+    assert captured == [expected_degrees], (
+        "hub-cap-query-bound violated: assoc arm should receive and reuse the "
+        f"run-level degree map, captured={captured}"
+    )
 
 
 def test_gate_with_assoc_differs_on_facets_only_candidate_pool(monkeypatch, tmp_path):
@@ -596,7 +775,7 @@ def test_gate_with_assoc_raises_when_assoc_arm_is_inert(monkeypatch, tmp_path):
         )
         monkeypatch.setattr(
             "eval.assoc_experiment._assocWithRankings",
-            lambda store, index, embedder, queries, recallK=None: (metrics, rankings),
+            lambda store, index, embedder, queries, recallK=None, facetDegrees=None: (metrics, rankings),
         )
 
         try:

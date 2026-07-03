@@ -48,7 +48,7 @@ _PARITY_KEYS = (
 )
 
 
-def assocSignal(store, seedAtomIds, k):
+def assocSignal(store, seedAtomIds, k, facetDegrees=None):
     """Specificity-damped association walk -> ``[(atomId, score)]``.
 
     Facet co-occurrence is the primary adjacency because the v3 store derives
@@ -61,11 +61,14 @@ def assocSignal(store, seedAtomIds, k):
     entities are the most specific semantic anchors, while tags carry curated
     scopes such as source/session labels. Project/era facets are broader
     filters elsewhere in recall, so treating them as assoc edges would mostly
-    create hubs. Facets whose live-atom degree exceeds ``HUB_CAP`` are skipped
-    because their damped contribution is negligible and their fanout is costly.
-    The per-seed facet scan is also capped at ``MAX_SEED_FACETS`` ordered
-    key/value rows, bounding derived neighbor work to
-    ``MAX_SEED_FACETS * HUB_CAP`` candidates per seed.
+    create hubs. Facet degrees are precomputed once for the assoc run over live
+    atoms and reused by every per-seed lookup; facets whose degree exceeds
+    ``HUB_CAP`` or is not above one are skipped by map lookup before any
+    neighbor expansion. The per-seed facet scan is capped at
+    ``MAX_SEED_FACETS`` ordered key/value rows and each qualifying facet
+    expansion is limited by ``HUB_CAP``, so derived neighbor work is bounded by
+    ``MAX_SEED_FACETS * HUB_CAP`` candidate rows per seed after the one-time
+    degree precompute.
 
     Stored edge rows, when present, are a bonus signal and keep the original
     two-hop formula. For every seed ``s``, through-atom ``t`` adjacent to ``s``,
@@ -97,8 +100,12 @@ def assocSignal(store, seedAtomIds, k):
         return []
 
     scores = defaultdict(float)
+    if facetDegrees is None:
+        facetDegrees = _precomputeFacetDegrees(store)
     for seed in seeds:
-        for candidate, contribution in _facetCooccurrenceNeighbors(store, seed):
+        for candidate, contribution in _facetCooccurrenceNeighbors(
+            store, seed, facetDegrees
+        ):
             if candidate in seedSet:
                 continue
             scores[candidate] += contribution
@@ -178,6 +185,7 @@ def gateWithAssoc(
     recallK=gate_mod._RECALL_K,
     gateBaseline=None,
     returnBaselineRankings=False,
+    facetDegrees=None,
 ):
     """Run the assoc arm after proving the cloned no-assoc gate is in parity."""
     baseline = gateBaseline
@@ -187,10 +195,12 @@ def gateWithAssoc(
         store, index, embedder, queries, recallK
     )
     _assertGateParity(baseline, baselineClone)
+    if facetDegrees is None:
+        facetDegrees = _precomputeFacetDegrees(store)
     assoc, assocRankings = _assocWithRankings(
-        store, index, embedder, queries, recallK
+        store, index, embedder, queries, recallK, facetDegrees=facetDegrees
     )
-    _assertAssocNotInert(store, baselineRankings, assocRankings)
+    _assertAssocNotInert(store, baselineRankings, assocRankings, facetDegrees)
     if returnBaselineRankings:
         return assoc, baselineRankings, assocRankings
     return assoc, assocRankings
@@ -204,15 +214,18 @@ def runChat(exportDir, dbPath, nQueries, embedder, log):
     store, index, stats = _prepareStore(dbPath, records, embedder, log)
     try:
         baseline = gate_mod.gate(store, index, embedder, queries)
+        facetDegrees = _precomputeFacetDegrees(store)
         assoc, baselineRankings, assocRankings = gateWithAssoc(
             store, index, embedder, queries,
             gateBaseline=baseline,
             returnBaselineRankings=True,
+            facetDegrees=facetDegrees,
         )
         bm25 = gate_mod.bm25Baseline(corpusRefs, corpusTexts, queries)
         return _experimentReport(
             len(records), stats, baseline, assoc, bm25, queries,
-            baselineRankings, assocRankings, _derivedGraphStats(store),
+            baselineRankings, assocRankings,
+            _derivedGraphStats(store, facetDegrees),
         )
     finally:
         store.close()
@@ -231,15 +244,18 @@ def runAtoms(exportPath, dbPath, clusterKey, nQueries, embedder, log,
     store, index, stats = _prepareStore(dbPath, records, embedder, log)
     try:
         baseline = gate_mod.gate(store, index, embedder, queries)
+        facetDegrees = _precomputeFacetDegrees(store)
         assoc, baselineRankings, assocRankings = gateWithAssoc(
             store, index, embedder, queries,
             gateBaseline=baseline,
             returnBaselineRankings=True,
+            facetDegrees=facetDegrees,
         )
         bm25 = gate_mod.bm25Baseline(corpusRefs, corpusTexts, queries)
         report = _experimentReport(
             len(records), stats, baseline, assoc, bm25, queries,
-            baselineRankings, assocRankings, _derivedGraphStats(store),
+            baselineRankings, assocRankings,
+            _derivedGraphStats(store, facetDegrees),
         )
         report["cluster_key"] = clusterKey
         report["eligible_queries"] = eligible
@@ -314,87 +330,91 @@ def _neighbors(store, atomId):
     return sorted(out, key=lambda item: (item[0], item[2]))
 
 
-def _facetCooccurrenceNeighbors(store, atomId):
+def _precomputeFacetDegrees(store):
     rows = store._conn.execute(
         """
-        WITH seed_facets AS (
-            SELECT key, value
-            FROM facets
-            WHERE atom_id = ?
-              AND key IN (?, ?)
-            ORDER BY CASE key WHEN 'entity' THEN 0 ELSE 1 END, value
-            LIMIT ?
-        ),
-        facet_degree AS (
-            SELECT sf.key, sf.value, COUNT(DISTINCT f.atom_id) AS degree
-            FROM seed_facets sf
-            JOIN facets f ON f.key = sf.key AND f.value = sf.value
-            JOIN atoms a ON a.id = f.atom_id
-            WHERE a.status = 'live'
-            GROUP BY sf.key, sf.value
-            HAVING degree > 1 AND degree <= ?
-        )
-        SELECT f.atom_id, d.degree
-        FROM facet_degree d
-        JOIN facets f ON f.key = d.key AND f.value = d.value
+        SELECT f.key, f.value, COUNT(DISTINCT f.atom_id) AS degree
+        FROM facets f
         JOIN atoms a ON a.id = f.atom_id
-        WHERE a.status = 'live'
-          AND f.atom_id != ?
-        ORDER BY f.atom_id
+        WHERE f.key IN (?, ?)
+          AND a.status = 'live'
+        GROUP BY f.key, f.value
         """,
-        (
-            atomId,
-            FACET_ASSOC_KEYS[0],
-            FACET_ASSOC_KEYS[1],
-            MAX_SEED_FACETS,
-            HUB_CAP,
-            atomId,
-        ),
+        (FACET_ASSOC_KEYS[0], FACET_ASSOC_KEYS[1]),
+    ).fetchall()
+    return {(key, value): degree for key, value, degree in rows}
+
+
+def _facetCooccurrenceNeighbors(store, atomId, facetDegrees):
+    seedFacets = store._conn.execute(
+        """
+        SELECT key, value
+        FROM facets
+        WHERE atom_id = ?
+          AND key IN (?, ?)
+        ORDER BY CASE key WHEN 'entity' THEN 0 ELSE 1 END, value
+        LIMIT ?
+        """,
+        (atomId, FACET_ASSOC_KEYS[0], FACET_ASSOC_KEYS[1], MAX_SEED_FACETS),
     ).fetchall()
     scores = defaultdict(float)
-    for neighbor, degree in rows:
-        scores[neighbor] += 1.0 / (degree ** SPEC_POWER)
+    for key, value in seedFacets:
+        degree = facetDegrees.get((key, value), 0)
+        if degree <= 1 or degree > HUB_CAP:
+            continue
+        rows = store._conn.execute(
+            """
+            SELECT f.atom_id
+            FROM facets f
+            JOIN atoms a ON a.id = f.atom_id
+            WHERE f.key = ?
+              AND f.value = ?
+              AND a.status = 'live'
+              AND f.atom_id != ?
+            ORDER BY f.atom_id
+            LIMIT ?
+            """,
+            (key, value, atomId, HUB_CAP),
+        ).fetchall()
+        contribution = 1.0 / (degree ** SPEC_POWER)
+        for row in rows:
+            scores[row[0]] += contribution
     return sorted(scores.items(), key=lambda item: item[0])
 
 
-def _derivedGraphStats(store):
-    rows = store._conn.execute(
-        """
-        WITH facet_degree AS (
-            SELECT f.key, f.value, COUNT(DISTINCT f.atom_id) AS degree
+def _derivedGraphStats(store, facetDegrees=None):
+    if facetDegrees is None:
+        facetDegrees = _precomputeFacetDegrees(store)
+    qualifyingFacets = [
+        (key, value, degree)
+        for (key, value), degree in facetDegrees.items()
+        if degree > 1 and degree <= HUB_CAP
+    ]
+    totalPairs = sum(
+        degree * (degree - 1)
+        for _key, _value, degree in qualifyingFacets
+    )
+    if not qualifyingFacets:
+        seedsWithNeighbors = 0
+    else:
+        qualifyingKeys = {
+            (key, value)
+            for key, value, _degree in qualifyingFacets
+        }
+        rows = store._conn.execute(
+            """
+            SELECT DISTINCT f.atom_id, f.key, f.value
             FROM facets f
             JOIN atoms a ON a.id = f.atom_id
             WHERE f.key IN (?, ?)
               AND a.status = 'live'
-            GROUP BY f.key, f.value
-            HAVING degree > 1 AND degree <= ?
-        )
-        SELECT COALESCE(SUM(degree * (degree - 1)), 0)
-        FROM facet_degree
-        """,
-        (FACET_ASSOC_KEYS[0], FACET_ASSOC_KEYS[1], HUB_CAP),
-    ).fetchone()
-    totalPairs = rows[0] if rows else 0
-    rows = store._conn.execute(
-        """
-        WITH facet_degree AS (
-            SELECT f.key, f.value, COUNT(DISTINCT f.atom_id) AS degree
-            FROM facets f
-            JOIN atoms a ON a.id = f.atom_id
-            WHERE f.key IN (?, ?)
-              AND a.status = 'live'
-            GROUP BY f.key, f.value
-            HAVING degree > 1 AND degree <= ?
-        )
-        SELECT COUNT(DISTINCT f.atom_id)
-        FROM facets f
-        JOIN atoms a ON a.id = f.atom_id
-        JOIN facet_degree d ON d.key = f.key AND d.value = f.value
-        WHERE a.status = 'live'
-        """,
-        (FACET_ASSOC_KEYS[0], FACET_ASSOC_KEYS[1], HUB_CAP),
-    ).fetchone()
-    seedsWithNeighbors = rows[0] if rows else 0
+            """,
+            (FACET_ASSOC_KEYS[0], FACET_ASSOC_KEYS[1]),
+        ).fetchall()
+        seedsWithNeighbors = len({
+            atomId for atomId, key, value in rows
+            if (key, value) in qualifyingKeys
+        })
     return {
         "facet_keys": list(FACET_ASSOC_KEYS),
         "hub_cap": HUB_CAP,
@@ -464,10 +484,14 @@ def _baselineWithRankings(store, index, embedder, queries,
 
 
 def _assocWithRankings(store, index, embedder, queries,
-                       recallK=gate_mod._RECALL_K):
+                       recallK=gate_mod._RECALL_K, facetDegrees=None):
+    if facetDegrees is None:
+        facetDegrees = _precomputeFacetDegrees(store)
     return _gateWithRecall(
         store, queries,
-        lambda query, k: _recallWithAssoc(store, index, embedder, query, k=k),
+        lambda query, k: _recallWithAssoc(
+            store, index, embedder, query, k=k, facetDegrees=facetDegrees
+        ),
         recallK,
         captureRankings=True,
     )
@@ -484,7 +508,7 @@ def _assertGateParity(gateBaseline, experimentClone):
         )
 
 
-def _assertAssocNotInert(store, baselineRankings, assocRankings):
+def _assertAssocNotInert(store, baselineRankings, assocRankings, facetDegrees=None):
     queryCount = max(len(baselineRankings), len(assocRankings))
     if queryCount == 0:
         return
@@ -495,7 +519,7 @@ def _assertAssocNotInert(store, baselineRankings, assocRankings):
     differ += abs(len(baselineRankings) - len(assocRankings))
     if differ:
         return
-    stats = _derivedGraphStats(store)
+    stats = _derivedGraphStats(store, facetDegrees)
     raise RuntimeError(
         "assoc arm inert: "
         f"{differ}/{queryCount} queries differ; refusing to emit a normal "
@@ -542,7 +566,7 @@ def _gateWithRecall(store, queries, recallFn, recallK, captureRankings=False):
 
 
 def _recallWithAssoc(store, index, embedder, query, project=None, timeScope=None,
-                     kinds=None, k=10, tokenBudget=1500):
+                     kinds=None, k=10, tokenBudget=1500, facetDegrees=None):
     now = int(time.time())
     if not query or not query.strip():
         return _emptyResult(store, tokenBudget)
@@ -563,7 +587,9 @@ def _recallWithAssoc(store, index, embedder, query, project=None, timeScope=None
         dnHits = [pair for pair in dnHits if pair[0] in filterSet]
 
     seedIds = [atomId for atomId, _score in rrf([bmHits, dnHits])[:ASSOC_SEED_K]]
-    assocHits = assocSignal(store, seedIds, ASSOC_SIGNAL_K)
+    assocHits = assocSignal(
+        store, seedIds, ASSOC_SIGNAL_K, facetDegrees=facetDegrees
+    )
     if filterSet is not None:
         assocHits = [pair for pair in assocHits if pair[0] in filterSet]
 
