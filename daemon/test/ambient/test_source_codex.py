@@ -307,6 +307,82 @@ def test_agent_message_events_are_fallback_when_response_item_messages_absent(tm
     ] == ["Fallback assistant text.", "Second fallback assistant text."]
 
 
+def test_empty_response_item_message_does_not_suppress_agent_message(tmp_path):
+    logPath = tmp_path / "rollout-empty-response-item-fallback.jsonl"
+    logPath.write_text(_codex_log(
+        _line({
+            "type": "response_item",
+            "payload": {
+                "type": "message",
+                "role": "assistant",
+                "content": [],
+            },
+        }),
+        _line({
+            "type": "event_msg",
+            "payload": {
+                "type": "agent_message",
+                "message": "Real fallback assistant text.",
+            },
+        }),
+    ), encoding="utf-8")
+
+    source = codexSource(logPath)
+
+    assert [delta["offset"] for delta in source["deltas"]] == [2], (
+        "produced-canonical assistant fallback violated: "
+        f"deltas={source['deltas']}"
+    )
+    assert source["deltas"][0]["events"][0]["content"][0]["text"] == (
+        "Real fallback assistant text."
+    ), f"agent_message fallback text contract violated: source={source}"
+
+
+def test_response_item_assistant_does_not_gate_event_user_message(tmp_path):
+    logPath = tmp_path / "rollout-canonical-assistant-with-user-events.jsonl"
+    logPath.write_text(_codex_log(
+        _line({
+            "type": "response_item",
+            "payload": {
+                "type": "message",
+                "role": "assistant",
+                "content": [{"type": "output_text", "text": "Canonical assistant."}],
+            },
+        }),
+        _line({
+            "type": "event_msg",
+            "payload": {
+                "type": "agent_message",
+                "message": "Duplicate assistant event.",
+            },
+        }),
+        _line({
+            "type": "event_msg",
+            "payload": {
+                "type": "user_message",
+                "message": "User event stays mapped.",
+            },
+        }),
+    ), encoding="utf-8")
+
+    source = codexSource(logPath)
+
+    assert [delta["offset"] for delta in source["deltas"]] == [1, 3], (
+        "assistant canonical/user-event independence violated: "
+        f"deltas={source['deltas']}"
+    )
+    assert [
+        delta["events"][0]["role"] for delta in source["deltas"]
+    ] == ["assistant", "user"], (
+        "event_msg.user_message ungated mapping violated: "
+        f"deltas={source['deltas']}"
+    )
+    assert [
+        delta["events"][0]["content"][0]["text"]
+        for delta in source["deltas"]
+    ] == ["Canonical assistant.", "User event stays mapped."]
+
+
 def test_event_user_message_maps_to_user_text_event(tmp_path):
     logPath = tmp_path / "rollout-event-user-message.jsonl"
     logPath.write_text(_codex_log(

@@ -66,25 +66,32 @@ def codexSource(logPath):
 
             records.append((lineNumber, record, payload))
 
-    hasResponseItemMessages = any(
-        record.get("type") == "response_item" and payload.get("type") in _MESSAGE_TYPES
-        for _, record, payload in records
-    )
-
     pending = []
+    responseItemAssistantEvents = []
+    eventMessageAssistantEvents = []
     for lineNumber, record, payload in records:
-        event = _eventFromRecord(
-            record,
-            payload,
-            allowAssistantEventMessages=not hasResponseItemMessages,
-        )
+        event = _eventFromRecord(record, payload)
         if event is None:
             continue
-        pending.append({
+        delta = {
             "sessionId": sessionId,
             "offset": lineNumber,
             "events": [event],
-        })
+        }
+        if _isResponseItemAssistantMessage(record, payload, event):
+            responseItemAssistantEvents.append(delta)
+        elif _isEventMessageAssistant(record, payload, event):
+            eventMessageAssistantEvents.append(delta)
+        else:
+            pending.append(delta)
+
+    assistantEvents = (
+        responseItemAssistantEvents
+        if responseItemAssistantEvents
+        else eventMessageAssistantEvents
+    )
+    pending.extend(assistantEvents)
+    pending.sort(key=lambda delta: delta["offset"])
 
     for delta in pending:
         delta["sessionId"] = sessionId
@@ -105,17 +112,13 @@ def _sessionId(payload):
     return None
 
 
-def _eventFromRecord(record, payload, allowAssistantEventMessages):
+def _eventFromRecord(record, payload):
     recordType = record.get("type")
     payloadType = payload.get("type")
 
     if recordType == "response_item" and payloadType in _MESSAGE_TYPES:
         return _messageEvent(payload)
-    if (
-        allowAssistantEventMessages
-        and recordType == "event_msg"
-        and payloadType in _ASSISTANT_EVENT_TYPES
-    ):
+    if recordType == "event_msg" and payloadType in _ASSISTANT_EVENT_TYPES:
         return _plainEvent("assistant", payload.get("message"), output=True)
     if recordType == "event_msg" and payloadType in _USER_EVENT_TYPES:
         return _plainEvent("user", payload.get("message"), output=False)
@@ -133,6 +136,22 @@ def _eventFromRecord(record, payload, allowAssistantEventMessages):
     ):
         return _toolResultEvent(payload)
     return None
+
+
+def _isResponseItemAssistantMessage(record, payload, event):
+    return (
+        record.get("type") == "response_item"
+        and payload.get("type") in _MESSAGE_TYPES
+        and event.get("role") == "assistant"
+    )
+
+
+def _isEventMessageAssistant(record, payload, event):
+    return (
+        record.get("type") == "event_msg"
+        and payload.get("type") in _ASSISTANT_EVENT_TYPES
+        and event.get("role") == "assistant"
+    )
 
 
 def _messageEvent(payload):
