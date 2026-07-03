@@ -56,12 +56,22 @@ is the real implementation against the local llama-server OpenAI-compatible
 endpoint that backs the Hermes/ornith stack; tests inject a deterministic fake, so
 nothing here depends on a live 35B.
 """
+import hashlib
 import json
+import sys
 import urllib.request
+from pathlib import Path
 
-from store.store import putAtom
+from store.store import putAtom, addFacet
 from ambient.segment import segment, KIND_EXPLICIT_EMIT
 from ambient.dedup import dedup
+
+_REPO_SRC = Path(__file__).resolve().parents[3] / "src"
+if str(_REPO_SRC) not in sys.path:
+    sys.path.insert(0, str(_REPO_SRC))
+
+from pensive.mega_extract import MegaExtractor  # noqa: E402  (path set above)
+from pensive.patterns import REAL_DATA_PATTERNS, build_pattern_set  # noqa: E402
 
 __all__ = [
     "distill",
@@ -170,7 +180,26 @@ def _spanRef(span):
     """The provenance ``sourceRef`` for a span: ``<sessionId>#<offset>``. Uniquely
     locates the span in the session, so the same span re-tailed maps to the same
     ref -- the hook the idempotency check hangs on."""
-    return f"{span.get('sessionId')}#{span.get('offset')}"
+    if span.get("_sourceRef") is not None:
+        return span["_sourceRef"]
+    sessionId = span.get("sessionId")
+    offset = span.get("offset")
+    if sessionId is None or offset is None:
+        return None
+    if str(offset) == "None" or str(offset).startswith("None."):
+        return None
+    return f"{sessionId}#{offset}"
+
+
+def _syntheticSourceRef(span):
+    sessionId = span.get("sessionId")
+    if sessionId is None:
+        return None
+    digest = hashlib.blake2b(
+        str(span.get("text", "")).encode("utf-8"),
+        digest_size=8,
+    ).hexdigest()
+    return f"{sessionId}#synthetic.{span.get('offset')}.{digest}"
 
 
 def _existingBySourceRef(store, sourceRef):
@@ -179,6 +208,8 @@ def _existingBySourceRef(store, sourceRef):
     This is the exact-span idempotency probe: if a span was already captured, its
     provenance row already points at this ref. Returns the atom id so the caller can
     bump (distilled) or skip (explicit) rather than insert a second copy."""
+    if sourceRef is None:
+        return None
     row = store._conn.execute(
         "SELECT atom_id FROM provenance WHERE source_ref = ? LIMIT 1",
         (sourceRef,),
@@ -217,7 +248,17 @@ def _provenance(source, span):
     }
 
 
-def _insertAtom(store, source, span, text, kind):
+def _newExtractor():
+    return MegaExtractor(build_pattern_set(REAL_DATA_PATTERNS))
+
+
+def _addEntityFacets(store, atomId, extractor, text):
+    labels = {label for label, _etype in extractor.extract(text)}
+    for label in labels:
+        addFacet(store, atomId, "entity", label)
+
+
+def _insertAtom(store, source, span, text, kind, extractor):
     """Insert one atom for ``span`` with body ``text`` and return its id.
 
     Importance starts at 0.0 (earned, not assigned) -- accrual raises it later. The
@@ -227,13 +268,15 @@ def _insertAtom(store, source, span, text, kind):
     agent = source.get("agent")
     if agent:
         prov["agent"] = agent
-    return putAtom(store, {
+    atomId = putAtom(store, {
         "text": text,
         "kind": kind,
         "project": source.get("project"),
         "importance": 0.0,
         "provenance": prov,
     })
+    _addEntityFacets(store, atomId, extractor, text)
+    return atomId
 
 
 # --- explicit-emit composition (mirrors the production emit shapes) --------- #
@@ -310,7 +353,11 @@ def _summaryText(summary):
     return text.strip(), kind
 
 
-def _distillSpan(store, source, span, model, embedder, result):
+def _hasTrustedSourceRef(span):
+    return bool(span.get("_sourceRefTrusted")) and _spanRef(span) is not None
+
+
+def _distillSpan(store, source, span, model, embedder, extractor, result):
     """Process one heuristic span under the ``distill`` policy (mutates ``result``).
 
     Order matters for storm-proofing and cost: the exact-span idempotency check runs
@@ -318,7 +365,7 @@ def _distillSpan(store, source, span, model, embedder, result):
     without paying for another summarization; only a genuinely new span is
     summarized, then dedup'd against recent atoms."""
     ref = _spanRef(span)
-    existing = _existingBySourceRef(store, ref)
+    existing = _existingBySourceRef(store, ref) if _hasTrustedSourceRef(span) else None
     if existing is not None:
         # Exact same span, seen again (a re-tail / overlapping delta): reinforce the
         # atom we already wrote, never a second copy.
@@ -345,12 +392,12 @@ def _distillSpan(store, source, span, model, embedder, result):
         result["bumped"] += 1
         return
 
-    atomId = _insertAtom(store, source, span, text, kind)
+    atomId = _insertAtom(store, source, span, text, kind, extractor)
     result["inserted"] += 1
     result["atomIds"].append(atomId)
 
 
-def _passthroughSpan(store, source, span, result):
+def _passthroughSpan(store, source, span, extractor, result):
     """Write an explicit-emit span straight through (bypass stage 2 and dedup).
 
     Curated by the agent, highest trust: compose the atom from the emit args and
@@ -358,20 +405,22 @@ def _passthroughSpan(store, source, span, result):
     provenance is already present, skip silently rather than duplicate a deliberate
     emit (an explicit emit does not accrue importance from a mechanical re-tail)."""
     ref = _spanRef(span)
-    if _existingBySourceRef(store, ref) is not None:
+    if _hasTrustedSourceRef(span) and _existingBySourceRef(store, ref) is not None:
         result["skipped"] += 1
         return
     emit = span["explicitEmit"]
     text, kind = _composeEmitText(emit["tool"], emit["args"])
-    if not text or not text.strip():
+    if text is None or text == "":
         result["skipped"] += 1
         return
-    atomId = _insertAtom(store, source, span, text, kind)
+    atomId = _insertAtom(store, source, span, text, kind, extractor)
+    for tag in dict.fromkeys(emit["args"].get("tags") or []):
+        addFacet(store, atomId, "tag", tag)
     result["passthrough"] += 1
     result["atomIds"].append(atomId)
 
 
-def _verbatimSpan(store, source, span, result):
+def _verbatimSpan(store, source, span, extractor, result):
     """Insert a span exactly as-is -- THE V3.1 SEAM.
 
     No stage-2 model, no dedup-merge: the span's own text becomes the atom, and a
@@ -385,12 +434,53 @@ def _verbatimSpan(store, source, span, result):
         text, kind = _composeEmitText(emit["tool"], emit["args"])
     else:
         text, kind = span["text"], "atom"
-    if not text or not text.strip():
+    if text is None or text == "":
         result["skipped"] += 1
         return
-    atomId = _insertAtom(store, source, span, text, kind)
+    atomId = _insertAtom(store, source, span, text, kind, extractor)
     result["inserted"] += 1
     result["atomIds"].append(atomId)
+
+
+def _verbatimTextBlocks(content):
+    if isinstance(content, str):
+        if content != "":
+            yield content
+        return
+    if not isinstance(content, list):
+        return
+    for block in content:
+        if not isinstance(block, dict) or block.get("type") != "text":
+            continue
+        text = block.get("text")
+        if isinstance(text, str) and text != "":
+            yield text
+
+
+def _verbatimSpans(transcriptSource, delta, deltaIndex):
+    sessionId = delta.get("sessionId", transcriptSource.get("sessionId"))
+    base = delta.get("offset", deltaIndex)
+    trusted = sessionId is not None and "offset" in delta and delta.get("offset") is not None
+    events = delta.get("events")
+    if not isinstance(events, list):
+        return []
+    spans = []
+    for eventIndex, event in enumerate(events):
+        if not isinstance(event, dict):
+            continue
+        for local, text in enumerate(_verbatimTextBlocks(event.get("content"))):
+            span = {
+                "sessionId": sessionId,
+                "offset": f"{base}.{eventIndex}.{local}",
+                "text": text,
+                "kind": "atom",
+                "explicitEmit": None,
+                "_sourceRefTrusted": trusted,
+            }
+            if not trusted:
+                span["_sourceRef"] = _syntheticSourceRef(span)
+            spans.append(span)
+    return spans
 
 
 def distill(store, transcriptSource, model, embedder):
@@ -421,25 +511,45 @@ def distill(store, transcriptSource, model, embedder):
         return result
 
     policy = transcriptSource.get("policy", DISTILL_POLICY)
+    if policy not in {DISTILL_POLICY, VERBATIM_POLICY}:
+        raise ValueError(f"unknown ambient distiller policy: {policy!r}")
     sessionId = transcriptSource.get("sessionId")
     deltas = transcriptSource.get("deltas") or []
+    extractor = _newExtractor()
 
-    for delta in deltas:
+    for deltaIndex, delta in enumerate(deltas):
         if not isinstance(delta, dict):
             continue
-        # segment() reads sessionId off the delta; inject the source's so a delta
-        # need not repeat it.
-        deltaForSeg = dict(delta)
-        deltaForSeg.setdefault("sessionId", sessionId)
-        for span in segment(deltaForSeg):
-            if not span.get("text") or not str(span["text"]).strip():
+        if policy == VERBATIM_POLICY:
+            spans = _verbatimSpans(transcriptSource, delta, deltaIndex)
+        else:
+            # segment() reads sessionId off the delta; inject the source's so a delta
+            # need not repeat it. Missing offsets get the delta index so refs cannot
+            # collide across separate tailed slices.
+            deltaForSeg = dict(delta)
+            deltaForSeg.setdefault("sessionId", sessionId)
+            deltaForSeg.setdefault("offset", deltaIndex)
+            trusted = (
+                deltaForSeg.get("sessionId") is not None
+                and "offset" in delta
+                and delta.get("offset") is not None
+            )
+            spans = segment(deltaForSeg)
+            for span in spans:
+                span["_sourceRefTrusted"] = trusted
+                if not trusted:
+                    span["_sourceRef"] = _syntheticSourceRef(span)
+        for span in spans:
+            if not span.get("text") or (
+                policy != VERBATIM_POLICY and not str(span["text"]).strip()
+            ):
                 result["skipped"] += 1     # malformed / empty span -> skip, never raise
                 continue
             if policy == VERBATIM_POLICY:
-                _verbatimSpan(store, transcriptSource, span, result)
+                _verbatimSpan(store, transcriptSource, span, extractor, result)
             elif span["kind"] == KIND_EXPLICIT_EMIT and span.get("explicitEmit"):
-                _passthroughSpan(store, transcriptSource, span, result)
+                _passthroughSpan(store, transcriptSource, span, extractor, result)
             else:
-                _distillSpan(store, transcriptSource, span, model, embedder, result)
+                _distillSpan(store, transcriptSource, span, model, embedder, extractor, result)
 
     return result

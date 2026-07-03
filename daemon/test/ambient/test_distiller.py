@@ -38,7 +38,7 @@ from ambient.distiller import (
 )
 from ambient.dedup import dedup, DEDUP_THRESHOLD
 from ambient.segment import segment, KIND_EXPLICIT_EMIT
-from store.store import openStore, putAtom, getAtom, atomCount
+from store.store import openStore, putAtom, getAtom, atomCount, facetsOf
 
 import pytest
 
@@ -76,12 +76,14 @@ class FakeEmbedder:
     DIM = 4096
 
     def embed(self, texts):
+        import hashlib
         import numpy as np
         out = []
         for t in texts:
             vec = np.zeros(self.DIM, dtype=np.float32)
             for tok in t.lower().split():
-                vec[hash(tok) % self.DIM] += 1.0
+                digest = hashlib.blake2b(tok.encode("utf-8"), digest_size=8).digest()
+                vec[int.from_bytes(digest, "big") % self.DIM] += 1.0
             n = float(np.linalg.norm(vec))
             if n > 0:
                 vec = vec / n
@@ -121,10 +123,20 @@ def _source(sessionId, events, policy=DISTILL_POLICY, offset=0, **extra):
     return src
 
 
+def _sourceDeltas(sessionId, deltas, policy=DISTILL_POLICY, **extra):
+    src = {"sessionId": sessionId, "policy": policy, "deltas": deltas}
+    src.update(extra)
+    return src
+
+
 def _atoms(store):
     ids = [r[0] for r in store._conn.execute(
         "SELECT id FROM atoms ORDER BY id").fetchall()]
     return [getAtom(store, i) for i in ids]
+
+
+def _facetPairs(store, atomId):
+    return {(f["key"], f["value"]) for f in facetsOf(store, atomId)}
 
 
 # --------------------------------------------------------------------------- #
@@ -135,7 +147,7 @@ def _atoms(store):
 def test_explicit_emit_passes_through_without_model(store):
     model = FakeModelClient()
     embedder = FakeEmbedder()
-    principle = "usearch HNSW must pin its score scale to the flat index"
+    principle = "Pensive must pin its score scale to the flat index"
     source = _source("sess-A", [
         _emitEvent("engram_emit_discovery",
                    {"project": "pensive", "principle": principle}),
@@ -152,6 +164,7 @@ def test_explicit_emit_passes_through_without_model(store):
 
     atom = getAtom(store, result["atomIds"][0])
     assert principle in atom["text"]
+    assert ("entity", "pensive") in _facetPairs(store, atom["id"])
     prov = atom["provenance"][0]
     assert prov["source"] == SOURCE_CLAUDE_CODE
     assert prov["sessionId"] == "sess-A"
@@ -167,7 +180,7 @@ def test_explicit_emit_passes_through_without_model(store):
 def test_heuristic_span_is_summarized_and_inserted(store):
     model = FakeModelClient()
     embedder = FakeEmbedder()
-    para = "I'll pin the HNSW score scale to the flat index so recall stays comparable."
+    para = "I'll pin the Pensive score scale to the flat index so recall stays comparable."
     source = _source("sess-H", [_assistantText(para)])
 
     result = distill(store, source, model, embedder)
@@ -177,10 +190,29 @@ def test_heuristic_span_is_summarized_and_inserted(store):
     assert model.calls == [para]                 # the model DID run on a heuristic span
     atom = getAtom(store, result["atomIds"][0])
     assert atom["text"] == f"principle: {para}"  # the fake's house-format summary
+    assert ("entity", "pensive") in _facetPairs(store, atom["id"])
     prov = atom["provenance"][0]
     assert prov["source"] == SOURCE_CLAUDE_CODE
     assert prov["sessionId"] == "sess-H"
     assert "sess-H#" in prov["sourceRef"]
+
+
+def test_explicit_emit_tags_become_tag_facets(store):
+    model = FakeModelClient()
+    embedder = FakeEmbedder()
+    source = _source("sess-T", [
+        _emitEvent("engram_emit_atom", {
+            "shape": "MegaExtractor facets must survive ambient passthrough",
+            "tags": ["src:ambient", "task-16"],
+        }),
+    ])
+
+    result = distill(store, source, model, embedder)
+
+    atom = getAtom(store, result["atomIds"][0])
+    facets = _facetPairs(store, atom["id"])
+    assert ("tag", "src:ambient") in facets
+    assert ("tag", "task-16") in facets
 
 
 # --------------------------------------------------------------------------- #
@@ -254,27 +286,94 @@ def test_near_dup_bumps_not_inserts(store):
     assert result["inserted"] == 1 and result["bumped"] == 1
 
 
+def test_missing_offsets_do_not_ref_collide_across_deltas(store):
+    model = FakeModelClient()
+    embedder = FakeEmbedder()
+    first = "I'll preserve the first missing-offset delta as its own memory."
+    second = "I'll preserve the second missing-offset delta as a distinct memory."
+    source = _sourceDeltas("sess-O", [
+        {"events": [_assistantText(first)]},
+        {"events": [_assistantText(second)]},
+    ])
+
+    result = distill(store, source, model, embedder)
+
+    assert atomCount(store) == 2
+    assert result["inserted"] == 2
+    assert [getAtom(store, atomId)["text"] for atomId in result["atomIds"]] == [
+        f"principle: {first}",
+        f"principle: {second}",
+    ]
+
+
+def test_anonymous_sources_do_not_ref_cross_contaminate(store):
+    model = FakeModelClient()
+    embedder = FakeEmbedder()
+    first = "I'll keep the anonymous first source as one memory."
+    second = "I'll keep the anonymous second source as a separate memory."
+
+    distill(store, _source(None, [_assistantText(first)]), model, embedder)
+    result = distill(store, _source(None, [_assistantText(second)]), model, embedder)
+
+    assert atomCount(store) == 2
+    assert result["inserted"] == 1
+    refs = [a["provenance"][0]["sourceRef"] for a in _atoms(store)]
+    assert all(ref is None or not ref.startswith("None#") for ref in refs)
+
+
 # --------------------------------------------------------------------------- #
 # The verbatim seam (v3.1): insert every span as-is, no model, no dedup-merge   #
 # --------------------------------------------------------------------------- #
 
 
-def test_verbatim_policy_inserts_every_span_unmodified(store):
+def test_verbatim_policy_inserts_every_text_block_byte_identical(store):
     model = FakeModelClient()
     embedder = FakeEmbedder()
-    # Two identical spans under a verbatim source. The distill policy would fold them
-    # into one; verbatim must keep BOTH, unmodified, and never call the model.
-    para = "I'll keep every word of this exactly as written, twice."
-    source = _source("sess-V", [_assistantText(para), _assistantText(para)],
-                     policy=VERBATIM_POLICY)
+    # Distill policy would drop cue-less prose, trim padding, ignore the user turn,
+    # and fold identical repeats. Verbatim preserves all non-empty text blocks as-is.
+    cueLess = "kairos has no capture cue here."
+    padded = "\n  keep my exact spacing  \n"
+    spaces = "   "
+    userText = "A user-role event is still person-sourced text."
+    repeat = "Repeat this exact sentence."
+    source = _source("sess-V", [
+        _assistantText(cueLess),
+        _assistantText(padded),
+        _assistantText(spaces),
+        {"role": "user", "content": userText},
+        _assistantText(repeat),
+        _assistantText(repeat),
+    ], policy=VERBATIM_POLICY)
 
     result = distill(store, source, model, embedder)
 
-    assert atomCount(store) == 2                        # repetition preserved, not merged
-    assert result["inserted"] == 2 and result["bumped"] == 0
+    assert atomCount(store) == 6                        # repetition preserved, not merged
+    assert result["inserted"] == 6 and result["bumped"] == 0
     assert model.calls == []                            # stage 2 never runs on verbatim
-    for atom in _atoms(store):
-        assert atom["text"] == para                     # inserted raw, not summarized
+    assert [getAtom(store, atomId)["text"] for atomId in result["atomIds"]] == [
+        cueLess,
+        padded,
+        spaces,
+        userText,
+        repeat,
+        repeat,
+    ]
+    assert ("entity", "kairos") in _facetPairs(store, result["atomIds"][0])
+
+
+def test_policy_must_be_known_value(store):
+    model = FakeModelClient()
+    embedder = FakeEmbedder()
+
+    with pytest.raises(ValueError):
+        distill(store, _source("sess-P", [_assistantText("I'll never run.")],
+                               policy="Verbatim"), model, embedder)
+
+    defaulted = {"sessionId": "sess-P2", "deltas": [
+        {"offset": 0, "events": [_assistantText("I'll still default to distill.")]}
+    ]}
+    result = distill(store, defaulted, model, embedder)
+    assert result["inserted"] == 1
 
 
 # --------------------------------------------------------------------------- #

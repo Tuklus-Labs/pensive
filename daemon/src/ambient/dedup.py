@@ -40,9 +40,11 @@ __all__ = ["dedup", "DEDUP_THRESHOLD", "RECENT_WINDOW", "cosine"]
 
 # Cosine-similarity bar for calling two atoms the same memory. High on purpose:
 # near-verbatim only. A false merge loses a memory; a missed near-dup only costs a
-# redundant atom, so we err toward keeping. Tuned against the test fake's
-# bag-of-words cosine (identical -> 1.0, one-word-different -> just under 1.0).
-DEDUP_THRESHOLD = 0.92
+# redundant atom, so we err toward keeping. Calibrated 2026-07-03 against local
+# BAAI/bge-small-en-v1.5 with 10 near-verbatim house-atom restatement pairs
+# (mean 0.9949, min 0.9863) and 10 distinct-but-related same-subsystem pairs
+# (mean 0.6974, max 0.8069). The recall harness owns final tuning.
+DEDUP_THRESHOLD = 0.96
 
 # How many recent live atoms a candidate is checked against. Bounds the scan on a
 # decades store; dedup is a recency phenomenon (see module docstring), so the
