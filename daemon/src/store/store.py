@@ -27,6 +27,7 @@ __all__ = [
     "supersede",
     "edgesFrom",
     "edgesTo",
+    "logRecall",
 ]
 
 _SCHEMA_PATH = Path(__file__).resolve().parent / "schema.sql"
@@ -167,6 +168,31 @@ def putAtom(store, atomInput):
         conn.rollback()
         raise
     return atomId
+
+
+def logRecall(store, atomIds, query=None, sourceRef=None, weight=1.0):
+    """Record one unprocessed recall_log row per returned atom id.
+
+    ``atomIds`` is the final served result set, already post-trim. The rows are a
+    single transaction so a failed telemetry write cannot leave a partial recall
+    event behind. Empty result sets are a no-op.
+    """
+    ids = list(atomIds)
+    if not ids:
+        return 0
+    conn = store._conn
+    now = _now()
+    try:
+        conn.executemany(
+            "INSERT INTO recall_log(id, atom_id, query, source_ref, weight, recorded_at) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            [(ulid(), atomId, query, sourceRef, weight, now) for atomId in ids],
+        )
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    return len(ids)
 
 
 def getAtom(store, atomId):

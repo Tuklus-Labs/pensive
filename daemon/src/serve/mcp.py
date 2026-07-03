@@ -48,6 +48,7 @@ from recall.payload import assembleTier2
 from store.store import (
     putAtom,
     getAtom,
+    logRecall,
     supersede,
     addFacet,
     facetsOf,
@@ -115,6 +116,7 @@ class ServeContext:
         self.defaultK = defaultK
         self.defaultTokenBudget = defaultTokenBudget
         self.index = FlatIndex()
+        self.recallLogErrors = 0
         self.reindex()
 
     def reindex(self):
@@ -196,6 +198,17 @@ def _truncateWords(text, limit=500):
     if len(words) > limit:
         return " ".join(words[:limit])
     return text
+
+
+def _returnedAtomIds(out):
+    return [r["atomId"] for r in out["results"]]
+
+
+def _logReturnedRecall(ctx, out, query, sourceRef):
+    try:
+        logRecall(ctx.store, _returnedAtomIds(out), query=query, sourceRef=sourceRef)
+    except Exception:  # noqa: BLE001 -- recall serving wins over telemetry
+        ctx.recallLogErrors += 1
 
 
 # --------------------------------------------------------------------------- #
@@ -308,7 +321,9 @@ def handle_pensive_recall(ctx, args):
         summary = _gistLine(atom["text"] if atom else "")
         tag = f"[{pct}%] ({src})" if src else f"[{pct}%]"
         lines.append(f"- {tag} {summary}")
-    return "\n".join(lines)
+    response = "\n".join(lines)
+    _logReturnedRecall(ctx, out, query, "mcp.pensive_recall")
+    return response
 
 
 def handle_pensive_analytics(ctx, args):
@@ -365,7 +380,9 @@ def handle_recall(ctx, args):
         project=project, timeScope=timeScope, kinds=kinds,
         k=k, tokenBudget=tokenBudget,
     )
-    return out["payload"]
+    response = out["payload"]
+    _logReturnedRecall(ctx, out, query, "mcp.recall")
+    return response
 
 
 def _supersessionChain(store, atomId):
