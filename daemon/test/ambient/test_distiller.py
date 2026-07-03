@@ -47,6 +47,7 @@ so the suite is fast and never touches the network or GPU.
 """
 from ambient.distiller import (
     distill, DISTILL_POLICY, VERBATIM_POLICY, SOURCE_CLAUDE_CODE, IMPORTANCE_CAP,
+    OrnithModelClient,
 )
 from ambient.dedup import dedup, DEDUP_THRESHOLD
 from ambient.segment import segment, KIND_EXPLICIT_EMIT
@@ -156,6 +157,22 @@ def _sourceRefs(store):
         row[0]
         for row in store._conn.execute(
             "SELECT source_ref FROM provenance ORDER BY id"
+        ).fetchall()
+    ]
+
+
+def _provenanceRows(store):
+    return [
+        {
+            "atomId": row[0],
+            "source": row[1],
+            "sessionId": row[2],
+            "agent": row[3],
+            "sourceRef": row[4],
+        }
+        for row in store._conn.execute(
+            "SELECT atom_id, source, session_id, agent, source_ref "
+            "FROM provenance ORDER BY id"
         ).fetchall()
     ]
 
@@ -325,6 +342,82 @@ def test_near_dup_bumps_not_inserts(store):
 
     assert atomCount(store) == 1
     assert result["inserted"] == 1 and result["bumped"] == 1
+
+
+def test_near_dup_replay_persists_ref_and_skips_model_on_second_pass(store):
+    class VaryingNearDupModelClient:
+        def __init__(self):
+            self.calls = []
+
+        def summarizeSpan(self, spanText):
+            self.calls.append(spanText)
+            stable = " ".join(["replay-stability"] * 120)
+            return {
+                "text": f"principle: {stable} model-call-{len(self.calls)}",
+                "kind": "atom",
+            }
+
+    model = VaryingNearDupModelClient()
+    embedder = FakeEmbedder()
+    first = "I'll persist near-dup provenance so replay hits the exact-ref gate."
+    second = "I'll persist near duplicate provenance so replay hits exact ref."
+    source = _sourceDeltas("sess-L", [
+        {"offset": 10, "events": [_assistantText(first)]},
+        {"offset": 20, "events": [_assistantText(second)]},
+    ], agent="codex-live")
+
+    firstPass = distill(store, source, model, embedder)
+    rowsAfterFirst = _provenanceRows(store)
+    replaySource = _sourceDeltas("sess-L", [
+        {"offset": 10, "events": [_assistantText(first)]},
+        {"offset": 20, "events": [_assistantText(second)]},
+    ], agent="codex-live")
+    secondPass = distill(store, replaySource, model, embedder)
+
+    assert firstPass["inserted"] == 1
+    assert firstPass["bumped"] == 1
+    assert len(model.calls) == 2
+    assert len(rowsAfterFirst) == 2
+    assert {row["sourceRef"] for row in rowsAfterFirst} == set(_sourceRefs(store))
+    assert {row["source"] for row in rowsAfterFirst} == {SOURCE_CLAUDE_CODE}
+    assert {row["sessionId"] for row in rowsAfterFirst} == {"sess-L"}
+    assert {row["agent"] for row in rowsAfterFirst} == {"codex-live"}
+    assert len({row["atomId"] for row in rowsAfterFirst}) == 1
+
+    assert secondPass["inserted"] == 0
+    assert secondPass["bumped"] == 2
+    assert atomCount(store) == 1
+    assert model.calls == [first, second]
+    assert _provenanceRows(store) == rowsAfterFirst
+
+
+def test_ornith_summarizer_uses_greedy_temperature(monkeypatch):
+    captured = {}
+
+    class FakeResponse:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, excType, exc, tb):
+            return False
+
+        def read(self):
+            return b'{"choices":[{"message":{"content":"principle: stable"},"finish_reason":"stop"}]}'
+
+    def fakeUrlopen(req, timeout):
+        captured["payload"] = json.loads(req.data.decode("utf-8"))
+        captured["timeout"] = timeout
+        return FakeResponse()
+
+    import json
+    import urllib.request
+    monkeypatch.setattr(urllib.request, "urlopen", fakeUrlopen)
+
+    client = OrnithModelClient(baseUrl="http://example.test/v1", timeout=3)
+
+    assert client.summarizeSpan("summarize this")["text"] == "principle: stable"
+    assert captured["payload"]["temperature"] == 0.0
+    assert captured["timeout"] == 3
 
 
 def test_same_explicit_offset_with_different_text_inserts_two_atoms(store):

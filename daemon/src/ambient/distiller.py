@@ -59,12 +59,14 @@ nothing here depends on a live 35B.
 import hashlib
 import json
 import sys
+import time
 import urllib.request
 from pathlib import Path
 
 from store.store import putAtom, addFacet
 from ambient.segment import segment, KIND_EXPLICIT_EMIT
 from ambient.dedup import dedup
+from util.ulid import ulid
 
 _REPO_SRC = Path(__file__).resolve().parents[3] / "src"
 if str(_REPO_SRC) not in sys.path:
@@ -162,7 +164,9 @@ class OrnithModelClient:
                 {"role": "user", "content": spanText},
             ],
             "max_tokens": self.maxTokens,
-            "temperature": 0.2,
+            # Dedup stability needs deterministic wording; these atoms are content,
+            # not prose-variety samples.
+            "temperature": 0.0,
         }
         data = json.dumps(payload).encode("utf-8")
         req = urllib.request.Request(
@@ -265,6 +269,57 @@ def _provenance(source, span):
     }
 
 
+def _provenanceForSource(source, span):
+    prov = _provenance(source, span)
+    agent = source.get("agent")
+    if agent:
+        prov["agent"] = agent
+    return prov
+
+
+def _attachProvenanceIfAbsent(store, atomId, source, span):
+    """Attach this span's provenance to an existing atom once.
+
+    Similarity dedup can merge a new span into an old atom. Recording the incoming
+    span's ref makes the next replay hit exact-ref idempotency before the model.
+    """
+    prov = _provenanceForSource(source, span)
+    if prov.get("sourceRef") is None:
+        return
+    conn = store._conn
+    existing = conn.execute(
+        "SELECT 1 FROM provenance WHERE atom_id = ? AND source = ? "
+        "AND session_id IS ? AND agent IS ? AND source_ref = ? LIMIT 1",
+        (
+            atomId,
+            prov["source"],
+            prov.get("sessionId"),
+            prov.get("agent"),
+            prov["sourceRef"],
+        ),
+    ).fetchone()
+    if existing is not None:
+        return
+    try:
+        conn.execute(
+            "INSERT INTO provenance(id, atom_id, source, session_id, agent, "
+            "source_ref, recorded_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (
+                ulid(),
+                atomId,
+                prov["source"],
+                prov.get("sessionId"),
+                prov.get("agent"),
+                prov["sourceRef"],
+                int(time.time()),
+            ),
+        )
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+
+
 def _newExtractor():
     return MegaExtractor(build_pattern_set(REAL_DATA_PATTERNS))
 
@@ -281,10 +336,7 @@ def _insertAtom(store, source, span, text, kind, extractor):
     Importance starts at 0.0 (earned, not assigned) -- accrual raises it later. The
     source's ``project``/``agent`` ride along when present. Store errors propagate
     loud (the decades rule: a failed write is real, not swallowed)."""
-    prov = _provenance(source, span)
-    agent = source.get("agent")
-    if agent:
-        prov["agent"] = agent
+    prov = _provenanceForSource(source, span)
     atomId = putAtom(store, {
         "text": text,
         "kind": kind,
@@ -421,6 +473,7 @@ def _distillSpan(store, source, span, model, embedder, extractor, result):
     verdict = dedup(store, embedder, text)
     if verdict["isDup"]:
         _accrueImportance(store, verdict["nearId"])
+        _attachProvenanceIfAbsent(store, verdict["nearId"], source, span)
         result["bumped"] += 1
         return
 
