@@ -30,6 +30,11 @@ Risk model (what could silently break, and the test that catches it):
   importance to infinity, breaking the ranking prior. The cap test feeds the same
   span 100x and asserts importance stops at the documented cap.
 
+- **Similarity bump tears before provenance attach.** A near-duplicate must bump
+  importance and attach the incoming span ref in the same transaction; otherwise a
+  crash between those writes makes replay miss exact-ref and bump twice. The
+  sabotage test raises between the update and insert and asserts neither persists.
+
 - **The verbatim seam regresses.** v3.1 will feed person-sourced material that must
   be preserved verbatim (no distillation, no dedup-merge). The seam test proves a
   policy='verbatim' source inserts EVERY span unmodified, never calls the model,
@@ -49,6 +54,7 @@ from ambient.distiller import (
     distill, DISTILL_POLICY, VERBATIM_POLICY, SOURCE_CLAUDE_CODE, IMPORTANCE_CAP,
     OrnithModelClient,
 )
+import ambient.distiller as distiller_module
 from ambient.dedup import dedup, DEDUP_THRESHOLD
 from ambient.segment import segment, KIND_EXPLICIT_EMIT
 from store.store import openStore, putAtom, getAtom, atomCount, facetsOf
@@ -389,6 +395,60 @@ def test_near_dup_replay_persists_ref_and_skips_model_on_second_pass(store):
     assert atomCount(store) == 1
     assert model.calls == [first, second]
     assert _provenanceRows(store) == rowsAfterFirst
+
+
+def test_near_dup_bump_and_provenance_attach_are_atomic(monkeypatch, store):
+    class StableNearDupModelClient:
+        def __init__(self):
+            self.calls = []
+
+        def summarizeSpan(self, spanText):
+            self.calls.append(spanText)
+            stable = " ".join(["atomic-bump-provenance"] * 120)
+            return {
+                "text": f"principle: {stable} model-call-{len(self.calls)}",
+                "kind": "atom",
+            }
+
+    model = StableNearDupModelClient()
+    embedder = FakeEmbedder()
+    first = "I'll make similarity bump provenance atomic."
+    second = "I'll make similar bump provenance attach atomic."
+    firstPass = distill(
+        store,
+        _source("sess-AT", [_assistantText(first)], offset=10),
+        model,
+        embedder,
+    )
+    atomId = firstPass["atomIds"][0]
+    before = getAtom(store, atomId)
+    rowsBefore = _provenanceRows(store)
+
+    def failBeforeAttach(*args, **kwargs):
+        raise RuntimeError("sabotage: fail before provenance insert")
+
+    monkeypatch.setattr(
+        distiller_module,
+        "_attachProvenanceIfAbsent",
+        failBeforeAttach,
+    )
+    with pytest.raises(RuntimeError, match="sabotage"):
+        distill(
+            store,
+            _source("sess-AT", [_assistantText(second)], offset=20),
+            model,
+            embedder,
+        )
+
+    after = getAtom(store, atomId)
+    assert after["importance"] == before["importance"], (
+        "similarity bump and provenance attach must roll back together: "
+        f"before={before['importance']!r} after={after['importance']!r}"
+    )
+    assert _provenanceRows(store) == rowsBefore, (
+        "failed similarity bump transaction must not leak provenance rows: "
+        f"rows={_provenanceRows(store)!r}"
+    )
 
 
 def test_ornith_summarizer_uses_greedy_temperature(monkeypatch):

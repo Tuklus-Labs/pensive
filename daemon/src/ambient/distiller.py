@@ -238,15 +238,30 @@ def _existingBySourceRef(store, sourceRef):
     return row[0] if row else None
 
 
-def _accrueImportance(store, atomId, increment=IMPORTANCE_BUMP, cap=IMPORTANCE_CAP):
+def _accrueImportance(
+    store,
+    atomId,
+    increment=IMPORTANCE_BUMP,
+    cap=IMPORTANCE_CAP,
+    commit=True,
+):
     """Raise a live atom's importance by ``increment``, clamped to ``cap``.
 
     The anti-storm bump: a re-tail or near-dup is reinforcement, not a new memory,
     so the existing atom gets more important instead of a duplicate being written.
     ``MIN(cap, importance + increment)`` is a scalar min in SQLite, so importance
     can never exceed ``cap`` no matter how many times a span recurs. Only touches
-    live atoms (a retired atom is not reinforced). One committed UPDATE."""
+    live atoms (a retired atom is not reinforced). By default this is one
+    committed UPDATE; callers can set ``commit=False`` to fold it into a larger
+    transaction."""
     conn = store._conn
+    if not commit:
+        conn.execute(
+            "UPDATE atoms SET importance = MIN(?, importance + ?) "
+            "WHERE id = ? AND status = 'live'",
+            (cap, increment, atomId),
+        )
+        return
     try:
         conn.execute(
             "UPDATE atoms SET importance = MIN(?, importance + ?) "
@@ -277,11 +292,12 @@ def _provenanceForSource(source, span):
     return prov
 
 
-def _attachProvenanceIfAbsent(store, atomId, source, span):
+def _attachProvenanceIfAbsent(store, atomId, source, span, commit=True):
     """Attach this span's provenance to an existing atom once.
 
     Similarity dedup can merge a new span into an old atom. Recording the incoming
     span's ref makes the next replay hit exact-ref idempotency before the model.
+    The duplicate-row check belongs in the same transaction as the insert.
     """
     prov = _provenanceForSource(source, span)
     if prov.get("sourceRef") is None:
@@ -300,6 +316,21 @@ def _attachProvenanceIfAbsent(store, atomId, source, span):
     ).fetchone()
     if existing is not None:
         return
+    if not commit:
+        conn.execute(
+            "INSERT INTO provenance(id, atom_id, source, session_id, agent, "
+            "source_ref, recorded_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (
+                ulid(),
+                atomId,
+                prov["source"],
+                prov.get("sessionId"),
+                prov.get("agent"),
+                prov["sourceRef"],
+                int(time.time()),
+            ),
+        )
+        return
     try:
         conn.execute(
             "INSERT INTO provenance(id, atom_id, source, session_id, agent, "
@@ -314,6 +345,18 @@ def _attachProvenanceIfAbsent(store, atomId, source, span):
                 int(time.time()),
             ),
         )
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+
+
+def _accrueImportanceAndAttachProvenance(store, atomId, source, span):
+    """Atomically reinforce a near-duplicate and record its incoming span ref."""
+    conn = store._conn
+    try:
+        _accrueImportance(store, atomId, commit=False)
+        _attachProvenanceIfAbsent(store, atomId, source, span, commit=False)
         conn.commit()
     except Exception:
         conn.rollback()
@@ -472,8 +515,7 @@ def _distillSpan(store, source, span, model, embedder, extractor, result):
 
     verdict = dedup(store, embedder, text)
     if verdict["isDup"]:
-        _accrueImportance(store, verdict["nearId"])
-        _attachProvenanceIfAbsent(store, verdict["nearId"], source, span)
+        _accrueImportanceAndAttachProvenance(store, verdict["nearId"], source, span)
         result["bumped"] += 1
         return
 
