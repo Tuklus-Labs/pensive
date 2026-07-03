@@ -34,6 +34,9 @@ MODEL_ID = gate_mod.MODEL_ID
 ASSOC_SEED_K = 20
 ASSOC_SIGNAL_K = 200
 SPEC_POWER = 1.0
+FACET_ASSOC_KEYS = ("entity", "tag")
+HUB_CAP = 128
+MAX_SEED_FACETS = 32
 _PARITY_KEYS = (
     "r_at_1",
     "r_at_5",
@@ -46,10 +49,27 @@ _PARITY_KEYS = (
 
 
 def assocSignal(store, seedAtomIds, k):
-    """Two-hop specificity-damped association walk -> ``[(atomId, score)]``.
+    """Specificity-damped association walk -> ``[(atomId, score)]``.
 
-    Formula, for every seed ``s``, through-node ``t`` adjacent to ``s``, and
-    second-hop candidate ``c`` adjacent to ``t``:
+    Facet co-occurrence is the primary adjacency because the v3 store derives
+    facet back-edges instead of materializing them. For each seed ``s``, facet
+    ``f``, and candidate ``c`` sharing ``f``:
+
+        contribution(s,f,c) = 1 / degree(f)^SPEC_POWER
+
+    ``FACET_ASSOC_KEYS`` is intentionally limited to ``entity`` and ``tag``:
+    entities are the most specific semantic anchors, while tags carry curated
+    scopes such as source/session labels. Project/era facets are broader
+    filters elsewhere in recall, so treating them as assoc edges would mostly
+    create hubs. Facets whose live-atom degree exceeds ``HUB_CAP`` are skipped
+    because their damped contribution is negligible and their fanout is costly.
+    The per-seed facet scan is also capped at ``MAX_SEED_FACETS`` ordered
+    key/value rows, bounding derived neighbor work to
+    ``MAX_SEED_FACETS * HUB_CAP`` candidates per seed.
+
+    Stored edge rows, when present, are a bonus signal and keep the original
+    two-hop formula. For every seed ``s``, through-atom ``t`` adjacent to ``s``,
+    and second-hop candidate ``c`` adjacent to ``t``:
 
         contribution(s,t,c) = weight(s,t) * weight(t,c) / degree(t)^SPEC_POWER
 
@@ -60,7 +80,7 @@ def assocSignal(store, seedAtomIds, k):
     build-phase experiment: strong edge weights can still matter, but hub paths
     must pay for every extra neighbor. The walk is deterministic: no sampling,
     score-descending order, atom-id tie-break, and seeds/through nodes excluded
-    from the returned candidates.
+    from the stored-edge two-hop returned candidates.
 
     Edges use logical undirected semantics for this eval walk. Mirrored physical
     rows between the same endpoints and type are one logical edge at max weight;
@@ -78,6 +98,11 @@ def assocSignal(store, seedAtomIds, k):
 
     scores = defaultdict(float)
     for seed in seeds:
+        for candidate, contribution in _facetCooccurrenceNeighbors(store, seed):
+            if candidate in seedSet:
+                continue
+            scores[candidate] += contribution
+
         for through, firstWeight, _firstType, _throughLive in _neighbors(store, seed):
             if through in seedSet:
                 continue
@@ -165,6 +190,7 @@ def gateWithAssoc(
     assoc, assocRankings = _assocWithRankings(
         store, index, embedder, queries, recallK
     )
+    _assertAssocNotInert(store, baselineRankings, assocRankings)
     if returnBaselineRankings:
         return assoc, baselineRankings, assocRankings
     return assoc, assocRankings
@@ -186,7 +212,7 @@ def runChat(exportDir, dbPath, nQueries, embedder, log):
         bm25 = gate_mod.bm25Baseline(corpusRefs, corpusTexts, queries)
         return _experimentReport(
             len(records), stats, baseline, assoc, bm25, queries,
-            baselineRankings, assocRankings,
+            baselineRankings, assocRankings, _derivedGraphStats(store),
         )
     finally:
         store.close()
@@ -213,7 +239,7 @@ def runAtoms(exportPath, dbPath, clusterKey, nQueries, embedder, log,
         bm25 = gate_mod.bm25Baseline(corpusRefs, corpusTexts, queries)
         report = _experimentReport(
             len(records), stats, baseline, assoc, bm25, queries,
-            baselineRankings, assocRankings,
+            baselineRankings, assocRankings, _derivedGraphStats(store),
         )
         report["cluster_key"] = clusterKey
         report["eligible_queries"] = eligible
@@ -286,6 +312,96 @@ def _neighbors(store, atomId):
     for neighbor, weight, edgeType in byLogicalEdge.values():
         out.append((neighbor, weight, edgeType, statuses.get(neighbor) == "live"))
     return sorted(out, key=lambda item: (item[0], item[2]))
+
+
+def _facetCooccurrenceNeighbors(store, atomId):
+    rows = store._conn.execute(
+        """
+        WITH seed_facets AS (
+            SELECT key, value
+            FROM facets
+            WHERE atom_id = ?
+              AND key IN (?, ?)
+            ORDER BY CASE key WHEN 'entity' THEN 0 ELSE 1 END, value
+            LIMIT ?
+        ),
+        facet_degree AS (
+            SELECT sf.key, sf.value, COUNT(DISTINCT f.atom_id) AS degree
+            FROM seed_facets sf
+            JOIN facets f ON f.key = sf.key AND f.value = sf.value
+            JOIN atoms a ON a.id = f.atom_id
+            WHERE a.status = 'live'
+            GROUP BY sf.key, sf.value
+            HAVING degree > 1 AND degree <= ?
+        )
+        SELECT f.atom_id, d.degree
+        FROM facet_degree d
+        JOIN facets f ON f.key = d.key AND f.value = d.value
+        JOIN atoms a ON a.id = f.atom_id
+        WHERE a.status = 'live'
+          AND f.atom_id != ?
+        ORDER BY f.atom_id
+        """,
+        (
+            atomId,
+            FACET_ASSOC_KEYS[0],
+            FACET_ASSOC_KEYS[1],
+            MAX_SEED_FACETS,
+            HUB_CAP,
+            atomId,
+        ),
+    ).fetchall()
+    scores = defaultdict(float)
+    for neighbor, degree in rows:
+        scores[neighbor] += 1.0 / (degree ** SPEC_POWER)
+    return sorted(scores.items(), key=lambda item: item[0])
+
+
+def _derivedGraphStats(store):
+    rows = store._conn.execute(
+        """
+        WITH facet_degree AS (
+            SELECT f.key, f.value, COUNT(DISTINCT f.atom_id) AS degree
+            FROM facets f
+            JOIN atoms a ON a.id = f.atom_id
+            WHERE f.key IN (?, ?)
+              AND a.status = 'live'
+            GROUP BY f.key, f.value
+            HAVING degree > 1 AND degree <= ?
+        )
+        SELECT COALESCE(SUM(degree * (degree - 1)), 0)
+        FROM facet_degree
+        """,
+        (FACET_ASSOC_KEYS[0], FACET_ASSOC_KEYS[1], HUB_CAP),
+    ).fetchone()
+    totalPairs = rows[0] if rows else 0
+    rows = store._conn.execute(
+        """
+        WITH facet_degree AS (
+            SELECT f.key, f.value, COUNT(DISTINCT f.atom_id) AS degree
+            FROM facets f
+            JOIN atoms a ON a.id = f.atom_id
+            WHERE f.key IN (?, ?)
+              AND a.status = 'live'
+            GROUP BY f.key, f.value
+            HAVING degree > 1 AND degree <= ?
+        )
+        SELECT COUNT(DISTINCT f.atom_id)
+        FROM facets f
+        JOIN atoms a ON a.id = f.atom_id
+        JOIN facet_degree d ON d.key = f.key AND d.value = f.value
+        WHERE a.status = 'live'
+        """,
+        (FACET_ASSOC_KEYS[0], FACET_ASSOC_KEYS[1], HUB_CAP),
+    ).fetchone()
+    seedsWithNeighbors = rows[0] if rows else 0
+    return {
+        "facet_keys": list(FACET_ASSOC_KEYS),
+        "hub_cap": HUB_CAP,
+        "max_seed_facets": MAX_SEED_FACETS,
+        "seeds_with_neighbors": seedsWithNeighbors,
+        "derived_neighbor_pairs": totalPairs,
+    }
 
 
 def _logicalEdgeKey(atomId, neighbor, edgeType):
@@ -366,6 +482,27 @@ def _assertGateParity(gateBaseline, experimentClone):
             f"{baseline} != experiment clone metrics {clone}; aborting "
             "without emitting an assoc experiment report"
         )
+
+
+def _assertAssocNotInert(store, baselineRankings, assocRankings):
+    queryCount = max(len(baselineRankings), len(assocRankings))
+    if queryCount == 0:
+        return
+    differ = sum(
+        1 for baseline, assoc in zip(baselineRankings, assocRankings)
+        if baseline != assoc
+    )
+    differ += abs(len(baselineRankings) - len(assocRankings))
+    if differ:
+        return
+    stats = _derivedGraphStats(store)
+    raise RuntimeError(
+        "assoc arm inert: "
+        f"{differ}/{queryCount} queries differ; refusing to emit a normal "
+        "assoc experiment report; "
+        f"seeds_with_neighbors={stats['seeds_with_neighbors']}; "
+        f"derived_neighbor_pairs={stats['derived_neighbor_pairs']}"
+    )
 
 
 def _parityMetrics(metrics):
@@ -496,6 +633,7 @@ def _experimentReport(
     queries,
     baselineRankings,
     assocRankings,
+    derivedGraphStats=None,
 ):
     comparison = {
         "baseline": baseline,
@@ -514,9 +652,12 @@ def _experimentReport(
         "delta": comparison["delta"],
         "assoc_seed_k": ASSOC_SEED_K,
         "assoc_damping_formula": (
-            "weight(s,t) * weight(t,c) / degree(t)^SPEC_POWER; "
-            f"SPEC_POWER={SPEC_POWER}; degree=count(unique incident neighbors)"
+            "facet: 1 / degree(f)^SPEC_POWER for shared entity/tag facets; "
+            "stored edges: weight(s,t) * weight(t,c) / degree(t)^SPEC_POWER; "
+            f"SPEC_POWER={SPEC_POWER}; degree=count(live atoms or unique "
+            "incident neighbors)"
         ),
+        "assoc_derived_graph": derivedGraphStats or {},
         "temporal_neighborhood": comparison["temporal_neighborhood"],
     }
 

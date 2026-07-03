@@ -69,20 +69,26 @@ Sabotage log:
 Loudness audit: every assertion below includes a rule-naming failure message.
 """
 
-from store.store import addEdge, openStore, putAtom
+from store.store import addEdge, addFacet, openStore, putAtom
 
 from eval.assoc_experiment import (
+    HUB_CAP,
     assocSignal,
     compareMetrics,
     gateWithAssoc,
     _experimentReport,
+    _recallWithAssoc,
 )
 
 
-def _put(store, text):
+def _put(store, text, source_ref=None):
     return putAtom(
         store,
-        {"text": text, "kind": "atom", "provenance": {"source": "test"}},
+        {
+            "text": text,
+            "kind": "atom",
+            "provenance": {"source": "bulk-import", "sourceRef": source_ref},
+        },
     )
 
 
@@ -106,6 +112,66 @@ def test_assoc_signal_finds_specific_two_hop_neighbor(tmp_path):
             "two-hop-only invariant violated: expected only the second-hop "
             f"candidate={candidate}, got ranked={ranked}, seed={seed}, "
             f"through={through}"
+        )
+    finally:
+        store.close()
+
+
+def test_assoc_signal_finds_facet_cooccurrence_neighbors_without_edges(tmp_path):
+    # risk: derived-facet-back-edges
+    store = _open(tmp_path)
+    try:
+        seed = _put(store, "seed")
+        rare_neighbor = _put(store, "rare neighbor")
+        tag_neighbor = _put(store, "tag neighbor")
+        other_rare = _put(store, "other rare")
+        addFacet(store, seed, "entity", "rare-entity")
+        addFacet(store, rare_neighbor, "entity", "rare-entity")
+        addFacet(store, other_rare, "entity", "rare-entity")
+        addFacet(store, seed, "tag", "shared-tag")
+        addFacet(store, tag_neighbor, "tag", "shared-tag")
+
+        ranked = assocSignal(store, [seed], k=10)
+        scores = dict(ranked)
+
+        assert scores[rare_neighbor] == 1 / 3, (
+            "derived-facet-back-edges violated: entity co-occurrence should "
+            f"score by inverse facet degree, ranked={ranked}"
+        )
+        assert scores[other_rare] == 1 / 3, (
+            "derived-facet-back-edges violated: all live atoms sharing the "
+            f"entity facet should be returned, ranked={ranked}"
+        )
+        assert scores[tag_neighbor] == 1 / 2, (
+            "derived-facet-back-edges violated: tag co-occurrence should "
+            f"participate with its own inverse degree, ranked={ranked}"
+        )
+        assert seed not in scores, (
+            "derived-facet-back-edges violated: seed atom must not be emitted, "
+            f"ranked={ranked}"
+        )
+    finally:
+        store.close()
+
+
+def test_assoc_signal_skips_facet_hubs_without_edges(tmp_path):
+    # risk: hub-cap
+    store = _open(tmp_path)
+    try:
+        seed = _put(store, "seed")
+        addFacet(store, seed, "entity", "too-common")
+        hub_neighbors = []
+        for i in range(HUB_CAP):
+            neighbor = _put(store, f"hub neighbor {i}")
+            hub_neighbors.append(neighbor)
+            addFacet(store, neighbor, "entity", "too-common")
+
+        ranked = assocSignal(store, [seed], k=10)
+
+        assert ranked == [], (
+            "hub-cap violated: facet degree above HUB_CAP should be skipped "
+            f"rather than producing near-zero hub candidates, ranked={ranked}, "
+            f"hub_degree={len(hub_neighbors) + 1}, HUB_CAP={HUB_CAP}"
         )
     finally:
         store.close()
@@ -437,3 +503,118 @@ def test_gate_with_assoc_raises_when_without_arm_diverges_from_gate_baseline(mon
             "arm-parity-divergent-clone violated: gateWithAssoc must abort "
             "when the without-arm clone diverges from gate.py baseline"
         )
+
+
+def test_gate_with_assoc_differs_on_facets_only_candidate_pool(monkeypatch, tmp_path):
+    # risk: facets-only-arm-differs
+    store = _open(tmp_path)
+    try:
+        seed = _put(store, "seed", source_ref="seed-ref")
+        promoted = _put(store, "promoted", source_ref="promoted-ref")
+        addFacet(store, seed, "entity", "shared")
+        addFacet(store, promoted, "entity", "shared")
+        queries = [{"query": "shared", "relevant": {"promoted-ref"}, "own": set()}]
+
+        baseline_result = {
+            "results": [{"atomId": seed}],
+            "payload": "",
+            "tokensUsed": 0,
+            "lowConfidence": False,
+        }
+
+        monkeypatch.setattr(
+            "eval.assoc_experiment.gate_mod.gate",
+            lambda store, index, embedder, queries: {
+                "r_at_1": 0.0,
+                "r_at_5": 0.0,
+                "r_at_10": 0.0,
+                "r_at_20": 0.0,
+                "mrr_at_10": 0.0,
+                "n": 1,
+                "low_confidence_rate": 0.0,
+            },
+        )
+        monkeypatch.setattr(
+            "eval.assoc_experiment.gate_mod.recall",
+            lambda store, index, embedder, query, k=10: baseline_result,
+        )
+        monkeypatch.setattr("eval.assoc_experiment.bm25", lambda store, query, k: [(seed, 1.0)])
+        monkeypatch.setattr("eval.assoc_experiment.dense", lambda index, embedder, query, k: [])
+        monkeypatch.setattr(
+            "eval.assoc_experiment.rerank",
+            lambda query, fused, store: [{"atomId": atom_id, "score": score} for atom_id, score in fused],
+        )
+        monkeypatch.setattr("eval.assoc_experiment.assessTrust", lambda ranked, signal_hits, store, now: ranked)
+        monkeypatch.setattr("eval.assoc_experiment.assemblePayload", lambda store, results, token_budget: ("", 0, False))
+
+        assoc, baseline_rankings, assoc_rankings = gateWithAssoc(
+            store, object(), object(), queries, returnBaselineRankings=True
+        )
+
+        assert baseline_rankings == [["seed-ref"]], (
+            "facets-only-arm-differs violated: without arm should only rank "
+            f"the lexical seed, baseline_rankings={baseline_rankings}"
+        )
+        assert "promoted-ref" in assoc_rankings[0], (
+            "facets-only-arm-differs violated: derived facet neighbor must "
+            f"enter assoc candidate pool, assoc_rankings={assoc_rankings}, assoc={assoc}"
+        )
+        assert baseline_rankings != assoc_rankings, (
+            "facets-only-arm-differs violated: assoc arm should not be byte-"
+            f"identical on a facets-only graph, assoc_rankings={assoc_rankings}"
+        )
+    finally:
+        store.close()
+
+
+def test_gate_with_assoc_raises_when_assoc_arm_is_inert(monkeypatch, tmp_path):
+    # risk: assoc-arm-inertness
+    store = _open(tmp_path)
+    try:
+        seed = _put(store, "seed")
+        neighbor = _put(store, "facet neighbor")
+        addFacet(store, seed, "entity", "shared")
+        addFacet(store, neighbor, "entity", "shared")
+        metrics = {
+            "r_at_1": 1.0,
+            "r_at_5": 1.0,
+            "r_at_10": 1.0,
+            "r_at_20": 1.0,
+            "mrr_at_10": 1.0,
+            "n": 1,
+            "low_confidence_rate": 0.0,
+        }
+        rankings = [["same"]]
+
+        monkeypatch.setattr(
+            "eval.assoc_experiment.gate_mod.gate",
+            lambda store, index, embedder, queries: metrics,
+        )
+        monkeypatch.setattr(
+            "eval.assoc_experiment._baselineWithRankings",
+            lambda store, index, embedder, queries, recallK=None: (metrics, rankings),
+        )
+        monkeypatch.setattr(
+            "eval.assoc_experiment._assocWithRankings",
+            lambda store, index, embedder, queries, recallK=None: (metrics, rankings),
+        )
+
+        try:
+            gateWithAssoc(store, object(), object(), [{"query": "q", "relevant": {"same"}, "own": set()}])
+        except RuntimeError as exc:
+            msg = str(exc)
+            assert "assoc arm inert" in msg and "0/1 queries differ" in msg, (
+                "assoc-arm-inertness violated: inert arm error must name the "
+                f"identical-ranking count, error={exc}"
+            )
+            assert "seeds_with_neighbors=2" in msg and "derived_neighbor_pairs=2" in msg, (
+                "assoc-arm-inertness violated: inert arm error must include "
+                f"derived graph diagnostics, error={exc}"
+            )
+        else:
+            raise AssertionError(
+                "assoc-arm-inertness violated: gateWithAssoc must abort when "
+                "baseline and assoc rankings are identical for every query"
+            )
+    finally:
+        store.close()
