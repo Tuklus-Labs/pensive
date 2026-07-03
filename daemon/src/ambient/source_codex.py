@@ -37,16 +37,17 @@ def codexSource(logPath):
     """Adapt one Codex CLI session JSONL log to a distiller transcript source."""
     path = Path(logPath)
     sessionId = path.stem
-    pending = []
+    records = []
 
     try:
-        lines = path.open("r", encoding="utf-8")
+        lines = path.open("rb")
     except OSError:
         raise
 
     with lines:
-        for lineNumber, line in enumerate(lines, 1):
+        for lineNumber, lineBytes in enumerate(lines, 1):
             try:
+                line = lineBytes.decode("utf-8")
                 record = json.loads(line)
             except (json.JSONDecodeError, UnicodeDecodeError):
                 continue
@@ -63,14 +64,27 @@ def codexSource(logPath):
                     sessionId = candidate
                 continue
 
-            event = _eventFromRecord(record, payload)
-            if event is None:
-                continue
-            pending.append({
-                "sessionId": sessionId,
-                "offset": lineNumber,
-                "events": [event],
-            })
+            records.append((lineNumber, record, payload))
+
+    hasResponseItemMessages = any(
+        record.get("type") == "response_item" and payload.get("type") in _MESSAGE_TYPES
+        for _, record, payload in records
+    )
+
+    pending = []
+    for lineNumber, record, payload in records:
+        event = _eventFromRecord(
+            record,
+            payload,
+            allowAssistantEventMessages=not hasResponseItemMessages,
+        )
+        if event is None:
+            continue
+        pending.append({
+            "sessionId": sessionId,
+            "offset": lineNumber,
+            "events": [event],
+        })
 
     for delta in pending:
         delta["sessionId"] = sessionId
@@ -91,16 +105,26 @@ def _sessionId(payload):
     return None
 
 
-def _eventFromRecord(record, payload):
+def _eventFromRecord(record, payload, allowAssistantEventMessages):
     recordType = record.get("type")
     payloadType = payload.get("type")
 
     if recordType == "response_item" and payloadType in _MESSAGE_TYPES:
         return _messageEvent(payload)
-    if recordType == "event_msg" and payloadType in _ASSISTANT_EVENT_TYPES:
+    if (
+        allowAssistantEventMessages
+        and recordType == "event_msg"
+        and payloadType in _ASSISTANT_EVENT_TYPES
+    ):
         return _plainEvent("assistant", payload.get("message"), output=True)
     if recordType == "event_msg" and payloadType in _USER_EVENT_TYPES:
         return _plainEvent("user", payload.get("message"), output=False)
+    if recordType == "response_item" and payloadType == "reasoning":
+        # 2026-07 scan: Codex reasoning records had encrypted content and empty
+        # summaries in 809/809 cases, leaving no plaintext transcript to map.
+        # If future Codex writes non-empty summary texts, map each summary text
+        # as assistant text and let distiller heuristics decide what to keep.
+        return None
     if recordType == "response_item" and payloadType in _TOOL_CALL_TYPES:
         return _toolUseEvent(payload)
     if (

@@ -231,3 +231,267 @@ def test_codex_source_falls_back_to_filename_for_missing_session(tmp_path):
     assert source["deltas"][0]["sessionId"] == "rollout-synthetic-fallback", (
         f"delta session fallback contract violated: deltas={source['deltas']}"
     )
+
+
+def test_response_item_messages_are_canonical_when_event_messages_duplicate(tmp_path):
+    logPath = tmp_path / "rollout-duplicate-assistant-families.jsonl"
+    logPath.write_text(_codex_log(
+        _line({
+            "type": "response_item",
+            "payload": {
+                "type": "message",
+                "role": "assistant",
+                "content": [{"type": "output_text", "text": "Use the canonical answer."}],
+            },
+        }),
+        _line({
+            "type": "event_msg",
+            "payload": {
+                "type": "agent_message",
+                "message": "Use the canonical answer.",
+            },
+        }),
+        _line({
+            "type": "response_item",
+            "payload": {
+                "type": "message",
+                "role": "assistant",
+                "content": [{"type": "output_text", "text": "Use the second answer."}],
+            },
+        }),
+        _line({
+            "type": "event_msg",
+            "payload": {
+                "type": "agent_message",
+                "message": "Use the second answer.",
+            },
+        }),
+    ), encoding="utf-8")
+
+    source = codexSource(logPath)
+
+    assert [delta["offset"] for delta in source["deltas"]] == [1, 3], (
+        f"response_item canonical family violated: deltas={source['deltas']}"
+    )
+    assert [
+        delta["events"][0]["content"][0]["text"]
+        for delta in source["deltas"]
+    ] == ["Use the canonical answer.", "Use the second answer."]
+
+
+def test_agent_message_events_are_fallback_when_response_item_messages_absent(tmp_path):
+    logPath = tmp_path / "rollout-agent-message-fallback.jsonl"
+    logPath.write_text(_codex_log(
+        _line({
+            "type": "event_msg",
+            "payload": {
+                "type": "agent_message",
+                "message": "Fallback assistant text.",
+            },
+        }),
+        _line({
+            "type": "event_msg",
+            "payload": {
+                "type": "agent_message",
+                "message": "Second fallback assistant text.",
+            },
+        }),
+    ), encoding="utf-8")
+
+    source = codexSource(logPath)
+
+    assert [delta["offset"] for delta in source["deltas"]] == [1, 2]
+    assert [
+        delta["events"][0]["content"][0]["text"]
+        for delta in source["deltas"]
+    ] == ["Fallback assistant text.", "Second fallback assistant text."]
+
+
+def test_event_user_message_maps_to_user_text_event(tmp_path):
+    logPath = tmp_path / "rollout-event-user-message.jsonl"
+    logPath.write_text(_codex_log(
+        _line({
+            "type": "event_msg",
+            "payload": {
+                "type": "user_message",
+                "message": "User-side event text.",
+            },
+        }),
+    ), encoding="utf-8")
+
+    source = codexSource(logPath)
+
+    assert source["deltas"] == [{
+        "sessionId": "rollout-event-user-message",
+        "offset": 1,
+        "events": [{
+            "role": "user",
+            "content": [{"type": "text", "text": "User-side event text."}],
+        }],
+    }]
+
+
+def test_session_meta_id_is_used_when_session_id_is_absent(tmp_path):
+    logPath = tmp_path / "rollout-id-only-meta.jsonl"
+    logPath.write_text(_codex_log(
+        _line({
+            "type": "session_meta",
+            "payload": {"id": "id-only-session"},
+        }),
+        _line({
+            "type": "response_item",
+            "payload": {
+                "type": "message",
+                "role": "assistant",
+                "content": [{"type": "output_text", "text": "Meta id fallback."}],
+            },
+        }),
+    ), encoding="utf-8")
+
+    source = codexSource(logPath)
+
+    assert source["sessionId"] == "id-only-session"
+    assert source["deltas"][0]["sessionId"] == "id-only-session"
+
+
+def test_empty_codex_log_yields_empty_deltas(tmp_path):
+    logPath = tmp_path / "rollout-empty.jsonl"
+    logPath.write_text("", encoding="utf-8")
+
+    source = codexSource(logPath)
+
+    assert source == {
+        "sessionId": "rollout-empty",
+        "source": "codex",
+        "policy": "distill",
+        "deltas": [],
+    }
+
+
+def test_custom_tool_call_and_web_search_call_map_to_tool_use(tmp_path):
+    logPath = tmp_path / "rollout-tool-branches.jsonl"
+    logPath.write_text(_codex_log(
+        _line({
+            "type": "response_item",
+            "payload": {
+                "type": "custom_tool_call",
+                "id": "custom-1",
+                "name": "custom-tool",
+                "input": {"needle": "synthetic"},
+            },
+        }),
+        _line({
+            "type": "response_item",
+            "payload": {
+                "type": "web_search_call",
+                "id": "search-1",
+                "action": "search",
+                "status": "completed",
+            },
+        }),
+    ), encoding="utf-8")
+
+    source = codexSource(logPath)
+
+    assert source["deltas"] == [
+        {
+            "sessionId": "rollout-tool-branches",
+            "offset": 1,
+            "events": [{
+                "role": "assistant",
+                "content": [{
+                    "type": "tool_use",
+                    "name": "custom-tool",
+                    "input": {"needle": "synthetic"},
+                    "id": "custom-1",
+                }],
+            }],
+        },
+        {
+            "sessionId": "rollout-tool-branches",
+            "offset": 2,
+            "events": [{
+                "role": "assistant",
+                "content": [{
+                    "type": "tool_use",
+                    "name": "search",
+                    "input": {"action": "search", "status": "completed"},
+                    "id": "search-1",
+                }],
+            }],
+        },
+    ]
+
+
+@pytest.mark.parametrize("role", ["developer", "system"])
+def test_developer_and_system_messages_map_to_user_role(tmp_path, role):
+    logPath = tmp_path / f"rollout-{role}-role.jsonl"
+    logPath.write_text(_codex_log(
+        _line({
+            "type": "response_item",
+            "payload": {
+                "type": "message",
+                "role": role,
+                "content": [{"type": "input_text", "text": f"{role} instruction."}],
+            },
+        }),
+    ), encoding="utf-8")
+
+    source = codexSource(logPath)
+
+    assert source["deltas"][0]["events"][0] == {
+        "role": "user",
+        "content": [{"type": "text", "text": f"{role} instruction."}],
+    }
+
+
+def test_reasoning_record_with_empty_summary_is_excluded(tmp_path):
+    logPath = tmp_path / "rollout-empty-reasoning.jsonl"
+    logPath.write_text(_codex_log(
+        _line({
+            "type": "response_item",
+            "payload": {
+                "type": "reasoning",
+                "id": "reasoning-1",
+                "encrypted_content": "synthetic-encrypted-content",
+                "summary": [],
+            },
+        }),
+    ), encoding="utf-8")
+
+    source = codexSource(logPath)
+
+    assert source["deltas"] == []
+
+
+def test_torn_multibyte_line_is_skipped_without_losing_valid_lines(tmp_path):
+    logPath = tmp_path / "rollout-torn-multibyte.jsonl"
+    validBefore = _line({
+        "type": "response_item",
+        "payload": {
+            "type": "message",
+            "role": "assistant",
+            "content": [{"type": "output_text", "text": "Before torn bytes."}],
+        },
+    }).encode("utf-8")
+    torn = (
+        b'{"type":"response_item","payload":{"type":"message","role":"assistant",'
+        b'"content":[{"type":"output_text","text":"torn \xe2\x82'
+    )
+    validAfter = _line({
+        "type": "response_item",
+        "payload": {
+            "type": "message",
+            "role": "assistant",
+            "content": [{"type": "output_text", "text": "After torn bytes."}],
+        },
+    }).encode("utf-8")
+    logPath.write_bytes(validBefore + b"\n" + torn + b"\n" + validAfter + b"\n")
+
+    source = codexSource(logPath)
+
+    assert [delta["offset"] for delta in source["deltas"]] == [1, 3]
+    assert [
+        delta["events"][0]["content"][0]["text"]
+        for delta in source["deltas"]
+    ] == ["Before torn bytes.", "After torn bytes."]
