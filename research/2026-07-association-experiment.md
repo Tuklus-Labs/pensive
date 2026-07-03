@@ -120,3 +120,25 @@ tree to re-measure once the cache exists.
 `("entity","tag")`, max-weight logical-edge dedupe. These are eval-tuned
 starting points; the serving harness owns final tuning against the p95
 budget.
+
+## Addendum (2026-07-03): the v2-stack row
+
+Gary asked for the literal head-to-head before cutover. The live legacy
+serving path (:8011 embed -> :8009 FAISS, the stack v3 replaces) was
+benchmarked on the SAME 500 sibling queries, same seed, same metrics
+code (eval/legacy-atoms.json):
+
+| system | R@1 | R@5 | R@10 | MRR@10 | p50 |
+|--------|-----|-----|------|--------|------|
+| legacy v2 stack | 0.530 | 0.682 | 0.728 | 0.594 | 15.1 ms |
+| BM25 | 0.562 | 0.732 | 0.782 | -- | -- |
+| v3 baseline | 0.668 | 0.804 | 0.842 | 0.726 | 490 ms |
+| v3 + assoc | 0.674 | 0.806 | 0.834 | 0.732 | 497 ms |
+
+v2 -> v3: R@1 +27%, R@5 +18%, R@10 +15%, MRR@10 +23% (relative). The
+legacy stack trails plain BM25 at every cutoff on this corpus. Latency
+is the tradeoff: 15 ms for a single unranked FAISS pass vs ~0.5 s for
+fusion + rerank + trust in the eval harness; the 150 ms serving p95
+budget is verified separately at cutover. Caveats: sibling-proxy labels
+(system-agnostic, project-cluster topical), and the chat-export gate has
+no legacy row because that corpus only exists in the v3 eval store.
