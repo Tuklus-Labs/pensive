@@ -91,7 +91,11 @@ def onTail(store, index, embedder, tailText, ctx):
             return None
 
         atom = getAtom(store, atomId)
-        if atom is None or not isinstance(atom.get("text"), str):
+        if (
+            atom is None
+            or atom.get("status") != "live"
+            or not isinstance(atom.get("text"), str)
+        ):
             return None
         if _alreadyInContext(atom["id"], atom["text"], ctx.get("recentContext")):
             return None

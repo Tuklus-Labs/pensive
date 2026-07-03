@@ -28,6 +28,10 @@ Loud failures propagate: a desync ``ValueError`` from ``applyPriors``/``rerank``
 ``assessTrust`` or a supersession-cycle error bubbles up unswallowed -- the
 decades rule says surface inconsistency, never paper over it.
 
+Daemon-internal modules may read through ``store._conn`` by sanctioned convention
+for batched SELECTs the public store API does not expose; the ``kinds`` SELECT
+below is one of those intentional internal reads.
+
 The public shape is the ``RecallResult`` dict Tasks 11 (eval) and 12 (MCP) build
 on: ``{results, payload, tokensUsed, lowConfidence}``.
 """

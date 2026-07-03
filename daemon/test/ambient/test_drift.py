@@ -281,6 +281,31 @@ def test_top_visible_hit_suppresses_without_lower_score_fallback(store):
     )
 
 
+@pytest.mark.parametrize("status", ["superseded", "tombstone"])
+def test_non_live_top_hit_suppresses_without_lower_score_fallback(store, status):
+    embedder = FakeEmbedder()
+    staleId = _put(store, "stale best memory must not be injected")
+    otherId = _put(store, "lower score live cousin must not inject")
+    otherAtom = getAtom(store, otherId)
+    store._conn.execute("UPDATE atoms SET status = ? WHERE id = ?", (status, staleId))
+    store._conn.commit()
+    index = OrderedIndex([(staleId, 0.99), (otherId, 0.98)])
+
+    injection = onTail(
+        store,
+        index,
+        embedder,
+        otherAtom["text"],
+        {"now": 1_000.0},
+    )
+
+    assert injection is None, (
+        f"live-only drift invariant violated: top hit with status={status!r} "
+        f"fell through to lower hit staleId={staleId} otherId={otherId} "
+        f"injection={injection!r}"
+    )
+
+
 def test_cooldown_lives_in_caller_ctx_not_module_state(store):
     embedder = FakeEmbedder()
     atomId = _put(store, "pensive drift watcher injects only high confidence memory")

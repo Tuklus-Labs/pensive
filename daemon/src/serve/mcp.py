@@ -180,6 +180,9 @@ def _composeAtomText(shape, approach, outcome, reason, principle,
     dense/lexical signals key on (shape, reason, principle) prominent; an inline
     narrative trails as its own paragraph.
     """
+    # Keep this separate from ambient.distiller._composeEmitText deliberately:
+    # mcp validates/requires legacy fields, while distiller tolerates arbitrary
+    # transcript args captured from tool calls.
     lines = [shape.strip()]
     if approach and approach.strip():
         lines.append(f"approach: {approach.strip()}")

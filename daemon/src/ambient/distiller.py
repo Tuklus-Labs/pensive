@@ -397,6 +397,9 @@ def _insertAtom(store, source, span, text, kind, extractor):
 # text of each emit type locally (rather than routing through serve.mcp, which
 # would couple ambient->serve and stamp source='explicit-emit'). The shapes are
 # stable -- they mirror the production pensive-mcp-server tools.
+# Keep this separate from serve.mcp._composeAtomText deliberately: mcp validates
+# and requires legacy fields, while the distiller tolerates arbitrary transcript
+# args captured from tool calls.
 
 _EMIT_KIND = {
     "engram_emit_atom": "atom",

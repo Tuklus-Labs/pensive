@@ -1,0 +1,11 @@
+# System Python 3.14 is assumed. torch must be the ROCm build on this box:
+# pip's default CUDA wheel will not serve the 7900 XTX. This file documents
+# daemon rebuildability; it is not an isolation venv mandate.
+torch
+sentence-transformers
+numpy
+usearch>=2.25
+mcp
+starlette
+uvicorn
+setproctitle

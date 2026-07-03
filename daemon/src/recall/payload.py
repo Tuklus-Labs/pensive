@@ -144,11 +144,11 @@ def _handleLine(atom, confidence):
 def _provenanceLine(atom, supersededBy=None):
     """The one provenance line for a Tier-1 entry.
 
-    Uses the FIRST provenance row (write order); putAtom writes exactly one, and a
-    supersession records its provenance against the successor, not this atom, so
-    the first row is this atom's own origin. ``<agent or session or 'unknown'>``
-    prefers the agent, falls back to the session id, then the literal ``unknown``.
-    A superseded atom appends its live-successor pointer."""
+    Uses the FIRST provenance row (write order); distiller bump/attach rows also
+    land on atoms, so only ULID insertion ordering via getAtom()'s ``ORDER BY id``
+    keeps the creation row at index 0. ``<agent or session or 'unknown'>`` prefers
+    the agent, falls back to the session id, then the literal ``unknown``. A
+    superseded atom appends its live-successor pointer."""
     prov = atom["provenance"][0] if atom["provenance"] else None
     if prov is None:
         source, who, recorded = "unknown", "unknown", "unknown"

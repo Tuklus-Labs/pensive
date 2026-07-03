@@ -1,8 +1,8 @@
 """Backfill an existing corpus export into the canonical v3 store.
 
 This is the one-time bridge from "the memory Gary already has" to "the memory v3
-serves". It consumes a read-only export of the live corpus and writes, through
-the canonical store API only, one atom per source record plus its provenance and
+serves". It consumes a read-only export of the live corpus and writes to the
+canonical store schema: one atom per source record plus its provenance and
 facets. It does NOT embed: embedding is a separate ``embedMissing`` pass the
 caller runs once the whole corpus is in (the fixed ``backfill(store, srcExport)``
 signature carries no embedder, and keeping embedding out means the ingest unit
@@ -38,9 +38,10 @@ load-bearing, not decorative.
 created_at override: ``putAtom`` stamps ``created_at`` to now, which is right for
 a live emit but wrong for a bulk import of historical memory -- a decade-old atom
 must not read as recorded today. When a record carries ``createdAt`` this module
-corrects the row to the real record time after the insert (occurred_at stays the
-event time; created_at becomes the ingest time), so the store's effective time
-COALESCE(occurred_at, created_at) reflects the atom's true age. Absent
+corrects the row to the real record time inside the record transaction
+(occurred_at stays the event time; created_at becomes the original record time),
+so the store's effective time COALESCE(occurred_at, created_at) reflects the
+atom's true age. Absent
 ``createdAt`` the putAtom default (now) stands.
 
 src: tags -> facets ``(key='tag', value='src:<name>')`` verbatim. Entity
@@ -62,14 +63,16 @@ ingested.
 
 Loudness: a record with no ``text`` has nothing to remember and RAISES rather than
 being silently skipped -- on a decades-scale store a swallowed record is memory
-lost forever. Each record is its own transaction (putAtom + its facets), so an
-abort preserves the records already committed (honest partial progress) instead of
-rolling back a multi-hour backfill.
+lost forever. Each record is its own transaction (atom + provenance + created_at
+override + facets), so an abort preserves the records already committed (honest
+partial progress) while rolling back the in-flight record completely.
 """
 import sys
+import time
 from pathlib import Path
 
-from store.store import putAtom, addFacet
+from store.migrate import CURRENT_SCHEMA_VERSION
+from util.ulid import ulid
 
 __all__ = ["backfill"]
 
@@ -97,6 +100,49 @@ def _getExtractor():
     if _extractor is None:
         _extractor = MegaExtractor(build_pattern_set(REAL_DATA_PATTERNS))
     return _extractor
+
+
+def _insertAtomNoCommit(conn, atomInput):
+    now = int(time.time())
+    atomId = ulid()
+    prov = atomInput["provenance"]
+    conn.execute(
+        "INSERT INTO atoms(id, text, kind, project, created_at, occurred_at, "
+        "importance, status, schema_version) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        (
+            atomId,
+            atomInput["text"],
+            atomInput["kind"],
+            atomInput.get("project"),
+            now,
+            atomInput.get("occurredAt"),
+            atomInput.get("importance", 0.0),
+            "live",
+            CURRENT_SCHEMA_VERSION,
+        ),
+    )
+    conn.execute(
+        "INSERT INTO provenance(id, atom_id, source, session_id, agent, "
+        "source_ref, recorded_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+        (
+            ulid(),
+            atomId,
+            prov["source"],
+            prov.get("sessionId"),
+            prov.get("agent"),
+            prov.get("sourceRef"),
+            now,
+        ),
+    )
+    return atomId
+
+
+def _addFacetNoCommit(conn, atomId, key, value):
+    conn.execute(
+        "INSERT OR IGNORE INTO facets(atom_id, key, value) VALUES (?, ?, ?)",
+        (atomId, key, value),
+    )
 
 
 def backfill(store, srcExport):
@@ -166,35 +212,41 @@ def backfill(store, srcExport):
             "importance": record.get("importance", 0.0),
             "provenance": provenance,
         }
-        atomId = putAtom(store, atomInput)
-
-        # created_at override for historical imports (see module docstring). One
-        # UPDATE, committed, only when the record supplies the real record time.
         createdAt = record.get("createdAt")
-        if createdAt is not None:
-            store._conn.execute(
-                "UPDATE atoms SET created_at = ? WHERE id = ?", (createdAt, atomId)
-            )
-            store._conn.commit()
-
-        ingested += 1
-        byKind[kind] = byKind.get(kind, 0) + 1
-        if sourceRef is not None:
-            seenRefs.add(sourceRef)  # dedup a repeated ref later in this same run
 
         # src: tags -> tag facets, verbatim. Dedup within the record so the count
         # matches the store (the facet PK dedups too, this keeps the stat honest).
-        for tag in dict.fromkeys(record.get("tags") or []):
-            addFacet(store, atomId, "tag", tag)
-            tagFacets += 1
+        tags = list(dict.fromkeys(record.get("tags") or []))
 
         # Entity enrichment -> entity facets in the pinned convention. extract()
         # returns the lowercase surface form already; dedup labels per atom so a
         # repeated entity is one facet and the count matches the store.
         labels = {label for label, _etype in extractor.extract(text)}
-        for label in labels:
-            addFacet(store, atomId, "entity", label)
-            entityFacets += 1
+        conn = store._conn
+        try:
+            atomId = _insertAtomNoCommit(conn, atomInput)
+            # created_at override for historical imports (see module docstring).
+            # Fold it into the record transaction so a crash cannot leave a
+            # wrong-created_at atom that the rerun guard skips forever.
+            if createdAt is not None:
+                conn.execute(
+                    "UPDATE atoms SET created_at = ? WHERE id = ?", (createdAt, atomId)
+                )
+            for tag in tags:
+                _addFacetNoCommit(conn, atomId, "tag", tag)
+            for label in labels:
+                _addFacetNoCommit(conn, atomId, "entity", label)
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+
+        ingested += 1
+        byKind[kind] = byKind.get(kind, 0) + 1
+        tagFacets += len(tags)
+        entityFacets += len(labels)
+        if sourceRef is not None:
+            seenRefs.add(sourceRef)  # dedup a repeated ref later in this same run
 
     return {
         "ingested": ingested,

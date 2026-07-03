@@ -104,22 +104,23 @@ def _gpuBusyPercent():
     """AMD ROCm GPU utilization from sysfs, or None if it cannot be read.
 
     Reads ``/sys/class/drm/card*/device/gpu_busy_percent`` -- the kernel's amdgpu
-    utilization counter -- taking the first readable card (the 7900 XTX shows up as
-    card1 on this box, the display adapter as card0, so glob + first-readable is
-    the right selector). ``torch.cuda.utilization()`` is NVIDIA-only and
+    utilization counter -- taking the maximum across readable cards (the display
+    adapter may be card0 while the 7900 XTX is card1, so first-readable can miss
+    the busy card). ``torch.cuda.utilization()`` is NVIDIA-only and
     meaningless on ROCm, so it is deliberately NOT used. Returns None on any
     failure (path absent, permission, non-integer), which the caller reads as
     "contention cannot be proven".
     """
     import glob
 
+    readings = []
     for path in sorted(glob.glob("/sys/class/drm/card*/device/gpu_busy_percent")):
         try:
             with open(path) as fh:
-                return int(fh.read().strip())
+                readings.append(int(fh.read().strip()))
         except (OSError, ValueError):
             continue
-    return None
+    return max(readings) if readings else None
 
 
 def test_rerank_of_fifty_pairs_under_100ms_warm(store, _rerankerWarm, capsys):
