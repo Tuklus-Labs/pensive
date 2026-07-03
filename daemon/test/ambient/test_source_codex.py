@@ -196,9 +196,17 @@ def test_codex_log_distills_with_codex_source_and_genuine_offsets(tmp_path, stor
     assert prov["sessionId"] == "codex-session-17", (
         f"codex provenance session contract violated: provenance={prov}"
     )
-    assert prov["sourceRef"] == "codex-session-17#3.0.0", (
+    # Trusted ref format (Task 16 fix round 2): <sessionId>#<offset>.<16-hex
+    # digest>. Pin the genuine line-offset prefix and the digest tail's shape,
+    # not the digest bytes themselves.
+    ref = prov["sourceRef"]
+    prefix, _, digestTail = ref.rpartition(".")
+    assert prefix == "codex-session-17#3.0.0", (
         f"line-offset sourceRef contract violated: provenance={prov}"
     )
+    assert len(digestTail) == 16 and all(
+        c in "0123456789abcdef" for c in digestTail
+    ), f"sourceRef digest tail malformed: {ref}"
 
 
 def test_codex_source_falls_back_to_filename_for_missing_session(tmp_path):

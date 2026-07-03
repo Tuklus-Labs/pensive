@@ -14,6 +14,18 @@ Risk model (what could silently break, and the test that catches it):
   and a repetitive transcript (-> bounded atom count), asserting the count stays
   small and importance rises instead.
 
+- **SourceRef collision.** Some sources can reuse an explicit offset for different
+  bytes. Exact idempotency must key on session, offset, and span content so a
+  repeated byte-for-byte span bumps, while different text at the same offset lands.
+
+- **Malformed offset identity.** A present ``offset=None`` must behave like a
+  missing offset: synthesize a ref without the literal string ``None`` and skip the
+  trusted exact-ref lookup.
+
+- **Emit tag contract drift.** The live MCP schema passes tags as a comma-separated
+  string. Ambient passthrough must split that shape and still accept a list
+  defensively.
+
 - **Importance runs away.** A bump-on-dup that never caps sends a hot span's
   importance to infinity, breaking the ranking prior. The cap test feeds the same
   span 100x and asserts importance stops at the documented cap.
@@ -139,6 +151,15 @@ def _facetPairs(store, atomId):
     return {(f["key"], f["value"]) for f in facetsOf(store, atomId)}
 
 
+def _sourceRefs(store):
+    return [
+        row[0]
+        for row in store._conn.execute(
+            "SELECT source_ref FROM provenance ORDER BY id"
+        ).fetchall()
+    ]
+
+
 # --------------------------------------------------------------------------- #
 # Step 1: an explicit emit passes straight through, bypassing the model        #
 # --------------------------------------------------------------------------- #
@@ -197,22 +218,42 @@ def test_heuristic_span_is_summarized_and_inserted(store):
     assert "sess-H#" in prov["sourceRef"]
 
 
-def test_explicit_emit_tags_become_tag_facets(store):
+def test_explicit_emit_string_tags_become_tag_facets(store):
     model = FakeModelClient()
     embedder = FakeEmbedder()
     source = _source("sess-T", [
         _emitEvent("engram_emit_atom", {
             "shape": "MegaExtractor facets must survive ambient passthrough",
-            "tags": ["src:ambient", "task-16"],
+            "tags": "recall, rerank",
         }),
     ])
 
     result = distill(store, source, model, embedder)
 
     atom = getAtom(store, result["atomIds"][0])
-    facets = _facetPairs(store, atom["id"])
-    assert ("tag", "src:ambient") in facets
-    assert ("tag", "task-16") in facets
+    tags = {value for key, value in _facetPairs(store, atom["id"]) if key == "tag"}
+    assert tags == {"recall", "rerank"}, (
+        f"emit tag string contract violated: tags={tags!r}"
+    )
+
+
+def test_explicit_emit_list_tags_are_still_defensive_case(store):
+    model = FakeModelClient()
+    embedder = FakeEmbedder()
+    source = _source("sess-T2", [
+        _emitEvent("engram_emit_atom", {
+            "shape": "MegaExtractor facets must survive ambient passthrough",
+            "tags": [" src:ambient ", "", "task-16"],
+        }),
+    ])
+
+    result = distill(store, source, model, embedder)
+
+    atom = getAtom(store, result["atomIds"][0])
+    tags = {value for key, value in _facetPairs(store, atom["id"]) if key == "tag"}
+    assert tags == {"src:ambient", "task-16"}, (
+        f"emit list tag defensive contract violated: tags={tags!r}"
+    )
 
 
 # --------------------------------------------------------------------------- #
@@ -286,6 +327,30 @@ def test_near_dup_bumps_not_inserts(store):
     assert result["inserted"] == 1 and result["bumped"] == 1
 
 
+def test_same_explicit_offset_with_different_text_inserts_two_atoms(store):
+    model = FakeModelClient()
+    embedder = FakeEmbedder()
+    first = "I'll switch recall scoring to deterministic tie order."
+    second = "The root cause is sqlite rollback around facet writes."
+    source = _sourceDeltas("sess-Q", [
+        {"offset": 7, "events": [_assistantText(first)]},
+        {"offset": 7, "events": [_assistantText(second)]},
+    ])
+
+    result = distill(store, source, model, embedder)
+
+    assert atomCount(store) == 2, (
+        f"content-digest sourceRef collision guard violated: refs={_sourceRefs(store)!r}"
+    )
+    assert result["inserted"] == 2
+    assert model.calls == [first, second], (
+        f"trusted exact-ref path swallowed distinct bytes: calls={model.calls!r}"
+    )
+    assert len(set(_sourceRefs(store))) == 2, (
+        f"sourceRefs must differ for different bytes at same offset: {_sourceRefs(store)!r}"
+    )
+
+
 def test_missing_offsets_do_not_ref_collide_across_deltas(store):
     model = FakeModelClient()
     embedder = FakeEmbedder()
@@ -319,6 +384,32 @@ def test_anonymous_sources_do_not_ref_cross_contaminate(store):
     assert result["inserted"] == 1
     refs = [a["provenance"][0]["sourceRef"] for a in _atoms(store)]
     assert all(ref is None or not ref.startswith("None#") for ref in refs)
+
+
+def test_explicit_offset_none_uses_synthetic_ref_without_literal_none(store):
+    model = FakeModelClient()
+    embedder = FakeEmbedder()
+    para = "I'll normalize an explicit null offset before span synthesis."
+    source = _sourceDeltas("sess-Z", [
+        {"offset": None, "events": [_assistantText(para)]},
+    ])
+
+    first = distill(store, source, model, embedder)
+    second = distill(store, source, model, embedder)
+
+    assert atomCount(store) == 1, (
+        f"same null-offset bytes should dedup after model pass: refs={_sourceRefs(store)!r}"
+    )
+    assert first["inserted"] == 1
+    assert second["inserted"] == 0 and second["bumped"] == 1
+    assert model.calls == [para, para], (
+        f"offset=None must not use trusted exact-ref shortcut: calls={model.calls!r}"
+    )
+    refs = _sourceRefs(store)
+    assert len(refs) == 1 and refs[0] is not None
+    assert "None" not in refs[0], (
+        f"offset=None leaked into sourceRef literal: refs={refs!r}"
+    )
 
 
 # --------------------------------------------------------------------------- #

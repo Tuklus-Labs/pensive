@@ -176,10 +176,20 @@ class OrnithModelClient:
 # --------------------------------------------------------------------------- #
 
 
+def _spanTextDigest(span):
+    return hashlib.blake2b(
+        str(span.get("text", "")).encode("utf-8"),
+        digest_size=8,
+    ).hexdigest()
+
+
 def _spanRef(span):
-    """The provenance ``sourceRef`` for a span: ``<sessionId>#<offset>``. Uniquely
-    locates the span in the session, so the same span re-tailed maps to the same
-    ref -- the hook the idempotency check hangs on."""
+    """The provenance ``sourceRef`` for a span.
+
+    Trusted offsets use ``<sessionId>#<offset>.<textDigest>``; synthetic refs use
+    ``<sessionId>#synthetic.<offset>.<textDigest>``. The content digest keeps exact
+    idempotency byte-stable: a re-tail of the same span maps to the same ref, while
+    different text at a reused offset lands as a distinct atom."""
     if span.get("_sourceRef") is not None:
         return span["_sourceRef"]
     sessionId = span.get("sessionId")
@@ -188,18 +198,14 @@ def _spanRef(span):
         return None
     if str(offset) == "None" or str(offset).startswith("None."):
         return None
-    return f"{sessionId}#{offset}"
+    return f"{sessionId}#{offset}.{_spanTextDigest(span)}"
 
 
 def _syntheticSourceRef(span):
     sessionId = span.get("sessionId")
     if sessionId is None:
         return None
-    digest = hashlib.blake2b(
-        str(span.get("text", "")).encode("utf-8"),
-        digest_size=8,
-    ).hexdigest()
-    return f"{sessionId}#synthetic.{span.get('offset')}.{digest}"
+    return f"{sessionId}#synthetic.{span.get('offset')}.{_spanTextDigest(span)}"
 
 
 def _existingBySourceRef(store, sourceRef):
@@ -333,6 +339,21 @@ def _composeEmitText(tool, args):
     return text, kind
 
 
+def _emitTags(args):
+    tags = args.get("tags")
+    if isinstance(tags, str):
+        candidates = tags.split(",")
+    elif isinstance(tags, list):
+        candidates = tags
+    else:
+        return []
+    return list(dict.fromkeys(
+        tag.strip()
+        for tag in candidates
+        if isinstance(tag, str) and tag.strip()
+    ))
+
+
 # --------------------------------------------------------------------------- #
 # Orchestration                                                                #
 # --------------------------------------------------------------------------- #
@@ -414,7 +435,7 @@ def _passthroughSpan(store, source, span, extractor, result):
         result["skipped"] += 1
         return
     atomId = _insertAtom(store, source, span, text, kind, extractor)
-    for tag in dict.fromkeys(emit["args"].get("tags") or []):
+    for tag in _emitTags(emit["args"]):
         addFacet(store, atomId, "tag", tag)
     result["passthrough"] += 1
     result["atomIds"].append(atomId)
@@ -460,6 +481,8 @@ def _verbatimTextBlocks(content):
 def _verbatimSpans(transcriptSource, delta, deltaIndex):
     sessionId = delta.get("sessionId", transcriptSource.get("sessionId"))
     base = delta.get("offset", deltaIndex)
+    if base is None:
+        base = deltaIndex
     trusted = sessionId is not None and "offset" in delta and delta.get("offset") is not None
     events = delta.get("events")
     if not isinstance(events, list):
@@ -527,6 +550,8 @@ def distill(store, transcriptSource, model, embedder):
             # need not repeat it. Missing offsets get the delta index so refs cannot
             # collide across separate tailed slices.
             deltaForSeg = dict(delta)
+            if deltaForSeg.get("offset") is None:
+                deltaForSeg.pop("offset", None)
             deltaForSeg.setdefault("sessionId", sessionId)
             deltaForSeg.setdefault("offset", deltaIndex)
             trusted = (
