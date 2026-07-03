@@ -19,7 +19,6 @@ from store.store import (
 )
 
 
-TABLES = ("atoms", "provenance", "edges", "facets", "embeddings")
 CRASH_DRILL_ITERATIONS = 5
 
 
@@ -61,24 +60,80 @@ def _populate_store(store):
     return first, second
 
 
-def _rows_by_table(path):
+def _sqlite_objects(path):
     conn = sqlite3.connect(path)
     try:
-        rows = {}
-        for table in TABLES:
-            order_by = {
-                "atoms": "id",
-                "provenance": "id",
-                "edges": "id",
-                "facets": "atom_id, key, value",
-                "embeddings": "atom_id, model_id",
-            }[table]
-            rows[table] = conn.execute(
-                f"SELECT * FROM {table} ORDER BY {order_by}"
-            ).fetchall()
-        return rows
+        return {
+            (kind, name)
+            for kind, name in conn.execute(
+                """
+                SELECT type, name
+                FROM sqlite_master
+                WHERE type IN ('table', 'index', 'trigger')
+                  AND name NOT LIKE 'sqlite_%'
+                """
+            )
+        }
     finally:
         conn.close()
+
+
+def _user_tables(path):
+    conn = sqlite3.connect(path)
+    try:
+        tables = [
+            row[0]
+            for row in conn.execute(
+                """
+                SELECT name
+                FROM sqlite_master
+                WHERE type = 'table'
+                  AND name NOT LIKE 'sqlite_%'
+                  AND name NOT IN ('fts', 'fts_data', 'fts_idx', 'fts_content',
+                                   'fts_docsize', 'fts_config')
+                ORDER BY name
+                """
+            )
+        ]
+        return tables
+    finally:
+        conn.close()
+
+
+def _ordered_rows(conn, table, include_snapshot_meta=False):
+    cols = [
+        row[1]
+        for row in conn.execute(f"PRAGMA table_info({table})").fetchall()
+    ]
+    order_by = ", ".join(cols)
+    where = ""
+    if table == "meta" and not include_snapshot_meta:
+        where = "WHERE key NOT IN ('snapshot_of', 'snapshot_at')"
+    return conn.execute(f"SELECT * FROM {table} {where} ORDER BY {order_by}").fetchall()
+
+
+def _assert_same_snapshot_content(left, right, include_snapshot_meta=False):
+    assert _sqlite_objects(left) == _sqlite_objects(right)
+    assert _user_tables(left) == _user_tables(right)
+
+    left_conn = sqlite3.connect(left)
+    right_conn = sqlite3.connect(right)
+    try:
+        for table in _user_tables(left):
+            left_rows = _ordered_rows(left_conn, table, include_snapshot_meta)
+            right_rows = _ordered_rows(right_conn, table, include_snapshot_meta)
+            assert len(right_rows) == len(left_rows), table
+            assert right_rows == left_rows
+
+        probe = left_conn.execute(
+            "SELECT rowid FROM fts WHERE fts MATCH 'durability' ORDER BY rowid"
+        ).fetchall()
+        assert right_conn.execute(
+            "SELECT rowid FROM fts WHERE fts MATCH 'durability' ORDER BY rowid"
+        ).fetchall() == probe
+    finally:
+        left_conn.close()
+        right_conn.close()
 
 
 def _integrity_ok(path):
@@ -123,8 +178,9 @@ def test_snapshot_is_loadable_standalone_db_and_restore_round_trips(tmp_path):
     finally:
         restored_store.close()
 
-    assert _rows_by_table(db_path) == _rows_by_table(snap_path)
-    assert _rows_by_table(db_path) == _rows_by_table(restore_path)
+    _assert_same_snapshot_content(db_path, snap_path)
+    _assert_same_snapshot_content(db_path, restore_path)
+    _assert_same_snapshot_content(snap_path, restore_path, include_snapshot_meta=True)
 
 
 def test_snapshot_rotation_prunes_only_older_snapshots_for_same_store(tmp_path):
@@ -141,7 +197,14 @@ def test_snapshot_rotation_prunes_only_older_snapshots_for_same_store(tmp_path):
         _populate_store(store)
         _populate_store(other)
 
-        mine = []
+        first_snap = snapshot(store, snapshot_dir)
+        prefix = first_snap.name.rsplit("-", 2)[0]
+        decoy_file = snapshot_dir / f"{prefix}-19990101T000000Z-1.sqlite3"
+        decoy_file.write_text("operator copy, not a pensive snapshot")
+        symlink_decoy = snapshot_dir / f"{prefix}-19990101T000000Z-2.sqlite3"
+        symlink_decoy.symlink_to(keeper)
+
+        mine = [first_snap]
         for _ in range(SNAPSHOT_KEEP + 2):
             mine.append(snapshot(store, snapshot_dir))
             time.sleep(0.001)
@@ -152,9 +215,43 @@ def test_snapshot_rotation_prunes_only_older_snapshots_for_same_store(tmp_path):
 
     remaining = sorted(p for p in snapshot_dir.iterdir() if p.name != keeper.name)
     assert keeper.read_text() == "do not prune me"
+    assert decoy_file.read_text() == "operator copy, not a pensive snapshot"
+    assert symlink_decoy.is_symlink()
+    assert symlink_decoy.resolve() == keeper
     assert other_snap in remaining
     assert sorted(p for p in mine if p.exists()) == mine[-SNAPSHOT_KEEP:]
     assert len([p for p in mine if p.exists()]) == SNAPSHOT_KEEP
+
+
+def test_restore_refuses_unrelated_sqlite_and_markerless_store_copy(tmp_path):
+    unrelated = tmp_path / "unrelated.db"
+    markerless_copy = tmp_path / "markerless.db"
+    db_path = tmp_path / "memory.db"
+    snapshot_dir = tmp_path / "snapshots"
+
+    conn = sqlite3.connect(unrelated)
+    try:
+        conn.execute("CREATE TABLE notes(body TEXT)")
+        conn.execute("INSERT INTO notes(body) VALUES ('not a pensive snapshot')")
+        conn.commit()
+    finally:
+        conn.close()
+
+    store = openStore(db_path)
+    try:
+        _populate_store(store)
+        store._conn.execute("VACUUM main INTO ?", (str(markerless_copy),))
+        snap_path = snapshot(store, snapshot_dir)
+    finally:
+        store.close()
+
+    with pytest.raises(RuntimeError, match="not a Pensive snapshot"):
+        restoreSnapshot(unrelated, tmp_path / "restore-unrelated.db")
+    with pytest.raises(RuntimeError, match="not a Pensive snapshot"):
+        restoreSnapshot(markerless_copy, tmp_path / "restore-copy.db")
+
+    restored = restoreSnapshot(snap_path, tmp_path / "restore-snapshot.db")
+    assert restored.exists()
 
 
 def test_restore_refuses_to_overwrite_existing_target(tmp_path):
@@ -204,7 +301,7 @@ progress_path = Path(sys.argv[2])
 store = openStore(db_path)
 try:
     with progress_path.open("a") as progress:
-        for index in range(200):
+        for index in range(100_000):
             atom_id = putAtom(
                 store,
                 {
@@ -242,8 +339,10 @@ finally:
                 break
             time.sleep(0.01)
         assert len(acknowledged) >= 8
+        assert proc.poll() is None
         os.kill(proc.pid, signal.SIGKILL)
         proc.wait(timeout=5)
+        assert proc.returncode == -signal.SIGKILL
     finally:
         if proc.poll() is None:
             os.kill(proc.pid, signal.SIGKILL)
@@ -264,6 +363,20 @@ finally:
             assert atom["schemaVersion"] == CURRENT_SCHEMA_VERSION
             assert len(atom["provenance"]) == 1
             assert atom["provenance"][0]["source"] == "codex"
+            assert atom["provenance"][0]["recordedAt"] is not None
+
+        bad_acked_provenance = recovered._conn.execute(
+            """
+            SELECT COUNT(*)
+            FROM provenance
+            WHERE atom_id IN (
+                SELECT value FROM json_each(?)
+            )
+              AND (source IS NULL OR recorded_at IS NULL)
+            """,
+            ("[" + ",".join(f'"{atom_id}"' for atom_id in acknowledged) + "]",),
+        ).fetchone()[0]
+        assert bad_acked_provenance == 0
 
         incomplete = recovered._conn.execute(
             """
@@ -274,9 +387,13 @@ finally:
                OR a.text IS NULL
                OR a.kind IS NULL
                OR a.created_at IS NULL
+               OR a.importance IS NULL
                OR a.status IS NULL
                OR a.schema_version IS NULL
                OR p.id IS NULL
+               OR p.atom_id IS NULL
+               OR p.source IS NULL
+               OR p.recorded_at IS NULL
             """
         ).fetchone()[0]
         assert incomplete == 0
