@@ -38,11 +38,13 @@ _RERANK_MODEL_ID = "BAAI/bge-reranker-base"
 # is part of the interface -- callers rely on it.
 _RERANK_CAP = 50
 
-# Explicit truncation window. Atom texts can exceed the model's 512-token context
-# (Task 18 posts conversation tails into recall as raw queries), so truncation
-# must be a DELIBERATE max_length, not an accidental tokenizer default that could
-# silently change with the model. 512 is bge-reranker-base's positional limit.
-_MAX_LENGTH = 512
+# Explicit truncation window. Production atom texts are p90 ~190 tokens, so 256
+# covers the normal corpus with headroom while keeping padded batches short: one
+# long atom is score-clipped instead of dragging the whole batch to 512. Director
+# measurement on 50 real pairs, warm, 7900 XTX, min of 5:
+# fp32@512 ~430ms | fp16@512 114ms | fp32@256 172ms | fp16@256 72ms.
+# Harness quality gates own future retuning.
+_MAX_LENGTH = 256
 
 # Lazy module-level singleton, mirroring the embedder: one copy per process,
 # loaded on first rerank(), never at import.
@@ -72,6 +74,13 @@ def _getReranker():
         _reranker = CrossEncoder(
             _RERANK_MODEL_ID, device=device, max_length=_MAX_LENGTH
         )
+        # Measured lever (50 real pairs, warm, 7900 XTX, min of 5):
+        # fp32@512 ~430ms | fp16@512 114ms | fp32@256 172ms | fp16@256 72ms.
+        # Keep CPU fallback in fp32: fp16 CPU is slow and some ops are unsupported.
+        # CUDA/ROCm scores may differ from fp32 in the ~1e-3 band, so near ties
+        # can flip; the quality gates guard the acceptable ranking envelope.
+        if device == "cuda":
+            _reranker.model.half()
     return _reranker
 
 

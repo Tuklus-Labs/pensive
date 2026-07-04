@@ -33,7 +33,8 @@ import re
 
 import pytest
 
-from recall.engine import recall, FACET_BOOST
+import recall.engine as engine
+from recall.engine import recall, FACET_BOOST, RERANK_HEAD
 from recall.payload import (
     assemblePayload,
     assembleTier2,
@@ -174,6 +175,39 @@ def _hundred_texts():
     return [_BASE_SENTENCES[i % len(_BASE_SENTENCES)].format(i=i) for i in range(100)]
 
 
+def _stub_recall_dependencies(monkeypatch, fused, reranked):
+    seen = {}
+
+    monkeypatch.setattr(engine, "facetSignal", lambda store, hints: {
+        "boostSet": set(),
+        "filterSet": None,
+    })
+    monkeypatch.setattr(engine, "bm25", lambda store, query, k: [])
+    monkeypatch.setattr(engine, "dense", lambda index, embedder, query, k: [])
+    monkeypatch.setattr(engine, "rrf", lambda hits: list(fused))
+    monkeypatch.setattr(engine, "applyPriors", lambda fusedPairs, store, hints: fusedPairs)
+
+    def rerankSpy(query, candidates, store):
+        seen["rerank_candidates"] = list(candidates)
+        return list(reranked)
+
+    def assessSpy(rerankedPairs, signalHits, store, now):
+        seen["assessed_pairs"] = list(rerankedPairs)
+        return [
+            _result(atomId, 0.9, True, score=score)
+            for atomId, score in rerankedPairs
+        ]
+
+    monkeypatch.setattr(engine, "rerank", rerankSpy)
+    monkeypatch.setattr(engine, "assessTrust", assessSpy)
+    monkeypatch.setattr(
+        engine,
+        "assemblePayload",
+        lambda store, results, tokenBudget: ("payload", 1, False),
+    )
+    return seen
+
+
 # --------------------------------------------------------------------------- #
 # Step 1: full pipeline over a seeded 100-atom store                          #
 # --------------------------------------------------------------------------- #
@@ -211,6 +245,37 @@ def test_recall_100_atoms_ordered_with_confidence_within_budget(
     assert isinstance(out["lowConfidence"], bool)
     # the strongest hit for this exact-phrase query is a "station" atom
     assert "range for data rate" in out["payload"]
+
+
+def test_recall_reranks_only_head_and_appends_tail_in_rrf_order(
+    store, monkeypatch
+):
+    poolSize = RERANK_HEAD + 5
+    fused = [(f"a{i}", float(poolSize - i)) for i in range(poolSize)]
+    rerankedHead = list(reversed(fused[:RERANK_HEAD]))
+    seen = _stub_recall_dependencies(monkeypatch, fused, rerankedHead)
+
+    out = recall(store, _BombIndex(), _BombEmbedder(), "query", k=poolSize)
+
+    expected = rerankedHead + fused[RERANK_HEAD:]
+    assert seen["rerank_candidates"] == fused[:RERANK_HEAD]
+    assert seen["assessed_pairs"] == expected
+    assert [r["atomId"] for r in out["results"]] == [atomId for atomId, _ in expected]
+    assert len(out["results"]) == len(fused)
+
+
+def test_recall_reranks_whole_pool_when_pool_is_below_head_cap(
+    store, monkeypatch
+):
+    fused = [(f"a{i}", float(10 - i)) for i in range(10)]
+    reranked = list(reversed(fused))
+    seen = _stub_recall_dependencies(monkeypatch, fused, reranked)
+
+    out = recall(store, _BombIndex(), _BombEmbedder(), "query", k=len(fused))
+
+    assert seen["rerank_candidates"] == fused
+    assert seen["assessed_pairs"] == reranked
+    assert [r["atomId"] for r in out["results"]] == [atomId for atomId, _ in reranked]
 
 
 # --------------------------------------------------------------------------- #

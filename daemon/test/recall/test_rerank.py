@@ -12,6 +12,7 @@ These tests use the REAL model and a REAL store, mirroring test_embedder.py: one
 session-scoped load of the ~1.1GB reranker, a fresh SQLite store per test.
 """
 import time
+import types
 
 import pytest
 
@@ -73,6 +74,114 @@ def _put(store, text, project="pensive"):
             "project": project,
             "provenance": {"source": "claude-code"},
         },
+    )
+
+
+def _resetReranker(monkeypatch):
+    from recall import rerank as rerankMod
+
+    monkeypatch.setattr(rerankMod, "_reranker", None)
+    return rerankMod
+
+
+def _installFakeRerankerDeps(monkeypatch, cudaAvailable):
+    created = []
+
+    class FakeDType:
+        pass
+
+    float32 = FakeDType()
+    float16 = FakeDType()
+
+    class FakeParam:
+        def __init__(self):
+            self.dtype = float32
+
+    class FakeModel:
+        def __init__(self):
+            self.param = FakeParam()
+
+        def parameters(self):
+            return iter([self.param])
+
+        def half(self):
+            self.param.dtype = float16
+            return self
+
+    class FakeCrossEncoder:
+        def __init__(self, modelId, *, device, max_length):
+            self.modelId = modelId
+            self.device = device
+            self.max_length = max_length
+            self.model = FakeModel()
+            created.append(self)
+
+    torch = types.SimpleNamespace(
+        cuda=types.SimpleNamespace(is_available=lambda: cudaAvailable),
+        float16=float16,
+        float32=float32,
+    )
+    sentenceTransformers = types.SimpleNamespace(CrossEncoder=FakeCrossEncoder)
+    hfLogging = types.SimpleNamespace(set_verbosity_error=lambda: None)
+    transformers = types.SimpleNamespace(
+        utils=types.SimpleNamespace(logging=hfLogging)
+    )
+    transformersUtils = types.SimpleNamespace(logging=hfLogging)
+
+    monkeypatch.setitem(__import__("sys").modules, "torch", torch)
+    monkeypatch.setitem(
+        __import__("sys").modules, "sentence_transformers", sentenceTransformers
+    )
+    monkeypatch.setitem(__import__("sys").modules, "transformers", transformers)
+    monkeypatch.setitem(
+        __import__("sys").modules, "transformers.utils", transformersUtils
+    )
+    monkeypatch.setitem(
+        __import__("sys").modules, "transformers.utils.logging", hfLogging
+    )
+    return created, float16, float32
+
+
+@pytest.mark.skipif(
+    not __import__("torch").cuda.is_available(),
+    reason="CUDA/ROCm unavailable; FP16 loader contract is GPU-only",
+)
+def test_cuda_loaded_model_parameters_are_float16(_rerankerWarm):
+    # contract: cuda loader precision
+    import torch
+    from recall import rerank as rerankMod
+
+    model = rerankMod._getReranker()
+
+    firstParam = next(model.model.parameters())
+    assert firstParam.dtype == torch.float16, (
+        "cuda reranker loader must convert model parameters to float16"
+    )
+
+
+def test_cpu_loader_keeps_cross_encoder_model_float32(monkeypatch):
+    # contract: cpu loader precision
+    rerankMod = _resetReranker(monkeypatch)
+    created, _float16, float32 = _installFakeRerankerDeps(monkeypatch, False)
+
+    model = rerankMod._getReranker()
+
+    assert created == [model], "loader must create exactly one CrossEncoder"
+    firstParam = next(model.model.parameters())
+    assert firstParam.dtype is float32, (
+        "cpu reranker loader must leave model parameters in float32"
+    )
+
+
+def test_loader_sets_cross_encoder_max_length_to_256(monkeypatch):
+    # contract: truncation window
+    rerankMod = _resetReranker(monkeypatch)
+    created, _float16, _float32 = _installFakeRerankerDeps(monkeypatch, False)
+
+    rerankMod._getReranker()
+
+    assert created[0].max_length == 256, (
+        "reranker loader must pass the measured 256-token max_length"
     )
 
 
@@ -240,8 +349,8 @@ def test_unknown_candidate_id_raises_valueerror_naming_it(store, monkeypatch):
 
 
 def test_very_long_text_truncates_cleanly_and_still_scores(store, _rerankerWarm):
-    # Sabotage: an atom whose text far exceeds the model's 512-token window (Task
-    # 18 posts long conversation tails into recall). Explicit max_length=512
+    # Sabotage: an atom whose text far exceeds the measured 256-token window (Task
+    # 18 posts long conversation tails into recall). Explicit max_length=256
     # truncates deliberately; the pair must still SCORE, not raise a length error.
     longText = "sonar navigation depth acoustic modem bathymetry survey " * 500  # ~3500 tokens
     longId = _put(store, longText)
@@ -256,11 +365,11 @@ def test_very_long_text_truncates_cleanly_and_still_scores(store, _rerankerWarm)
 
     # Prove the truncation is REAL, not the text merely happening to fit: tokenizing
     # the (query, longText) pair with the module's own max_length caps the input at
-    # exactly 512 tokens (the long text is ~3500 tokens, so it MUST be cut).
+    # exactly 256 tokens (the long text is ~3500 tokens, so it MUST be cut).
     from recall import rerank as rerankMod
 
     model = rerankMod._getReranker()
     enc = model.tokenizer(
         QUERY, longText, truncation=True, max_length=rerankMod._MAX_LENGTH
     )
-    assert len(enc["input_ids"]) == rerankMod._MAX_LENGTH == 512
+    assert len(enc["input_ids"]) == rerankMod._MAX_LENGTH == 256

@@ -19,8 +19,8 @@ stating in one place:
   window must not be double-applied.
 - The facet ``boostSet`` is a post-fusion MULTIPLICATIVE boost (``* FACET_BOOST``)
   applied before priors, and its members count as a ``facet`` signal hit.
-- ``kinds`` filters the fused list in one batched SELECT BEFORE rerank, so all 50
-  rerank slots go to eligible atoms.
+- ``kinds`` filters the fused list in one batched SELECT BEFORE rerank, so the
+  rerank head is spent on eligible atoms.
 - ``now`` is sampled ONCE at entry and threaded to both the time prior and the
   trust layer, so every clock-dependent decision in a single call agrees.
 
@@ -43,13 +43,19 @@ from recall.rerank import rerank
 from recall.trust import assessTrust
 from recall.payload import assemblePayload
 
-__all__ = ["recall", "FACET_BOOST"]
+__all__ = ["recall", "FACET_BOOST", "RERANK_HEAD"]
 
 # Post-fusion multiplicative boost for atoms carrying a query-matching entity
 # facet. Small on purpose (a nudge, not an override) and harness-tunable: Task
 # 11's eval owns the final value. 1.15 = a 15% lift to a boosted atom's fused
 # score before priors.
 FACET_BOOST = 1.15
+
+# Cross-encoder rerank head. The Task 8 warm budget was benched at ~31ms for 50
+# pairs; scoring only the top 64 fused candidates keeps margin while bounding the
+# pool, and the harness owns future tuning. Candidates below this head keep their
+# fused RRF order and are appended after the reranked head, never dropped.
+RERANK_HEAD = 64
 
 # Recall breadth per signal: the plan's top-200 candidate generation. Matches the
 # signals-module default; named here so the orchestrator states its own contract.
@@ -125,7 +131,7 @@ def recall(store, index, embedder, query, project=None, timeScope=None,
     fused = rrf([bmHits, dnHits])
 
     # 5. Post-fusion facet boost, applied before priors. applyPriors re-sorts, so
-    #    the boosted scores feed the ranking that decides the rerank top-50 cut.
+    #    the boosted scores feed the ranking that decides the rerank head.
     if boostSet:
         fused = [
             (atomId, score * FACET_BOOST if atomId in boostSet else score)
@@ -139,16 +145,25 @@ def recall(store, index, embedder, query, project=None, timeScope=None,
         priorHints["timeScope"] = timeScope
     fused = applyPriors(fused, store, priorHints)
 
-    # 7. kinds filter before rerank, so the 50 rerank slots are spent on eligible
-    #    atoms only. An empty result here (nothing of the wanted kind) short-circuits.
+    # 7. kinds filter before rerank, so the rerank head is spent on eligible atoms
+    #    only. An empty result here (nothing of the wanted kind) short-circuits.
     if kinds is not None:
         fused = _filterKinds(store, fused, kinds)
 
     if not fused:
         return _emptyResult(store, tokenBudget)
 
-    # 8. Cross-encoder rerank (caps at the fused top-50).
-    reranked = rerank(query, fused, store)
+    # 8. Cross-encoder rerank over the fused head only. The untouched tail stays
+    #    in fused RRF order below the reranked head, so trust/payload still see
+    #    every candidate.
+    rerankHead = fused[:RERANK_HEAD]
+    rerankedHead = rerank(query, rerankHead, store)
+    rerankedIds = {atomId for atomId, _ in rerankedHead}
+    reranked = (
+        rerankedHead
+        + [pair for pair in rerankHead if pair[0] not in rerankedIds]
+        + fused[RERANK_HEAD:]
+    )
 
     # 9. Trust: confidence, shouldTrust, why, supersession -- same ``now``.
     assessed = assessTrust(reranked, signalHits, store, now)
