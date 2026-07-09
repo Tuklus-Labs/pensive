@@ -106,8 +106,11 @@ Loudness audit: every assertion below includes a rule-naming failure message.
 
 from store.store import addEdge, addFacet, openStore, putAtom
 
+from recall.vector_index import buildClassIndexes
+
 from eval.assoc_experiment import (
     HUB_CAP,
+    MODEL_ID,
     assocSignal,
     compareMetrics,
     gateWithAssoc,
@@ -726,8 +729,12 @@ def test_gate_with_assoc_differs_on_facets_only_candidate_pool(monkeypatch, tmp_
         monkeypatch.setattr("eval.assoc_experiment.assessTrust", lambda ranked, signal_hits, store, now: ranked)
         monkeypatch.setattr("eval.assoc_experiment.assemblePayload", lambda store, results, token_budget: ("", 0, False))
 
+        # index is now the {className: VectorIndex} map _recallWithAssoc consumes
+        # per class; the corpus is single-kind (memory), dense stays mocked to []
+        # so only the assoc signal can differentiate the arms.
+        indexes = buildClassIndexes(store, MODEL_ID)
         assoc, baseline_rankings, assoc_rankings = gateWithAssoc(
-            store, object(), object(), queries, returnBaselineRankings=True
+            store, indexes, object(), queries, returnBaselineRankings=True
         )
 
         assert baseline_rankings == [["seed-ref"]], (
