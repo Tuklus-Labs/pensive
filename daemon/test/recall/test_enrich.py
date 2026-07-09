@@ -2,7 +2,7 @@
 import pytest
 
 from recall.enrich import locateChunk, relatedMemory, Enricher
-from store.store import openStore, putAtom, addFacet
+from store.store import openStore, putAtom, addFacet, addEdge
 
 
 @pytest.fixture
@@ -106,3 +106,48 @@ def test_enricher_empty_for_memory_kind_and_on_any_failure(store):
                  sourceRef="kv_cache/vector_meta.db#rowid=1")
     # Unknown root: no location; no facets: no relations; empty, no raise.
     assert Enricher(store).lines({"atomId": chunk}) == []
+
+
+def test_enricher_prefers_real_relates_edges(store):
+    chunk = _put(store, "chunk body", kind="document_chunk")
+    viaEdge = _put(store, "memory linked by verified edge")
+    viaFacet = _put(store, "memory linked only by facet")
+    addFacet(store, chunk, "entity", "shared_e")
+    addFacet(store, viaFacet, "entity", "shared_e")
+    addEdge(store, {"src": chunk, "dst": viaEdge, "type": "relates",
+                    "weight": 0.9})
+    lines = Enricher(store).lines({"atomId": chunk})
+    joined = "\n".join(lines)
+    assert f"relates -> p3://{viaEdge}" in joined
+    assert viaFacet not in joined              # edges replace the facet join
+
+
+def test_edge_to_dead_memory_falls_back_to_facets(store):
+    chunk = _put(store, "chunk body", kind="document_chunk")
+    dead = _put(store, "superseded memory")
+    live = _put(store, "facet-linked memory")
+    addEdge(store, {"src": chunk, "dst": dead, "type": "relates",
+                    "weight": 0.9})
+    store._conn.execute(
+        "UPDATE atoms SET status='superseded' WHERE id=?", (dead,))
+    store._conn.commit()
+    addFacet(store, chunk, "entity", "shared_e")
+    addFacet(store, live, "entity", "shared_e")
+    lines = Enricher(store).lines({"atomId": chunk})
+    joined = "\n".join(lines)
+    assert dead not in joined                  # dead edge target never renders
+    assert f"relates -> p3://{live}" in joined # fallback still works
+
+
+def test_edges_ordered_by_weight_and_capped(store):
+    chunk = _put(store, "chunk body", kind="document_chunk")
+    mems = [_put(store, f"memory {i}") for i in range(4)]
+    weights = [0.2, 0.9, 0.5, 0.7]
+    for m, w in zip(mems, weights):
+        addEdge(store, {"src": chunk, "dst": m, "type": "relates",
+                        "weight": w})
+    lines = Enricher(store, relatedLimit=2).lines({"atomId": chunk})
+    rel = [l for l in lines if l.startswith("relates ->")]
+    assert len(rel) == 2
+    assert f"p3://{mems[1]}" in rel[0]         # 0.9 first
+    assert f"p3://{mems[3]}" in rel[1]         # 0.7 second

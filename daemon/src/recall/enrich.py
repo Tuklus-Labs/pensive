@@ -6,11 +6,13 @@ this is a handful of file reads and one facet query per recall):
 - **Location line** ``at <ref-path>#L<start>-<end>``: the chunk's stored text
   located in its source file by whitespace-normalized search. The chunker that
   produced the corpus is irrelevant because the text itself is the key.
-- **Relation lines** ``relates -> p3://<atomId> <gist>``: memory-kind atoms
-  sharing entity facets with the chunk, rarest-shared-entity first (specificity
-  = 1/frequency, summed over shared entities). Same grammar as Tier-2 edge
-  lines, so when the Phase C campaign materializes real relates edges the
-  payload format does not change.
+- **Relation lines** ``relates -> p3://<atomId> <gist>``: when the chunk has
+  LIVE outgoing ``relates`` edges to live memory atoms, those render (weight
+  desc, capped at ``relatedLimit``). Chunks the Phase C campaign has not
+  covered yet have no such edges, so they fall back to memory-kind atoms
+  sharing entity facets with the chunk, rarest-shared-entity first
+  (specificity = 1/frequency, summed over shared entities). Same grammar
+  either way, so the payload format does not change across the campaign.
 
 Failure policy: every miss (unknown ref root, missing/oversized/binary file,
 text not found, no shared facets) yields NO line, never an exception. Recall
@@ -123,6 +125,31 @@ def relatedMemory(store, atomId, limit=3):
     return out
 
 
+def _edgeRelations(store, chunkId, limit):
+    """LIVE relates edges from a chunk -> [(memId, gist)] by weight desc.
+
+    Only edges whose destination is a live atom render (parity with the
+    Tier-2 rule: never dangle a pointer at a non-recallable atom). Returns
+    [] when the chunk has no live relates edges, which is the signal to fall
+    back to the facet join.
+    """
+    rows = store._conn.execute(
+        "SELECT e.dst_atom FROM edges e "
+        "JOIN atoms a ON a.id = e.dst_atom "
+        "WHERE e.src_atom = ? AND e.type = 'relates' "
+        "AND a.status = 'live' "
+        "ORDER BY e.weight DESC, e.dst_atom LIMIT ?",
+        (chunkId, limit),
+    ).fetchall()
+    out = []
+    for (memId,) in rows:
+        atom = getAtom(store, memId)
+        if atom is None:
+            continue
+        out.append((memId, _gist(atom["text"])))
+    return out
+
+
 class Enricher:
     """Per-recall enrichment: furniture lines for one result dict.
 
@@ -148,8 +175,12 @@ class Enricher:
                 if span is not None:
                     base = ref.split("#", 1)[0]
                     out.append(f"at {base}#L{span[0]}-{span[1]}")
-        for memId, gist in relatedMemory(
-                self._store, result["atomId"], self._relatedLimit):
+        relations = _edgeRelations(
+            self._store, result["atomId"], self._relatedLimit)
+        if not relations:
+            relations = relatedMemory(
+                self._store, result["atomId"], self._relatedLimit)
+        for memId, gist in relations:
             out.append(f"relates -> p3://{memId} {gist}")
         return out
 
