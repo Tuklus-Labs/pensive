@@ -220,7 +220,31 @@ def assembleTier2(store, atomId, confidence=0.0, supersededBy=None):
     return entry
 
 
-def assemblePayload(store, results, tokenBudget):
+def _enrichedEntry(store, result, enricher, remainingBudget):
+    """Tier-1 entry plus enricher lines, degraded to fit remainingBudget.
+
+    Degrade order (spec: attachments go first, bodies are never touched):
+    drop ``relates`` lines from the end one at a time, then the ``at`` line,
+    then the bare entry. Returns the best-fitting string, which may still
+    exceed remainingBudget (the caller's atomic-drop rule then applies to the
+    WHOLE entry, exactly as for a bare oversized entry). An enricher that
+    raises is treated as no enricher for this entry: serve-time enrichment is
+    best-effort by contract and must never break recall.
+    """
+    entry = tier1Entry(store, result)
+    try:
+        extra = list(enricher.lines(result))
+    except Exception:
+        extra = []
+    while extra:
+        candidate = entry + _LINE_SEPARATOR + _LINE_SEPARATOR.join(extra)
+        if estimateTokens(candidate) <= remainingBudget:
+            return candidate
+        extra.pop()  # relates lines shed from the end; the at line goes last
+    return entry
+
+
+def assemblePayload(store, results, tokenBudget, enricher=None):
     """Assemble the recall payload from trust results -> ``(payload, tokens, lowConf)``.
 
     ``results`` is the trust-annotated, best-first (reranked-order) list. Two modes:
@@ -236,6 +260,9 @@ def assemblePayload(store, results, tokenBudget):
       handles of the best untrusted hits, budget permitting. Never a Tier-1 body --
       weak matches are oriented, not padded. ``lowConf`` is True.
 
+    ``enricher`` (optional) appends per-result furniture lines that degrade before
+    anything else under budget; None preserves the exact legacy payload.
+
     ``tokens`` is ``estimateTokens`` of the FINAL payload string (furniture and
     separators included)."""
     if not any(r.get("shouldTrust") for r in results):
@@ -243,7 +270,14 @@ def assemblePayload(store, results, tokenBudget):
 
     entries = []
     for result in results:
-        entry = tier1Entry(store, result)
+        if enricher is not None:
+            joined = _ENTRY_SEPARATOR.join(entries) if entries else ""
+            used = estimateTokens(joined) if entries else 0
+            sep = estimateTokens(_ENTRY_SEPARATOR) if entries else 0
+            entry = _enrichedEntry(store, result, enricher,
+                                   tokenBudget - used - sep)
+        else:
+            entry = tier1Entry(store, result)
         trial = _ENTRY_SEPARATOR.join(entries + [entry])
         if estimateTokens(trial) <= tokenBudget:
             entries.append(entry)
