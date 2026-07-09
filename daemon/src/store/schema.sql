@@ -23,7 +23,7 @@ CREATE INDEX IF NOT EXISTS idx_atoms_status  ON atoms(status);
 CREATE TABLE IF NOT EXISTS provenance (
   id          TEXT PRIMARY KEY,           -- ULID
   atom_id     TEXT NOT NULL REFERENCES atoms(id),
-  source      TEXT NOT NULL,              -- claude-code|codex|explicit-emit|bulk-import|distiller; person-* reserved for person imports and supersession exclusion
+  source      TEXT NOT NULL,              -- claude-code|codex|explicit-emit|bulk-import|distiller|repair-tool; person-* reserved for person imports and supersession exclusion
   session_id  TEXT,
   agent       TEXT,
   source_ref  TEXT,                       -- transcript span/file/message id

@@ -11,6 +11,7 @@ if str(_DAEMON / "tools") not in sys.path:
 
 from repair_passes import repairKvCacheRefs, dedupReferenceLibrary
 from store.store import openStore, putAtom
+from util.ulid import ulid
 
 
 @pytest.fixture
@@ -67,6 +68,17 @@ def test_non_files_summary_reported_not_guessed(store, tmp_path):
     ref = store._conn.execute(
         "SELECT source_ref FROM provenance LIMIT 1").fetchone()[0]
     assert ref == "kv_cache/vector_meta.db#rowid=3"  # untouched
+
+
+def test_null_summary_reported_not_crashed(store, tmp_path):
+    _putChunk(store, "body", "kv_cache/vector_meta.db#rowid=5")
+    old = _makeOldDb(tmp_path, [(5, None)])
+    report = repairKvCacheRefs(store, old)
+    assert report["noPathInSummary"] == 1
+    assert report["rewritten"] == 0
+    ref = store._conn.execute(
+        "SELECT source_ref FROM provenance LIMIT 1").fetchone()[0]
+    assert ref == "kv_cache/vector_meta.db#rowid=5"  # untouched
 
 
 def test_missing_rowid_reported(store, tmp_path):
@@ -151,6 +163,32 @@ def test_multiple_twins_reported_not_guessed(store):
     report = dedupReferenceLibrary(store)
     assert report["superseded"] == 0
     assert report["multipleTwins"] == 1
+
+
+def test_dedup_multi_provenance_dup_superseded_once(store):
+    """A dup atom with TWO reference-library provenance rows must be
+    superseded exactly once, not once per matching provenance row."""
+    dup, canon = _putPair(store, "77-multi.md", 1, "identical body text")
+    store._conn.execute(
+        "INSERT INTO provenance(id, atom_id, source, session_id, agent, "
+        "source_ref, recorded_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+        (ulid(), dup, "bulk-import", None, None,
+         "reference-library/77-multi.md#c1", 0),
+    )
+    store._conn.commit()
+    report = dedupReferenceLibrary(store)
+    assert report["superseded"] == 1
+    edges = store._conn.execute(
+        "SELECT src_atom, dst_atom FROM edges WHERE type='supersedes'"
+    ).fetchall()
+    assert edges == [(canon, dup)]
+    statuses = dict(store._conn.execute(
+        "SELECT id, status FROM atoms WHERE kind='document_chunk'").fetchall())
+    assert statuses[dup] == "superseded"
+    assert statuses[canon] == "live"
+    second = dedupReferenceLibrary(store)
+    assert second == {"superseded": 0, "noTwin": 0,
+                      "textMismatch": 0, "multipleTwins": 0}
 
 
 def test_dedup_idempotent(store):

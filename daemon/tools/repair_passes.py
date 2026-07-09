@@ -113,7 +113,16 @@ def dedupReferenceLibrary(store, sessionId=None):
     LIVE predicate excludes already-superseded copies, and the candidate scan
     excludes this pass's own provenance rows (source='repair-tool') so a
     survivor's supersede-record -- written with the loser's old source_ref --
-    is never mistaken for a fresh duplicate on rerun.
+    is never mistaken for a fresh duplicate on rerun. Provenance rows this
+    pass writes (source='repair-tool') are excluded from the candidate scan
+    by design, so the pass's own writes can never re-trigger it.
+
+    The candidate scan JOINs provenance, so an atom with more than one
+    matching ``reference-library/...`` provenance row would otherwise surface
+    once per row. The loop dedupes candidate atom ids (first occurrence wins)
+    and re-checks each dup's status immediately before superseding it, so a
+    multi-provenance dup is superseded at most once even if the dedupe above
+    were ever bypassed.
     """
     report = {"superseded": 0, "noTwin": 0, "textMismatch": 0,
               "multipleTwins": 0}
@@ -124,7 +133,11 @@ def dedupReferenceLibrary(store, sessionId=None):
         "AND p.source_ref LIKE ? AND p.source != 'repair-tool'",
         (_REFLIB_DUP_ROOT + "%",)
     ).fetchall()
+    seen = set()
     for dupId, ref, text in dups:
+        if dupId in seen:
+            continue
+        seen.add(dupId)
         tail = ref[len(_REFLIB_DUP_ROOT):]
         twins = store._conn.execute(
             "SELECT a.id, a.text FROM atoms a "
@@ -142,6 +155,15 @@ def dedupReferenceLibrary(store, sessionId=None):
         twinId, twinText = twins[0]
         if twinText != text:
             report["textMismatch"] += 1
+            continue
+        # Fresh single-row status check right before the write: a
+        # multi-provenance dup could otherwise be superseded twice (inflated
+        # count, redundant edge+provenance) if it ever reached this point
+        # more than once. Not counted as superseded when already handled.
+        current = store._conn.execute(
+            "SELECT status FROM atoms WHERE id = ?", (dupId,)
+        ).fetchone()
+        if current is None or current[0] != 'live':
             continue
         prov = {"source": "repair-tool", "sourceRef": ref}
         if sessionId is not None:
