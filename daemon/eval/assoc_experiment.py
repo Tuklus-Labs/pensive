@@ -28,7 +28,7 @@ from recall.rerank import rerank  # noqa: E402
 from recall.signals import bm25, dense, facetSignal  # noqa: E402
 from recall.strata import classesForKinds  # noqa: E402
 from recall.trust import assessTrust  # noqa: E402
-from recall.vector_index import FlatIndex, buildClassIndexes  # noqa: E402
+from recall.vector_index import buildClassIndexes  # noqa: E402
 from store.store import edgesFrom, edgesTo, openStore  # noqa: E402
 
 MODEL_ID = gate_mod.MODEL_ID

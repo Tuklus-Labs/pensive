@@ -166,7 +166,7 @@ class _BombIndex:
     def search(self, vec, k):
         raise AssertionError("index.search must not be called")
 
-    def build(self, store, modelId):
+    def build(self, store, modelId, kinds=None):
         raise AssertionError("index.build must not be called")
 
 
@@ -486,9 +486,9 @@ def test_project_matching_nothing_returns_sentinel_without_touching_models(store
 
 
 def test_kinds_filter_excluding_everything_returns_sentinel(store, embedder):
-    # A kinds filter that matches no atom empties the fused list before rerank ->
-    # sentinel. (Dense runs, so the embedder is needed; the reranker is not, since
-    # the pipeline short-circuits before it.)
+    # A kinds filter naming no known kind yields no classes, so recall short-
+    # circuits to the sentinel before any signal runs (neither dense nor the
+    # reranker execute). The embedder is only used to build the fixture indexes.
     for i in range(5):
         _put(store, f"acoustic modem note {i}", kind="atom")
     indexes = _indexes(store, embedder)

@@ -50,7 +50,7 @@ if str(_DAEMON_SRC) not in sys.path:
 
 from recall.engine import recall  # noqa: E402
 from recall.embedder import Embedder, embedMissing  # noqa: E402
-from recall.vector_index import FlatIndex, buildClassIndexes  # noqa: E402
+from recall.vector_index import buildClassIndexes  # noqa: E402
 from ingest.backfill import backfill  # noqa: E402
 from store.store import openStore  # noqa: E402
 

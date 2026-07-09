@@ -10,8 +10,9 @@ reranker (the real relevance judge) ever sees it. These helpers let the engine
 generate candidates per class and fill the rerank head by round-robin, so both
 populations reach the reranker and the winner is decided on relevance, not count.
 
-Nothing here touches the model or the vector index; it is deliberately dependency
--free so both ``signals`` and ``vector_index`` can import it without a cycle.
+Nothing here touches the model or the vector index; it is deliberately
+dependency-free so both ``signals`` and ``vector_index`` can import it without a
+cycle.
 """
 
 __all__ = [
