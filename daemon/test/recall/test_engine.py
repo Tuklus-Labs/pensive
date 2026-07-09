@@ -46,7 +46,7 @@ from recall.payload import (
     GIST_CHARS,
 )
 from recall.embedder import Embedder, embedMissing
-from recall.vector_index import FlatIndex
+from recall.vector_index import FlatIndex, buildClassIndexes
 from store.store import openStore, putAtom, addEdge, supersede, addFacet
 
 MODEL_ID = "BAAI/bge-small-en-v1.5"
@@ -105,6 +105,12 @@ def store(tmp_path):
         s.close()
 
 
+@pytest.fixture
+def indexes(store, embedder):
+    embedMissing(store, embedder)
+    return buildClassIndexes(store, MODEL_ID)
+
+
 def _put(store, text, project="aegis", kind="atom", occurredAt=None,
          importance=0.0, source="claude-code", agent=None, sessionId=None):
     prov = {"source": source}
@@ -142,13 +148,25 @@ def _index(store, embedder):
     return FlatIndex().build(store, MODEL_ID)
 
 
+def _indexes(store, embedder):
+    embedMissing(store, embedder)
+    return buildClassIndexes(store, MODEL_ID)
+
+
+# Opaque per-class sentinels for stub tests: dense is monkeypatched and ignores
+# its index arg, so these only need to make indexes.get(name) truthy so the
+# stubbed dense is still exercised once per class.
+_SENTINEL = object()
+_STUB_INDEXES = {"memory": _SENTINEL, "code": _SENTINEL}
+
+
 class _BombIndex:
     """Every method explodes: proves a code path never touched the index."""
 
     def search(self, vec, k):
         raise AssertionError("index.search must not be called")
 
-    def build(self, store, modelId):
+    def build(self, store, modelId, kinds=None):
         raise AssertionError("index.build must not be called")
 
 
@@ -182,10 +200,19 @@ def _stub_recall_dependencies(monkeypatch, fused, reranked):
         "boostSet": set(),
         "filterSet": None,
     })
-    monkeypatch.setattr(engine, "bm25", lambda store, query, k: [])
+    monkeypatch.setattr(engine, "bm25", lambda store, query, k, kinds=None: [])
     monkeypatch.setattr(engine, "dense", lambda index, embedder, query, k: [])
     monkeypatch.setattr(engine, "rrf", lambda hits: list(fused))
     monkeypatch.setattr(engine, "applyPriors", lambda fusedPairs, store, hints: fusedPairs)
+    # These tail-append tests use synthetic fused ids that are not real atoms, so
+    # the real splitByClass (a store SELECT) would drop them all. Stub it to a
+    # single populated bucket in fused order; the real interleave then builds the
+    # head as that list's prefix, exactly the old fused[:RERANK_HEAD]. Cross-class
+    # interleaving is covered by test_rerank_head_is_interleaved_across_classes.
+    monkeypatch.setattr(engine, "splitByClass", lambda fusedPairs, store, classNames: {
+        name: (list(fusedPairs) if i == 0 else [])
+        for i, name in enumerate(classNames)
+    })
 
     def rerankSpy(query, candidates, store):
         seen["rerank_candidates"] = list(candidates)
@@ -209,6 +236,84 @@ def _stub_recall_dependencies(monkeypatch, fused, reranked):
 
 
 # --------------------------------------------------------------------------- #
+# Stratified recall: both classes reach the reranker; the head interleaves      #
+# --------------------------------------------------------------------------- #
+
+
+def test_memory_intent_query_surfaces_memory_over_code(
+        store, embedder, indexes, _rerankerWarm):
+    # A store flooded with code chunks (the real-world 20:1 shape, scaled down)
+    # plus a few reasoning-memory atoms. A memory-shaped query must return a
+    # memory-kind atom at the top, not a code chunk, because both classes reached
+    # the reranker and the reranker sorted on relevance.
+    for i in range(40):
+        _put(store, f"def handler_{i}(req): return route(req, table_{i})",
+             kind="document_chunk")
+    good = _put(store,
+                "we decided to migrate the ingest pipeline to stratified recall "
+                "next sprint because the code corpus was starving memory",
+                kind="atom")
+    idx = buildClassIndexes(store, MODEL_ID)  # rebuild after inserts
+    out = recall(store, idx, embedder,
+                 "what did we decide about the ingest pipeline migration", k=5)
+    topId = out["results"][0]["atomId"]
+    assert topId == good
+
+
+def test_code_intent_query_surfaces_the_right_chunk(
+        store, embedder, _rerankerWarm):
+    for i in range(20):
+        _put(store, f"notes on sprint planning meeting number {i}", kind="atom")
+    target = _put(store,
+                  "def _compile(self): acquire build_lock then publish the csr "
+                  "matrix only if the graph generation has not moved",
+                  kind="document_chunk")
+    idx = buildClassIndexes(store, MODEL_ID)
+    out = recall(store, idx, embedder,
+                 "csr matrix compile build lock generation publish", k=5)
+    topId = out["results"][0]["atomId"]
+    assert topId == target
+
+
+def test_rerank_head_is_interleaved_across_classes(store, monkeypatch):
+    # White-box: with equal-length per-class fused lists, the head handed to
+    # rerank must alternate memory, code, memory, code ... (choke point 2 fixed).
+    mem = [_put(store, f"memory {i}", kind="atom") for i in range(5)]
+    code = [_put(store, f"code {i}", kind="document_chunk") for i in range(5)]
+    # fused order: all memory first, then all code. Naive fused[:RERANK_HEAD] would
+    # put every memory ahead of every code; interleave must alternate them.
+    fused = [(a, 100 - i) for i, a in enumerate(mem)] + \
+            [(a, 50 - i) for i, a in enumerate(code)]
+
+    seen = {}
+    monkeypatch.setattr(engine, "facetSignal",
+                        lambda store, hints: {"boostSet": set(), "filterSet": None})
+    monkeypatch.setattr(engine, "bm25", lambda store, query, k, kinds=None: [])
+    monkeypatch.setattr(engine, "dense", lambda index, embedder, query, k: [])
+    monkeypatch.setattr(engine, "rrf", lambda hits: list(fused))
+    monkeypatch.setattr(engine, "applyPriors",
+                        lambda fusedPairs, store, hints: fusedPairs)
+
+    def rerankSpy(query, candidates, store):
+        seen["head"] = [a for a, _ in candidates]
+        return list(candidates)
+
+    monkeypatch.setattr(engine, "rerank", rerankSpy)
+    monkeypatch.setattr(engine, "assessTrust",
+                        lambda pairs, hits, store, now: [
+                            _result(a, 0.9, True, score=s) for a, s in pairs])
+    monkeypatch.setattr(engine, "assemblePayload",
+                        lambda store, results, tokenBudget: ("payload", 1, False))
+
+    recall(store, {"memory": None, "code": None}, _BombEmbedder(),
+           "irrelevant", k=10)
+    head = seen["head"]
+    # First four head slots alternate memory, code, memory, code.
+    assert head[0] in mem and head[1] in code
+    assert head[2] in mem and head[3] in code
+
+
+# --------------------------------------------------------------------------- #
 # Step 1: full pipeline over a seeded 100-atom store                          #
 # --------------------------------------------------------------------------- #
 
@@ -222,10 +327,10 @@ def test_recall_100_atoms_ordered_with_confidence_within_budget(
     # module's own heuristic is <= tokenBudget.
     for text in _hundred_texts():
         _put(store, text)
-    index = _index(store, embedder)
+    indexes = _indexes(store, embedder)
 
     out = recall(
-        store, index, embedder,
+        store, indexes, embedder,
         "acoustic modems trade range for data rate",
         k=10, tokenBudget=1500,
     )
@@ -255,7 +360,7 @@ def test_recall_reranks_only_head_and_appends_tail_in_rrf_order(
     rerankedHead = list(reversed(fused[:RERANK_HEAD]))
     seen = _stub_recall_dependencies(monkeypatch, fused, rerankedHead)
 
-    out = recall(store, _BombIndex(), _BombEmbedder(), "query", k=poolSize)
+    out = recall(store, _STUB_INDEXES, _BombEmbedder(), "query", k=poolSize)
 
     expected = rerankedHead + fused[RERANK_HEAD:]
     assert seen["rerank_candidates"] == fused[:RERANK_HEAD]
@@ -271,7 +376,7 @@ def test_recall_reranks_whole_pool_when_pool_is_below_head_cap(
     reranked = list(reversed(fused))
     seen = _stub_recall_dependencies(monkeypatch, fused, reranked)
 
-    out = recall(store, _BombIndex(), _BombEmbedder(), "query", k=len(fused))
+    out = recall(store, _STUB_INDEXES, _BombEmbedder(), "query", k=len(fused))
 
     assert seen["rerank_candidates"] == fused
     assert seen["assessed_pairs"] == reranked
@@ -298,10 +403,10 @@ def test_timescope_restricts_results_to_the_window(store, embedder, _rerankerWar
         _put(store, f"sonar bathymetry survey grid line out {i}", occurredAt=outTime)
         for i in range(4)
     }
-    index = _index(store, embedder)
+    indexes = _indexes(store, embedder)
 
     out = recall(
-        store, index, embedder, "sonar bathymetry survey grid",
+        store, indexes, embedder, "sonar bathymetry survey grid",
         timeScope=(windowStart, windowEnd), k=10,
     )
 
@@ -323,9 +428,9 @@ def test_entity_facet_threads_into_the_why(store, embedder, _rerankerWarm):
     hit = _put(store, "notes about the pensive memory engine and its recall path")
     addFacet(store, hit, "entity", "pensive")
     _put(store, "unrelated acoustic modem range note")
-    index = _index(store, embedder)
+    indexes = _indexes(store, embedder)
 
-    out = recall(store, index, embedder, "what did we learn about pensive recall", k=10)
+    out = recall(store, indexes, embedder, "what did we learn about pensive recall", k=10)
 
     byId = {r["atomId"]: r for r in out["results"]}
     assert hit in byId
@@ -346,10 +451,10 @@ def test_superseded_after_index_build_surfaces_chained_provenance(
     # successor, and the payload must render that "superseded by" provenance line.
     old = _put(store, "the pressure hull rates to 488 meters of depth")
     new = _put(store, "the pressure hull now rates to 500 meters of depth")
-    index = _index(store, embedder)          # both live, both indexed
+    indexes = _indexes(store, embedder)      # both live, both indexed
     supersede(store, old, new, {"source": "claude-code"})  # index now stale for old
 
-    out = recall(store, index, embedder, "pressure hull depth rating", k=10)
+    out = recall(store, indexes, embedder, "pressure hull depth rating", k=10)
 
     byId = {r["atomId"]: r for r in out["results"]}
     assert old in byId
@@ -371,7 +476,8 @@ def test_project_matching_nothing_returns_sentinel_without_touching_models(store
     # sentinel, BEFORE any signal runs. Bomb index/embedder prove no model work.
     _put(store, "an aegis note", project="aegis")
 
-    out = recall(store, _BombIndex(), _BombEmbedder(), "note", project="ghost", k=10)
+    out = recall(store, {"memory": _BombIndex(), "code": _BombIndex()},
+                 _BombEmbedder(), "note", project="ghost", k=10)
 
     assert out["results"] == []
     assert out["payload"] == SENTINEL_LOW_CONFIDENCE
@@ -380,14 +486,14 @@ def test_project_matching_nothing_returns_sentinel_without_touching_models(store
 
 
 def test_kinds_filter_excluding_everything_returns_sentinel(store, embedder):
-    # A kinds filter that matches no atom empties the fused list before rerank ->
-    # sentinel. (Dense runs, so the embedder is needed; the reranker is not, since
-    # the pipeline short-circuits before it.)
+    # A kinds filter naming no known kind yields no classes, so recall short-
+    # circuits to the sentinel before any signal runs (neither dense nor the
+    # reranker execute). The embedder is only used to build the fixture indexes.
     for i in range(5):
         _put(store, f"acoustic modem note {i}", kind="atom")
-    index = _index(store, embedder)
+    indexes = _indexes(store, embedder)
 
-    out = recall(store, index, embedder, "acoustic modem", kinds=["nonexistent_kind"], k=10)
+    out = recall(store, indexes, embedder, "acoustic modem", kinds=["nonexistent_kind"], k=10)
 
     assert out["results"] == []
     assert out["payload"] == SENTINEL_LOW_CONFIDENCE
@@ -401,7 +507,8 @@ def test_whitespace_query_returns_sentinel_without_touching_models(store):
     _put(store, "some content")
 
     for q in ["", "   ", "\t\n  "]:
-        out = recall(store, _BombIndex(), _BombEmbedder(), q, k=10)
+        out = recall(store, {"memory": _BombIndex(), "code": _BombIndex()},
+                     _BombEmbedder(), q, k=10)
         assert out["results"] == []
         assert out["payload"] == SENTINEL_LOW_CONFIDENCE
         assert out["lowConfidence"] is True

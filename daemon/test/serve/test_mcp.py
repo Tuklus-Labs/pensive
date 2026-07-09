@@ -573,6 +573,34 @@ def test_pensive_analytics_returns_v3_store_shape_json(ctx):
     assert data["store"]["byStatus"]["live"] == 2
 
 
+def test_serve_context_holds_class_indexes_and_recall_prefers_memory(tmp_path):
+    from recall.embedder import Embedder
+    from serve.mcp import ServeContext, handle_recall
+    from store.store import openStore, putAtom
+
+    store = openStore(tmp_path / "mem.db")
+    try:
+        for i in range(30):
+            putAtom(store, {
+                "text": f"def route_{i}(r): return dispatch(r, {i})",
+                "kind": "document_chunk", "project": "aegis",
+                "importance": 0.0, "provenance": {"source": "bulk-import"},
+            })
+        putAtom(store, {
+            "text": "we chose Authelia forward-auth as the default web perimeter",
+            "kind": "atom", "project": "aegis",
+            "importance": 0.0, "provenance": {"source": "claude-code"},
+        })
+        ctx = ServeContext(store, Embedder("BAAI/bge-small-en-v1.5"),
+                           "BAAI/bge-small-en-v1.5")
+        assert set(ctx.indexes.keys()) == {"memory", "code"}
+        out = handle_recall(ctx, {"query": "what did we choose for web auth",
+                                  "k": 3})
+        assert "Authelia" in out
+    finally:
+        store.close()
+
+
 # --------------------------------------------------------------------------- #
 # End-to-end smoke: serve over the real transport, clean SIGINT shutdown         #
 # --------------------------------------------------------------------------- #

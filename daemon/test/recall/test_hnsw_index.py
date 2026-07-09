@@ -430,15 +430,17 @@ def test_select_index_counts_only_live_embedded_atoms(embedder, store, monkeypat
 
 
 def test_daemon_startup_uses_factory_and_selects_flat_at_shadow_scale(embedder, store):
-    """The daemon builds its resident index through ServeContext, which now goes
-    through selectIndex. At shadow scale that still returns a FlatIndex, so the
-    serving path is byte-for-byte the pre-Task-15 behavior."""
+    """The daemon builds its resident indexes through ServeContext, which now goes
+    through buildClassIndexes -> selectIndex per kind-class. At shadow scale every
+    class is below the HNSW threshold, so each resident dense index is an exact
+    FlatIndex and the serving path stays byte-for-byte the pre-Task-15 behavior."""
     from serve.mcp import ServeContext
 
     for s in _SMALL_TEXTS:
         _put(store, s)
     ctx = ServeContext(store, embedder, MODEL_ID)
-    assert isinstance(ctx.index, FlatIndex)
+    assert set(ctx.indexes) == {"memory", "code"}
+    assert all(isinstance(idx, FlatIndex) for idx in ctx.indexes.values())
 
 
 # A clean-room child that seeds embeddings directly (no real embedder needed),

@@ -55,15 +55,19 @@ class HnswIndex(VectorIndex):
         # and search() short-circuits to [] on it.
         self._index = None
 
-    def build(self, store, modelId):
+    def build(self, store, modelId, kinds=None):
         # EXACTLY FlatIndex.build's query: same LIVE filter, same model, same
-        # ORDER BY -- the two indexes must load one identical candidate universe.
+        # optional kinds restriction, same ORDER BY -- the flat and HNSW indexes
+        # for a given class must load one identical candidate universe.
+        from recall.strata import kindInClause
+
+        kindClause, kindParams = kindInClause(kinds, alias="a")
         rows = store._conn.execute(
             "SELECT e.atom_id, e.vector FROM embeddings e "
             "JOIN atoms a ON a.id = e.atom_id "
-            "WHERE e.model_id = ? AND a.status = 'live' "
+            "WHERE e.model_id = ? AND a.status = 'live'" + kindClause + " "
             "ORDER BY e.atom_id",
-            (modelId,),
+            (modelId, *kindParams),
         ).fetchall()
         self._atomIds = [r[0] for r in rows]
         if not rows:

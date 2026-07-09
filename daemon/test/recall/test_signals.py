@@ -176,6 +176,33 @@ def test_bm25_caps_huge_query_and_still_matches_early_tokens(store):
     assert doc in ids
 
 
+def test_bm25_kinds_filter_scopes_to_requested_kinds(store):
+    from recall.signals import bm25
+    from store.store import putAtom
+
+    def put(text, kind):
+        return putAtom(store, {
+            "text": text, "kind": kind, "project": "aegis",
+            "importance": 0.0, "provenance": {"source": "claude-code"},
+        })
+
+    memId = put("the migration plan for the ingest pipeline", "atom")
+    codeId = put("the migration plan for the ingest pipeline", "document_chunk")
+
+    allHits = {a for a, _ in bm25(store, "migration ingest pipeline", 200)}
+    assert memId in allHits and codeId in allHits
+
+    memOnly = {a for a, _ in bm25(store, "migration ingest pipeline", 200,
+                                  kinds=("atom", "narrative", "snapshot"))}
+    assert memId in memOnly
+    assert codeId not in memOnly
+
+    codeOnly = {a for a, _ in bm25(store, "migration ingest pipeline", 200,
+                                   kinds=("document_chunk",))}
+    assert codeId in codeOnly
+    assert memId not in codeOnly
+
+
 # --------------------------------------------------------------------------- #
 # dense                                                                       #
 # --------------------------------------------------------------------------- #

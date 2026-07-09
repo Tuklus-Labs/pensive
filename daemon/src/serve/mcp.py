@@ -43,7 +43,7 @@ from mcp.types import CallToolResult, TextContent, Tool
 
 from recall.engine import recall
 from recall.embedder import embedMissing
-from recall.vector_index import FlatIndex, selectIndex
+from recall.vector_index import buildClassIndexes
 from recall.payload import assembleTier2
 from serve import viz
 from store.store import (
@@ -94,16 +94,15 @@ class ServeContext:
     """Everything the handlers need, loaded once and reused.
 
     Holds the canonical ``store``, a resident ``embedder``, the ``modelId`` they
-    agree on, and a ``FlatIndex`` rebuilt from the store's embeddings. ``agent``
-    is stamped into emit provenance when the caller is known.
+    agree on, and ``indexes``: one dense index per kind-class (``memory``,
+    ``code``, ...), built by ``buildClassIndexes`` and rebuilt by ``reindex``, so
+    memory and code atoms are searched from separate pools instead of one mixed
+    index. ``agent`` is stamped into emit provenance when the caller is known.
 
-    ``reindex`` embeds any not-yet-embedded live atoms and rebuilds the dense
-    index, so an atom written by an emit/correct becomes recallable by BOTH the
+    ``reindex`` embeds any not-yet-embedded live atoms and rebuilds the per-class
+    indexes, so an atom written by an emit/correct becomes recallable by BOTH the
     lexical (query-time) and dense (index) signals on the next call. It runs at
-    construction and after every mutating tool. The concrete index comes from
-    ``selectIndex``, the Task 15 size switch: at shadow scale it returns the exact
-    ``FlatIndex`` (serving behavior unchanged), and only past ``HNSW_THRESHOLD``
-    would it hand back the approximate HNSW index. A full rebuild per emit is the
+    construction and after every mutating tool. A full rebuild per emit is the
     known cost an incremental index would later retire; for the shadow daemon it is
     correct and cheap enough.
     """
@@ -116,17 +115,14 @@ class ServeContext:
         self.agent = agent
         self.defaultK = defaultK
         self.defaultTokenBudget = defaultTokenBudget
-        self.index = FlatIndex()
+        self.indexes = {}
         self.recallLogErrors = 0
         self.reindex()
 
     def reindex(self):
-        """Embed missing live atoms and rebuild the dense index from the store.
-
-        The index type is chosen by ``selectIndex`` from the store's current size,
-        so the daemon rides the flat->HNSW switch automatically as it grows."""
+        """Embed missing live atoms and rebuild the per-class dense indexes."""
         embedMissing(self.store, self.embedder)
-        self.index = selectIndex(self.store, self.modelId)
+        self.indexes = buildClassIndexes(self.store, self.modelId)
 
 
 # --------------------------------------------------------------------------- #
@@ -313,7 +309,7 @@ def handle_pensive_recall(ctx, args):
     project = args.get("project", "") or None      # "" (legacy default) -> no filter
     limit = int(args.get("limit", 10))
     out = recall(
-        ctx.store, ctx.index, ctx.embedder, query,
+        ctx.store, ctx.indexes, ctx.embedder, query,
         project=project, k=limit, tokenBudget=ctx.defaultTokenBudget,
     )
     results = out["results"]
@@ -382,7 +378,7 @@ def handle_recall(ctx, args):
         timeScope = (int(timeScope[0]), int(timeScope[1]))
     kinds = args.get("kinds")
     out = recall(
-        ctx.store, ctx.index, ctx.embedder, query,
+        ctx.store, ctx.indexes, ctx.embedder, query,
         project=project, timeScope=timeScope, kinds=kinds,
         k=k, tokenBudget=tokenBudget,
     )

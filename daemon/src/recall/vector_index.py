@@ -18,8 +18,10 @@ import abc
 import numpy as np
 
 from recall.embedder import blobToVec
+from recall.strata import KIND_CLASSES, kindInClause
 
-__all__ = ["VectorIndex", "FlatIndex", "selectIndex", "HNSW_THRESHOLD"]
+__all__ = ["VectorIndex", "FlatIndex", "selectIndex", "buildClassIndexes",
+           "HNSW_THRESHOLD"]
 
 # Above this many embedded LIVE atoms, the exact flat scan's O(n)-per-query cost
 # stops being free and :func:`selectIndex` switches to the approximate HNSW index.
@@ -64,13 +66,14 @@ class FlatIndex(VectorIndex):
         # (n, dim) float32 of unit-normalized rows; empty until build().
         self._matrix = np.empty((0, 0), dtype=np.float32)
 
-    def build(self, store, modelId):
+    def build(self, store, modelId, kinds=None):
+        kindClause, kindParams = kindInClause(kinds, alias="a")
         rows = store._conn.execute(
             "SELECT e.atom_id, e.vector FROM embeddings e "
             "JOIN atoms a ON a.id = e.atom_id "
-            "WHERE e.model_id = ? AND a.status = 'live' "
+            "WHERE e.model_id = ? AND a.status = 'live'" + kindClause + " "
             "ORDER BY e.atom_id",
-            (modelId,),
+            (modelId, *kindParams),
         ).fetchall()
         self._atomIds = [r[0] for r in rows]
         if rows:
@@ -108,34 +111,54 @@ class FlatIndex(VectorIndex):
         return [(self._atomIds[i], float(scores[i])) for i in order]
 
 
-def _countEmbeddedLive(store, modelId):
+def _countEmbeddedLive(store, modelId, kinds=None):
     """Count embedded LIVE atoms for ``modelId`` -- the size the switch keys on.
 
     Mirrors the build-time filter EXACTLY (``embeddings`` joined to LIVE ``atoms``
-    for this model), so the count equals the number of vectors either index would
-    actually load. A raw ``embeddings`` row count would over-count superseded atoms
-    that are never in the index and could pick HNSW for a store that is small once
-    the dead rows are excluded.
+    for this model, same optional ``kinds`` restriction), so the count equals the
+    number of vectors the matching index would actually load. A raw ``embeddings``
+    row count would over-count superseded atoms that are never in the index and
+    could pick HNSW for a store that is small once the dead rows are excluded.
     """
+    kindClause, kindParams = kindInClause(kinds, alias="a")
     return store._conn.execute(
         "SELECT COUNT(*) FROM embeddings e "
         "JOIN atoms a ON a.id = e.atom_id "
-        "WHERE e.model_id = ? AND a.status = 'live'",
-        (modelId,),
+        "WHERE e.model_id = ? AND a.status = 'live'" + kindClause,
+        (modelId, *kindParams),
     ).fetchone()[0]
 
 
-def selectIndex(store, modelId):
-    """Build and return the right ``VectorIndex`` for the store's current size.
+def selectIndex(store, modelId, kinds=None):
+    """Build and return the right ``VectorIndex`` for this population's size.
 
-    Below :data:`HNSW_THRESHOLD` embedded live atoms, an exact ``FlatIndex``; at or
-    above it, the approximate ``HnswIndex``. Returns the index already BUILT, so a
-    caller (daemon startup) swaps one ``FlatIndex().build(...)`` call for this and
-    is otherwise unchanged. ``HnswIndex`` is imported lazily so that importing this
-    module -- and using ``FlatIndex`` at shadow scale -- never requires usearch.
+    Below :data:`HNSW_THRESHOLD` embedded live atoms (of ``kinds``, if given), an
+    exact ``FlatIndex``; at or above it, the approximate ``HnswIndex``. Returns the
+    index already BUILT. ``kinds`` scopes the index to one kind-class so a caller
+    can hold one index per population; ``kinds=None`` preserves the original
+    single-index contract (every live embedded atom). The count is taken over the
+    SAME ``kinds``, so a small minority class rides the exact flat scan even when
+    the whole store is past the threshold. ``HnswIndex`` is imported lazily so that
+    importing this module (and using ``FlatIndex`` at shadow scale) never requires
+    usearch.
     """
-    if _countEmbeddedLive(store, modelId) >= HNSW_THRESHOLD:
+    if _countEmbeddedLive(store, modelId, kinds) >= HNSW_THRESHOLD:
         from recall.hnsw_index import HnswIndex
 
-        return HnswIndex().build(store, modelId)
-    return FlatIndex().build(store, modelId)
+        return HnswIndex().build(store, modelId, kinds)
+    return FlatIndex().build(store, modelId, kinds)
+
+
+def buildClassIndexes(store, modelId):
+    """One built ``VectorIndex`` per kind-class in ``KIND_CLASSES``, keyed by name.
+
+    ``{"memory": <index>, "code": <index>}`` today. Each class picks flat vs HNSW
+    independently by its own live-embedded count, so the small memory population
+    gets an exact scan while the large code population gets the approximate graph.
+    An empty class (no live embedded atoms of its kinds) yields an empty but valid
+    index whose ``search`` returns ``[]``.
+    """
+    return {
+        name: selectIndex(store, modelId, kinds)
+        for name, kinds in KIND_CLASSES
+    }

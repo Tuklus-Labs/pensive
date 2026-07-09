@@ -4,8 +4,9 @@ Everything Tasks 6-9 built becomes a single call here. ``recall`` threads three
 parallel signals through fusion, priors, rerank, and trust, then hands the
 annotated results to the payload assembler:
 
-    signals (bm25 + dense + facet)  ->  RRF fusion  ->  facet boost  ->  priors
-        ->  kinds filter  ->  cross-encoder rerank  ->  trust  ->  tiered payload
+    per-class signals  ->  RRF fusion  ->  facet boost  ->  priors  ->  kinds
+        filter  ->  round-robin rerank head  ->  cross-encoder rerank  ->  trust
+        ->  tiered payload
 
 The ordering resolves ambiguities that span the parts, so it is fixed and worth
 stating in one place:
@@ -37,6 +38,7 @@ on: ``{results, payload, tokensUsed, lowConfidence}``.
 """
 import time
 
+from recall.strata import classesForKinds, interleave, splitByClass
 from recall.signals import bm25, dense, facetSignal
 from recall.fusion import rrf, applyPriors
 from recall.rerank import rerank
@@ -62,25 +64,30 @@ RERANK_HEAD = 64
 _SIGNAL_K = 200
 
 
-def recall(store, index, embedder, query, project=None, timeScope=None,
+def recall(store, indexes, embedder, query, project=None, timeScope=None,
            kinds=None, k=10, tokenBudget=1500):
     """Run the full recall pipeline and assemble a tiered payload.
 
-    ``store`` is the canonical store, ``index`` a built ``VectorIndex``,
-    ``embedder`` a loaded ``Embedder``. Options:
+    ``store`` is the canonical store, ``indexes`` a ``{className: VectorIndex}``
+    map (one built dense index per kind-class, from ``buildClassIndexes``), and
+    ``embedder`` a loaded ``Embedder``. Candidates are generated PER CLASS (a
+    kind-scoped bm25 list plus that class's own dense index), so the large code
+    corpus can no longer starve the smaller reasoning memory out of the pool.
+    Fusion, the facet boost, and priors run globally as before; the rerank head is
+    then filled by round-robin across the per-class fused rankings, so the
+    cross-encoder scores a fair mix and its scores decide the final order. Options:
 
     - ``project``: restrict recall to that project's live atoms (facet filter).
     - ``timeScope`` ``(startUnix, endUnix)``: restrict to atoms whose effective
       time falls in the inclusive window (applied once, in the priors stage).
-    - ``kinds``: keep only these atom kinds (batched filter before rerank).
+    - ``kinds``: restrict to these atom kinds. Stratification runs over only the
+      classes overlapping ``kinds`` (a single-class request degrades to today's
+      non-stratified behavior).
     - ``k``: number of results to return (default 10).
     - ``tokenBudget``: payload budget by the conservative heuristic (default 1500).
 
     Returns the ``RecallResult`` dict ``{results, payload, tokensUsed,
-    lowConfidence}``: ``results`` is the trust-annotated list in reranked order,
-    trimmed to ``k``; ``payload`` is the tiered plain-text block within budget;
-    ``tokensUsed`` is its heuristic token count; ``lowConfidence`` is True when no
-    result cleared the trust floor (payload is then the sentinel, never padded).
+    lowConfidence}``.
     """
     now = int(time.time())
 
@@ -108,9 +115,20 @@ def recall(store, index, embedder, query, project=None, timeScope=None,
     if filterSet is not None and not filterSet:
         return _emptyResult(store, tokenBudget)
 
-    # 2. Candidate signals, top-200 each.
-    bmHits = bm25(store, query, _SIGNAL_K)
-    dnHits = dense(index, embedder, query, _SIGNAL_K)
+    # 2. Per-class candidate generation. classesForKinds(None) is every class;
+    #    a kinds subset narrows to the overlapping classes. No class -> sentinel.
+    classes = classesForKinds(kinds)
+    if not classes:
+        return _emptyResult(store, tokenBudget)
+    classNames = [name for name, _ in classes]
+
+    bmHits = []
+    dnHits = []
+    for name, classKinds in classes:
+        bmHits.extend(bm25(store, query, _SIGNAL_K, kinds=classKinds))
+        classIndex = indexes.get(name)
+        if classIndex is not None:
+            dnHits.extend(dense(classIndex, embedder, query, _SIGNAL_K))
 
     # signalHits: which of {bm25, dense, facet} hit each atom, drawn from the raw
     # top-200 lists and the boostSet. Trust reads this as explanation evidence.
@@ -145,24 +163,28 @@ def recall(store, index, embedder, query, project=None, timeScope=None,
         priorHints["timeScope"] = timeScope
     fused = applyPriors(fused, store, priorHints)
 
-    # 7. kinds filter before rerank, so the rerank head is spent on eligible atoms
-    #    only. An empty result here (nothing of the wanted kind) short-circuits.
+    # 7. kinds filter before the head is built: the per-class dense index for a
+    #    class returns every kind in that class, so an explicit narrow kinds
+    #    request (e.g. only 'narrative') still needs this to drop the other
+    #    in-class kinds. An empty result here short-circuits.
     if kinds is not None:
         fused = _filterKinds(store, fused, kinds)
 
     if not fused:
         return _emptyResult(store, tokenBudget)
 
-    # 8. Cross-encoder rerank over the fused head only. The untouched tail stays
-    #    in fused RRF order below the reranked head, so trust/payload still see
-    #    every candidate.
-    rerankHead = fused[:RERANK_HEAD]
+    # 8. Stratified rerank head: round-robin across the per-class fused rankings so
+    #    the cross-encoder scores a fair mix of both classes, then let its scores
+    #    decide. The untouched fused tail keeps global RRF order below the head.
+    perClass = splitByClass(fused, store, classNames)
+    rerankHead = interleave([perClass[name] for name in classNames], RERANK_HEAD)
     rerankedHead = rerank(query, rerankHead, store)
     rerankedIds = {atomId for atomId, _ in rerankedHead}
+    headIds = {atomId for atomId, _ in rerankHead}
     reranked = (
         rerankedHead
         + [pair for pair in rerankHead if pair[0] not in rerankedIds]
-        + fused[RERANK_HEAD:]
+        + [pair for pair in fused if pair[0] not in headIds]
     )
 
     # 9. Trust: confidence, shouldTrust, why, supersession -- same ``now``.

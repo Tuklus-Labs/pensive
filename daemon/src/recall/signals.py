@@ -48,6 +48,7 @@ if str(_REPO_SRC) not in sys.path:
 
 from pensive.mega_extract import MegaExtractor  # noqa: E402  (path set above)
 from pensive.patterns import REAL_DATA_PATTERNS, build_pattern_set  # noqa: E402
+from recall.strata import kindInClause  # noqa: E402  (path set above)
 
 # Default recall breadth: the plan's recall stage takes the top 200 per signal.
 _DEFAULT_K = 200
@@ -102,11 +103,14 @@ def _sanitizeFtsQuery(query):
     return " OR ".join(quoted)
 
 
-def bm25(store, query, k=_DEFAULT_K):
+def bm25(store, query, k=_DEFAULT_K, kinds=None):
     """Lexical signal: FTS5 BM25 over live atom text -> ``[(atomId, score)]``.
 
     ``score`` is the negated ``bm25()`` cost, so higher = better and the list is
-    already best-first. Returns [] for ``k <= 0`` or a query with no searchable
+    already best-first. ``kinds`` (when a non-empty iterable) restricts the result
+    to atoms of those kinds via an ``AND a.kind IN (...)`` clause, so the engine
+    can pull a separate per-class candidate list; ``kinds=None`` is unrestricted
+    (every live atom). Returns [] for ``k <= 0`` or a query with no searchable
     token (parity with the vector-index contract; never raises on raw text).
     """
     if k <= 0:
@@ -114,13 +118,14 @@ def bm25(store, query, k=_DEFAULT_K):
     match = _sanitizeFtsQuery(query)
     if match is None:
         return []
+    kindClause, kindParams = kindInClause(kinds, alias="a")
     rows = store._conn.execute(
         "SELECT a.id, -bm25(fts) AS score "
         "FROM fts JOIN atoms a ON a.rowid = fts.rowid "
-        "WHERE fts MATCH ? AND a.status = 'live' "
+        "WHERE fts MATCH ? AND a.status = 'live'" + kindClause + " "
         "ORDER BY bm25(fts) "
         "LIMIT ?",
-        (match, k),
+        (match, *kindParams, k),
     ).fetchall()
     return [(r[0], r[1]) for r in rows]
 

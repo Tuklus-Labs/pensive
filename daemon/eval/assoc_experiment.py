@@ -26,8 +26,9 @@ from recall.fusion import applyPriors, rrf  # noqa: E402
 from recall.payload import assemblePayload  # noqa: E402
 from recall.rerank import rerank  # noqa: E402
 from recall.signals import bm25, dense, facetSignal  # noqa: E402
+from recall.strata import classesForKinds  # noqa: E402
 from recall.trust import assessTrust  # noqa: E402
-from recall.vector_index import FlatIndex  # noqa: E402
+from recall.vector_index import buildClassIndexes  # noqa: E402
 from store.store import edgesFrom, edgesTo, openStore  # noqa: E402
 
 MODEL_ID = gate_mod.MODEL_ID
@@ -581,7 +582,17 @@ def _recallWithAssoc(store, index, embedder, query, project=None, timeScope=None
         return _emptyResult(store, tokenBudget)
 
     bmHits = bm25(store, query, ASSOC_SIGNAL_K)
-    dnHits = dense(index, embedder, query, ASSOC_SIGNAL_K)
+    # Dense candidates are generated PER CLASS from the {className: VectorIndex}
+    # map, mirroring the main engine (src/recall/engine.py): iterate the classes
+    # overlapping ``kinds`` and concatenate each class index's own hits. An empty
+    # class index contributes nothing (its search returns []) and a class with no
+    # built index is skipped by the None guard, so the small memory population can
+    # no longer be starved out of the pool by the large code corpus.
+    dnHits = []
+    for name, _classKinds in classesForKinds(kinds):
+        classIndex = index.get(name)
+        if classIndex is not None:
+            dnHits.extend(dense(classIndex, embedder, query, ASSOC_SIGNAL_K))
     if filterSet is not None:
         bmHits = [pair for pair in bmHits if pair[0] in filterSet]
         dnHits = [pair for pair in dnHits if pair[0] in filterSet]
@@ -646,7 +657,7 @@ def _prepareStore(dbPath, records, embedder, log):
     t1 = time.time()
     embedded = embedMissing(store, embedder)
     log(f"embedded {embedded} atoms in {time.time()-t1:.1f}s")
-    index = FlatIndex().build(store, MODEL_ID)
+    index = buildClassIndexes(store, MODEL_ID)
     return store, index, stats
 
 

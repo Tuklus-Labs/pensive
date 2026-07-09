@@ -158,7 +158,7 @@ def runShadow(ctx, counters, rawBody, logPath):
     try:
         t0 = time.perf_counter()
         out = recall(
-            ctx.store, ctx.index, ctx.embedder, query,
+            ctx.store, ctx.indexes, ctx.embedder, query,
             project=project, k=ctx.defaultK, tokenBudget=ctx.defaultTokenBudget,
         )
         latencyMs = (time.perf_counter() - t0) * 1000.0
