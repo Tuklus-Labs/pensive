@@ -230,7 +230,7 @@ def _stub_recall_dependencies(monkeypatch, fused, reranked):
     monkeypatch.setattr(
         engine,
         "assemblePayload",
-        lambda store, results, tokenBudget: ("payload", 1, False),
+        lambda store, results, tokenBudget, enricher=None: ("payload", 1, False),
     )
     return seen
 
@@ -303,7 +303,8 @@ def test_rerank_head_is_interleaved_across_classes(store, monkeypatch):
                         lambda pairs, hits, store, now: [
                             _result(a, 0.9, True, score=s) for a, s in pairs])
     monkeypatch.setattr(engine, "assemblePayload",
-                        lambda store, results, tokenBudget: ("payload", 1, False))
+                        lambda store, results, tokenBudget, enricher=None:
+                            ("payload", 1, False))
 
     recall(store, {"memory": None, "code": None}, _BombEmbedder(),
            "irrelevant", k=10)
@@ -727,3 +728,40 @@ def test_facet_boost_constant_is_a_gentle_nudge():
     # The boost is a small multiplicative lift, not an override -- pin the range so
     # a future edit that turns it into a dominating factor trips here.
     assert 1.0 < FACET_BOOST < 1.5
+
+
+# --------------------------------------------------------------------------- #
+# Task 4: enrich=True wires the Enricher into the final assemblePayload call  #
+# --------------------------------------------------------------------------- #
+
+
+def test_enriched_recall_attaches_location_and_relations(
+        store, embedder, _rerankerWarm, tmp_path, monkeypatch):
+    import recall.enrich as enrich_mod
+    # Point the enricher's filesystem root at tmp_path via the Enricher the
+    # engine constructs: patch the class default rather than threading a home
+    # argument through recall() (serve never needs a non-default home).
+    f = tmp_path / "Projects/obol/api/rate.go"
+    f.parent.mkdir(parents=True)
+    f.write_text("package api\nfunc Rate() int { return 1 }\n")
+    origInit = enrich_mod.Enricher.__init__
+
+    def patchedInit(self, s, home=None, relatedLimit=3):
+        origInit(self, s, home=tmp_path, relatedLimit=relatedLimit)
+
+    monkeypatch.setattr(enrich_mod.Enricher, "__init__", patchedInit)
+
+    chunk = putAtom(store, {
+        "text": "func Rate() int { return 1 }", "kind": "document_chunk",
+        "project": "obol", "importance": 0.0,
+        "provenance": {"source": "bulk-import",
+                       "sourceRef": "projects/obol/api/rate.go#c0"},
+    })
+    mem = _put(store, "we capped the rate limiter at one per second")
+    addFacet(store, chunk, "entity", "rate_limiter")
+    addFacet(store, mem, "entity", "rate_limiter")
+    idx = buildClassIndexes(store, MODEL_ID)
+    out = recall(store, idx, embedder, "rate limiter cap function",
+                 k=3, enrich=True)
+    assert "at projects/obol/api/rate.go#L2-2" in out["payload"]
+    assert f"relates -> p3://{mem}" in out["payload"]

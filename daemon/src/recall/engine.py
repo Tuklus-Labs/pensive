@@ -44,6 +44,7 @@ from recall.fusion import rrf, applyPriors
 from recall.rerank import rerank
 from recall.trust import assessTrust
 from recall.payload import assemblePayload
+from recall.enrich import Enricher
 
 __all__ = ["recall", "FACET_BOOST", "RERANK_HEAD"]
 
@@ -65,7 +66,7 @@ _SIGNAL_K = 200
 
 
 def recall(store, indexes, embedder, query, project=None, timeScope=None,
-           kinds=None, k=10, tokenBudget=1500):
+           kinds=None, k=10, tokenBudget=1500, enrich=False):
     """Run the full recall pipeline and assemble a tiered payload.
 
     ``store`` is the canonical store, ``indexes`` a ``{className: VectorIndex}``
@@ -85,6 +86,9 @@ def recall(store, indexes, embedder, query, project=None, timeScope=None,
       non-stratified behavior).
     - ``k``: number of results to return (default 10).
     - ``tokenBudget``: payload budget by the conservative heuristic (default 1500).
+    - ``enrich``: attach serve-time enrichment lines (chunk file location and
+      related memory) to document_chunk results. Off by default; the eval gate
+      and legacy callers measure the bare pipeline.
 
     Returns the ``RecallResult`` dict ``{results, payload, tokensUsed,
     lowConfidence}``.
@@ -192,7 +196,9 @@ def recall(store, indexes, embedder, query, project=None, timeScope=None,
 
     # 10. Trim to k and assemble the tiered payload within budget.
     results = assessed[:k]
-    payload, tokensUsed, lowConfidence = assemblePayload(store, results, tokenBudget)
+    enricher = Enricher(store) if enrich else None
+    payload, tokensUsed, lowConfidence = assemblePayload(
+        store, results, tokenBudget, enricher=enricher)
     return {
         "results": results,
         "payload": payload,

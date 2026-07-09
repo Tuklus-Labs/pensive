@@ -596,6 +596,7 @@ def test_serve_context_holds_class_indexes_and_recall_prefers_memory(tmp_path):
         assert set(ctx.indexes.keys()) == {"memory", "code"}
         out = handle_recall(ctx, {"query": "what did we choose for web auth",
                                   "k": 3})
+        # Enrichment on the native handler must not disturb memory results.
         assert "Authelia" in out
     finally:
         store.close()
