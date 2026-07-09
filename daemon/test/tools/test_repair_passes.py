@@ -9,7 +9,7 @@ _DAEMON = Path(__file__).resolve().parents[2]
 if str(_DAEMON / "tools") not in sys.path:
     sys.path.insert(0, str(_DAEMON / "tools"))
 
-from repair_passes import repairKvCacheRefs
+from repair_passes import repairKvCacheRefs, dedupReferenceLibrary
 from store.store import openStore, putAtom
 
 
@@ -99,3 +99,63 @@ def test_idempotent_second_run_is_noop(store, tmp_path):
     second = repairKvCacheRefs(store, old)
     assert second == {"rewritten": 0, "projectBackfilled": 0,
                       "noPathInSummary": 0, "rowidMissing": 0}
+
+
+_CANON_ROOT = "projects/Aegis/AEGIS/docs/reference-library/"
+
+
+def _putPair(store, fname, cN, text, driftedText=None):
+    """A reflib duplicate pair: null-project copy + canonical Aegis copy."""
+    dup = _putChunk(store, text, f"reference-library/{fname}#c{cN}")
+    canon = _putChunk(store, driftedText if driftedText is not None else text,
+                      f"{_CANON_ROOT}{fname}#c{cN}", project="Aegis")
+    return dup, canon
+
+
+def test_dedup_supersedes_null_copy_keeps_canonical(store):
+    dup, canon = _putPair(store, "53-hw.md", 2, "identical body text")
+    report = dedupReferenceLibrary(store)
+    assert report["superseded"] == 1
+    statuses = dict(store._conn.execute(
+        "SELECT id, status FROM atoms WHERE kind='document_chunk'").fetchall())
+    assert statuses[dup] == "superseded"
+    assert statuses[canon] == "live"
+    # A supersedes edge canon -> dup exists (new -> old convention).
+    edge = store._conn.execute(
+        "SELECT src_atom, dst_atom FROM edges WHERE type='supersedes'"
+    ).fetchone()
+    assert edge == (canon, dup)
+
+
+def test_text_mismatch_left_live_and_reported(store):
+    dup, canon = _putPair(store, "99-drift.md", 0, "old text", "revised text")
+    report = dedupReferenceLibrary(store)
+    assert report["superseded"] == 0
+    assert report["textMismatch"] == 1
+    statuses = {r[1] for r in store._conn.execute(
+        "SELECT id, status FROM atoms").fetchall()}
+    assert statuses == {"live"}
+
+
+def test_no_twin_reported(store):
+    _putChunk(store, "orphan body", "reference-library/only-here.md#c0")
+    report = dedupReferenceLibrary(store)
+    assert report["superseded"] == 0
+    assert report["noTwin"] == 1
+
+
+def test_multiple_twins_reported_not_guessed(store):
+    _putChunk(store, "same", "reference-library/multi.md#c1")
+    _putChunk(store, "same", f"{_CANON_ROOT}multi.md#c1", project="Aegis")
+    _putChunk(store, "same", f"{_CANON_ROOT}multi.md#c1", project="Aegis")
+    report = dedupReferenceLibrary(store)
+    assert report["superseded"] == 0
+    assert report["multipleTwins"] == 1
+
+
+def test_dedup_idempotent(store):
+    _putPair(store, "53-hw.md", 2, "identical body text")
+    dedupReferenceLibrary(store)
+    second = dedupReferenceLibrary(store)
+    assert second == {"superseded": 0, "noTwin": 0,
+                      "textMismatch": 0, "multipleTwins": 0}

@@ -22,10 +22,13 @@ if str(_SRC) not in sys.path:
     sys.path.insert(0, str(_SRC))
 
 from repair_lib import parseFilesSummary, abspathToRef  # noqa: E402
+from store.store import supersede  # noqa: E402
 
-__all__ = ["repairKvCacheRefs"]
+__all__ = ["repairKvCacheRefs", "dedupReferenceLibrary"]
 
 _ROWID_RE = re.compile(r"^kv_cache/vector_meta\.db#rowid=(\d+)$")
+_REFLIB_DUP_ROOT = "reference-library/"
+_REFLIB_CANON_ROOT = "projects/Aegis/AEGIS/docs/reference-library/"
 
 
 def repairKvCacheRefs(store, oldDbPath):
@@ -95,4 +98,54 @@ def repairKvCacheRefs(store, oldDbPath):
         raise
     finally:
         old.close()
+    return report
+
+
+def dedupReferenceLibrary(store, sessionId=None):
+    """Supersede null-root reflib chunks that duplicate the canonical copies.
+
+    For each LIVE document_chunk whose ref is ``reference-library/<tail>``:
+    find LIVE canonical twins at ``projects/Aegis/.../reference-library/<tail>``.
+    Exactly one twin with EXACTLY matching text: supersede the null-root copy
+    (survivor = the canonical copy, which carries project attribution). Zero
+    twins, multiple twins, or text drift: count and leave live; a forced merge
+    of drifted content would silently lose the difference. Idempotent: the
+    LIVE predicate excludes already-superseded copies, and the candidate scan
+    excludes this pass's own provenance rows (source='repair-tool') so a
+    survivor's supersede-record -- written with the loser's old source_ref --
+    is never mistaken for a fresh duplicate on rerun.
+    """
+    report = {"superseded": 0, "noTwin": 0, "textMismatch": 0,
+              "multipleTwins": 0}
+    dups = store._conn.execute(
+        "SELECT a.id, p.source_ref, a.text FROM atoms a "
+        "JOIN provenance p ON p.atom_id = a.id "
+        "WHERE a.kind = 'document_chunk' AND a.status = 'live' "
+        "AND p.source_ref LIKE ? AND p.source != 'repair-tool'",
+        (_REFLIB_DUP_ROOT + "%",)
+    ).fetchall()
+    for dupId, ref, text in dups:
+        tail = ref[len(_REFLIB_DUP_ROOT):]
+        twins = store._conn.execute(
+            "SELECT a.id, a.text FROM atoms a "
+            "JOIN provenance p ON p.atom_id = a.id "
+            "WHERE a.kind = 'document_chunk' AND a.status = 'live' "
+            "AND p.source_ref = ?",
+            (_REFLIB_CANON_ROOT + tail,)
+        ).fetchall()
+        if not twins:
+            report["noTwin"] += 1
+            continue
+        if len(twins) > 1:
+            report["multipleTwins"] += 1
+            continue
+        twinId, twinText = twins[0]
+        if twinText != text:
+            report["textMismatch"] += 1
+            continue
+        prov = {"source": "repair-tool", "sourceRef": ref}
+        if sessionId is not None:
+            prov["sessionId"] = sessionId
+        supersede(store, dupId, twinId, prov)
+        report["superseded"] += 1
     return report
