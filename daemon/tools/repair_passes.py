@@ -21,10 +21,13 @@ _SRC = _TOOLS.parent / "src"
 if str(_SRC) not in sys.path:
     sys.path.insert(0, str(_SRC))
 
-from repair_lib import parseFilesSummary, abspathToRef  # noqa: E402
+from repair_lib import parseFilesSummary, abspathToRef, refToProject  # noqa: E402
 from store.store import supersede  # noqa: E402
 
-__all__ = ["repairKvCacheRefs", "dedupReferenceLibrary"]
+__all__ = [
+    "repairKvCacheRefs", "dedupReferenceLibrary", "backfillProjects",
+    "totals", "verifyRepair",
+]
 
 _ROWID_RE = re.compile(r"^kv_cache/vector_meta\.db#rowid=(\d+)$")
 _REFLIB_DUP_ROOT = "reference-library/"
@@ -171,3 +174,61 @@ def dedupReferenceLibrary(store, sessionId=None):
         supersede(store, dupId, twinId, prov)
         report["superseded"] += 1
     return report
+
+
+def backfillProjects(store):
+    """Backfill NULL projects derivable from refs; count the rest.
+
+    Only document_chunk atoms; only where project IS NULL; the derivation is
+    refToProject (projects/<name>/ and reference-library/ resolve, dotfile and
+    kv_cache roots do not). Idempotent: backfilled rows leave the predicate.
+    """
+    report = {"backfilled": 0, "unresolvable": 0}
+    rows = store._conn.execute(
+        "SELECT a.id, p.source_ref FROM atoms a "
+        "JOIN provenance p ON p.atom_id = a.id "
+        "WHERE a.kind = 'document_chunk' AND a.project IS NULL"
+    ).fetchall()
+    try:
+        for atomId, ref in rows:
+            project = refToProject(ref) if ref else None
+            if project is None:
+                report["unresolvable"] += 1
+                continue
+            store._conn.execute(
+                "UPDATE atoms SET project = ? WHERE id = ? AND project IS NULL",
+                (project, atomId))
+            report["backfilled"] += 1
+        store._conn.commit()
+    except Exception:
+        store._conn.rollback()
+        raise
+    return report
+
+
+def totals(store):
+    """The invariant counters verifyRepair checks against."""
+    total = store._conn.execute("SELECT COUNT(*) FROM atoms").fetchone()[0]
+    live = store._conn.execute(
+        "SELECT COUNT(*) FROM atoms WHERE status='live'").fetchone()[0]
+    return {"total": total, "live": live}
+
+
+def verifyRepair(store, preTotals):
+    """Post-run invariants: no atom created or destroyed; kv refs gone or known.
+
+    ``atomTotalDelta`` must be zero (supersession changes status, never count).
+    ``liveDelta`` is informational (dedup reduces live count by design).
+    ``ok`` is True when the total held.
+    """
+    post = totals(store)
+    kvRemaining = store._conn.execute(
+        "SELECT COUNT(*) FROM provenance WHERE source_ref LIKE 'kv_cache%'"
+    ).fetchone()[0]
+    delta = post["total"] - preTotals["total"]
+    return {
+        "ok": delta == 0,
+        "atomTotalDelta": delta,
+        "liveDelta": post["live"] - preTotals["live"],
+        "kvRefsRemaining": kvRemaining,
+    }

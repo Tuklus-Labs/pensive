@@ -9,7 +9,9 @@ _DAEMON = Path(__file__).resolve().parents[2]
 if str(_DAEMON / "tools") not in sys.path:
     sys.path.insert(0, str(_DAEMON / "tools"))
 
-from repair_passes import repairKvCacheRefs, dedupReferenceLibrary
+from repair_passes import (
+    repairKvCacheRefs, dedupReferenceLibrary, backfillProjects, verifyRepair,
+)
 from store.store import openStore, putAtom
 from util.ulid import ulid
 
@@ -197,3 +199,45 @@ def test_dedup_idempotent(store):
     second = dedupReferenceLibrary(store)
     assert second == {"superseded": 0, "noTwin": 0,
                       "textMismatch": 0, "multipleTwins": 0}
+
+
+def test_backfill_from_projects_ref(store):
+    aid = _putChunk(store, "b", "projects/sextant/doa/model.py#c4")
+    report = backfillProjects(store)
+    assert report["backfilled"] == 1
+    assert store._conn.execute(
+        "SELECT project FROM atoms WHERE id=?", (aid,)).fetchone()[0] == "sextant"
+
+
+def test_backfill_reflib_gets_aegis_and_dotfiles_stay_null(store):
+    r = _putChunk(store, "b", "reference-library/x.md#c0")
+    d = _putChunk(store, "b", "claude-home/hooks/emit.py#c1")
+    report = backfillProjects(store)
+    assert report["backfilled"] == 1
+    assert report["unresolvable"] == 1
+    got = dict(store._conn.execute(
+        "SELECT id, project FROM atoms").fetchall())
+    assert got[r] == "Aegis"
+    assert got[d] is None
+
+
+def test_backfill_idempotent(store):
+    _putChunk(store, "b", "projects/sextant/doa/model.py#c4")
+    backfillProjects(store)
+    assert backfillProjects(store) == {"backfilled": 0, "unresolvable": 0}
+
+
+def test_verifyRepair_flags_count_drift(store):
+    _putChunk(store, "b", "projects/x/y.py#c0")
+    pre = {"total": 99, "live": 99}   # wrong on purpose
+    v = verifyRepair(store, pre)
+    assert v["ok"] is False
+    assert v["atomTotalDelta"] != 0
+
+
+def test_verifyRepair_ok_when_totals_hold(store):
+    _putChunk(store, "b", "projects/x/y.py#c0")
+    pre = {"total": 1, "live": 1}
+    v = verifyRepair(store, pre)
+    assert v["ok"] is True
+    assert v["kvRefsRemaining"] == 0
