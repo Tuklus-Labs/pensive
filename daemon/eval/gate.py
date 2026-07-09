@@ -50,7 +50,7 @@ if str(_DAEMON_SRC) not in sys.path:
 
 from recall.engine import recall  # noqa: E402
 from recall.embedder import Embedder, embedMissing  # noqa: E402
-from recall.vector_index import FlatIndex  # noqa: E402
+from recall.vector_index import FlatIndex, buildClassIndexes  # noqa: E402
 from ingest.backfill import backfill  # noqa: E402
 from store.store import openStore  # noqa: E402
 
@@ -116,10 +116,10 @@ def _atomToSourceRef(store):
     return {r[0]: r[1] for r in rows}
 
 
-def gate(store, index, embedder, queries, recallK=_RECALL_K):
+def gate(store, indexes, embedder, queries, recallK=_RECALL_K):
     """Run v3 ``recall`` as a system over ``queries`` -> metrics dict.
 
-    The fixed interface core is ``gate(store, index, embedder)`` -- the recall
+    The fixed interface core is ``gate(store, indexes, embedder)`` -- the recall
     stack under test. ``queries`` is the benchmark bound to that stack: a list of
     ``{"query": str, "relevant": set(sourceRef), "own": set(sourceRef)}``. For each
     query the gate runs the WHOLE recall pipeline, maps result atomIds back to
@@ -138,7 +138,7 @@ def gate(store, index, embedder, queries, recallK=_RECALL_K):
     lowConf = 0
     for q in queries:
         t0 = time.perf_counter()
-        result = recall(store, index, embedder, q["query"], k=recallK)
+        result = recall(store, indexes, embedder, q["query"], k=recallK)
         latencies.append((time.perf_counter() - t0) * 1000.0)
         if result["lowConfidence"]:
             lowConf += 1
@@ -334,7 +334,7 @@ def _prepareStore(dbPath, records, embedder, log):
     embedded = embedMissing(store, embedder)
     log(f"embedded {embedded} atoms in {time.time()-t1:.1f}s "
         f"({embedded/max(1e-9, time.time()-t1):.0f}/s)")
-    index = FlatIndex().build(store, MODEL_ID)
+    index = buildClassIndexes(store, MODEL_ID)
     return store, index, stats
 
 

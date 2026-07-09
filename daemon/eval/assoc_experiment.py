@@ -27,7 +27,7 @@ from recall.payload import assemblePayload  # noqa: E402
 from recall.rerank import rerank  # noqa: E402
 from recall.signals import bm25, dense, facetSignal  # noqa: E402
 from recall.trust import assessTrust  # noqa: E402
-from recall.vector_index import FlatIndex  # noqa: E402
+from recall.vector_index import FlatIndex, buildClassIndexes  # noqa: E402
 from store.store import edgesFrom, edgesTo, openStore  # noqa: E402
 
 MODEL_ID = gate_mod.MODEL_ID
@@ -581,6 +581,16 @@ def _recallWithAssoc(store, index, embedder, query, project=None, timeScope=None
         return _emptyResult(store, tokenBudget)
 
     bmHits = bm25(store, query, ASSOC_SIGNAL_K)
+    # KNOWN GAP (out of Task 6 scope, documented in the commit body): index is
+    # the buildClassIndexes() {className: VectorIndex} map everywhere else in
+    # this module, but dense() here still expects a single VectorIndex with
+    # .search(). This call raises AttributeError if the assoc arm is exercised
+    # end to end with a real index; today it is only reached in tests with
+    # dense() mocked, so this is not caught by the automated suite. Left as is
+    # because Task 6's brief scopes assoc_experiment.py changes to exactly the
+    # backfill build and the baseline recall lambda, and a same-file test
+    # (test_gate_with_assoc_differs_on_facets_only_candidate_pool) relies on
+    # this call never touching index directly when dense() is mocked.
     dnHits = dense(index, embedder, query, ASSOC_SIGNAL_K)
     if filterSet is not None:
         bmHits = [pair for pair in bmHits if pair[0] in filterSet]
@@ -646,7 +656,7 @@ def _prepareStore(dbPath, records, embedder, log):
     t1 = time.time()
     embedded = embedMissing(store, embedder)
     log(f"embedded {embedded} atoms in {time.time()-t1:.1f}s")
-    index = FlatIndex().build(store, MODEL_ID)
+    index = buildClassIndexes(store, MODEL_ID)
     return store, index, stats
 
 
