@@ -114,3 +114,73 @@ def test_emitProposals_batches_and_self_contained_lines(store, tmp_path):
         assert len(line["memText"]) <= 100
         assert len(line["chunkText"]) <= 100
         assert "\n" not in line["memText"]     # whitespace-collapsed
+
+
+from edge_proposer import buildFreqMap, proposeDense
+
+MODEL_ID = "BAAI/bge-small-en-v1.5"
+
+
+def test_freqMap_matches_per_atom_scoring(store):
+    mem = _put(store, "memory text")
+    hot = _put(store, "chunk text", kind="document_chunk")
+    addFacet(store, mem, "entity", "rare_e")
+    addFacet(store, hot, "entity", "rare_e")
+    fm = buildFreqMap(store)
+    assert fm["rare_e"] == 2
+    withMap = proposeForAtom(store, mem, freqMap=fm)
+    without = proposeForAtom(store, mem)
+    assert withMap == without           # identical scoring, no freq SQL
+
+
+def test_proposeDense_finds_semantic_neighbor(store):
+    import pytest
+    emb = pytest.importorskip("recall.embedder")
+    from recall.embedder import Embedder, embedMissing
+    from recall.vector_index import buildClassIndexes
+    embedder = Embedder(MODEL_ID)
+    mem = _put(store, "we fixed the csr matrix publish race with a lock")
+    close = _put(store, "def compile(): publish csr matrix under build lock",
+                 kind="document_chunk")
+    far = _put(store, "banana bread recipe with walnuts",
+               kind="document_chunk")
+    embedMissing(store, embedder)
+    codeIndex = buildClassIndexes(store, MODEL_ID)["code"]
+    got = proposeDense(store, codeIndex, mem, MODEL_ID, topK=2, minSim=0.3)
+    ids = [p["chunkId"] for p in got]
+    assert close in ids
+    assert all(p["channel"] == "dense" for p in got)
+    assert all(p["score"] >= 0.3 for p in got)
+    tight = proposeDense(store, codeIndex, mem, MODEL_ID, topK=2, minSim=0.99)
+    assert tight == []                  # threshold filters
+
+
+def test_proposeDense_missing_embedding_returns_empty(store):
+    mem = _put(store, "never embedded")
+    class _BombIndex:
+        def search(self, vec, k):
+            raise AssertionError("must not search without a vector")
+    assert proposeDense(store, _BombIndex(), mem, MODEL_ID) == []
+
+
+def test_emitProposals_merges_channels_dedup_keeps_higher(store, tmp_path):
+    import json
+    import pytest
+    pytest.importorskip("recall.embedder")
+    from recall.embedder import Embedder, embedMissing
+    embedder = Embedder(MODEL_ID)
+    mem = _put(store, "we fixed the csr matrix publish race with a lock")
+    both = _put(store, "def compile(): publish csr matrix under build lock",
+                kind="document_chunk")
+    addFacet(store, mem, "entity", "rare_e")
+    addFacet(store, both, "entity", "rare_e")   # entity AND dense candidate
+    embedMissing(store, embedder)
+    out = tmp_path / "props"
+    report = emitProposals(store, out, minSim=0.3)
+    lines = [json.loads(l) for f in sorted(out.glob("*.jsonl"))
+             for l in f.read_text().splitlines()]
+    ours = [l for l in lines if l["chunkId"] == both]
+    assert len(ours) == 1               # deduped across channels
+    assert report["merged"] == report["proposals"]
+    assert report["entityProposals"] >= 1
+    assert report["denseProposals"] >= 1
