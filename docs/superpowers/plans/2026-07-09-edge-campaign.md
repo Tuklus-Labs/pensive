@@ -947,3 +947,211 @@ EOF
 - **Placeholder scan:** none; all steps carry complete code and expected outputs.
 - **Type consistency:** verdict dict keys match between Task 2 tests and `writeVerdicts`; `Enricher(store, home=None, relatedLimit=3)` signature untouched (Task 3 only changes `.lines` internals); edge direction (src=chunk) is identical in Task 2's writer, Task 2's tests, Task 3's `_edgeRelations` query, and the payload grammar rationale.
 - **Self-referential predicate check (the Task-3-of-repair lesson):** the writer's own writes are edges+provenance, which its verdict-driven predicate never scans (it reads verdict FILES, not the store); rollback keys on campaign ownership. The proposer reads facets only, never edges. No pass here can re-trigger on its own output.
+
+---
+
+### Task 4 (amendment, post-pilot): dense proposal channel + freq precompute
+
+**Pilot finding driving this task:** 200-atom pilot yielded 30 proposals with 189 zero-yield atoms. Facet coverage is 98.9%, but the entity vocabulary connects memory to chunks almost entirely through hub values (aegis 26k, claude 16k) and dates; only ~700 rare shared values carry signal. Also 1.12s/atom (the freq CTE recomputes per atom) makes the full run 4.4h. The campaign needs a second, semantic proposal channel and a perf fix. Verification stays the precision gate: propose loose, verify hard.
+
+**Files:**
+- Modify: `tools/edge_proposer.py`
+- Test: `test/tools/test_edge_proposer.py` (add tests)
+
+**Interfaces:**
+- Changed: `proposeForAtom(store, memId, maxPerAtom=3, hubCap=500, minScore=0.02, freqMap=None) -> list[dict]`; when `freqMap` (a `{value: liveCount}` dict) is given, NO freq SQL runs for scoring: shared-entity candidates come from one indexed query and scores use the map. Behavior with `freqMap=None` is unchanged (backward compatible, existing tests untouched).
+- New: `buildFreqMap(store) -> dict` (one GROUP BY over live entity facets).
+- New: `proposeDense(store, codeIndex, memId, modelId, topK=5, minSim=0.5) -> list[dict]` each `{"memId", "chunkId", "score": cosine, "entities": [], "channel": "dense"}`; fetches the memory atom's STORED vector (`SELECT vector FROM embeddings WHERE atom_id=? AND model_id=?`, via `recall.embedder.blobToVec`), searches the code-class index, filters `minSim`. Missing embedding -> [] (never embeds at proposal time).
+- Changed: `emitProposals(store, outDir, ..., denseK=5, minSim=0.5, modelId=MODEL_ID)` builds the freq map once and the code index once (`buildClassIndexes(store, modelId)["code"]`), merges both channels per atom (dedup by chunkId keeping the higher score, entity channel tagged `"channel": "entity"`), caps the merged list at `maxPerAtom + denseK`. Report gains `{"entityProposals", "denseProposals", "merged"}`.
+
+- [ ] **Step 1: Write the failing tests**
+
+Add to `test/tools/test_edge_proposer.py`:
+
+```python
+from edge_proposer import buildFreqMap, proposeDense
+
+MODEL_ID = "BAAI/bge-small-en-v1.5"
+
+
+def test_freqMap_matches_per_atom_scoring(store):
+    mem = _put(store, "memory text")
+    hot = _put(store, "chunk text", kind="document_chunk")
+    addFacet(store, mem, "entity", "rare_e")
+    addFacet(store, hot, "entity", "rare_e")
+    fm = buildFreqMap(store)
+    assert fm["rare_e"] == 2
+    withMap = proposeForAtom(store, mem, freqMap=fm)
+    without = proposeForAtom(store, mem)
+    assert withMap == without           # identical scoring, no freq SQL
+
+
+def test_proposeDense_finds_semantic_neighbor(store):
+    import pytest
+    emb = pytest.importorskip("recall.embedder")
+    from recall.embedder import Embedder, embedMissing
+    from recall.vector_index import buildClassIndexes
+    embedder = Embedder(MODEL_ID)
+    mem = _put(store, "we fixed the csr matrix publish race with a lock")
+    close = _put(store, "def compile(): publish csr matrix under build lock",
+                 kind="document_chunk")
+    far = _put(store, "banana bread recipe with walnuts",
+               kind="document_chunk")
+    embedMissing(store, embedder)
+    codeIndex = buildClassIndexes(store, MODEL_ID)["code"]
+    got = proposeDense(store, codeIndex, mem, MODEL_ID, topK=2, minSim=0.3)
+    ids = [p["chunkId"] for p in got]
+    assert close in ids
+    assert all(p["channel"] == "dense" for p in got)
+    assert all(p["score"] >= 0.3 for p in got)
+    tight = proposeDense(store, codeIndex, mem, MODEL_ID, topK=2, minSim=0.99)
+    assert tight == []                  # threshold filters
+
+
+def test_proposeDense_missing_embedding_returns_empty(store):
+    mem = _put(store, "never embedded")
+    class _BombIndex:
+        def search(self, vec, k):
+            raise AssertionError("must not search without a vector")
+    assert proposeDense(store, _BombIndex(), mem, MODEL_ID) == []
+
+
+def test_emitProposals_merges_channels_dedup_keeps_higher(store, tmp_path):
+    import json
+    import pytest
+    pytest.importorskip("recall.embedder")
+    from recall.embedder import Embedder, embedMissing
+    embedder = Embedder(MODEL_ID)
+    mem = _put(store, "we fixed the csr matrix publish race with a lock")
+    both = _put(store, "def compile(): publish csr matrix under build lock",
+                kind="document_chunk")
+    addFacet(store, mem, "entity", "rare_e")
+    addFacet(store, both, "entity", "rare_e")   # entity AND dense candidate
+    embedMissing(store, embedder)
+    out = tmp_path / "props"
+    report = emitProposals(store, out, minSim=0.3)
+    lines = [json.loads(l) for f in sorted(out.glob("*.jsonl"))
+             for l in f.read_text().splitlines()]
+    ours = [l for l in lines if l["chunkId"] == both]
+    assert len(ours) == 1               # deduped across channels
+    assert report["merged"] == report["proposals"]
+    assert report["entityProposals"] >= 1
+    assert report["denseProposals"] >= 1
+```
+
+- [ ] **Step 2: Run to verify failure**
+
+Run: `python3 -m pytest test/tools/test_edge_proposer.py -v -k "freqMap or Dense or merges"`
+Expected: FAIL, ImportError on buildFreqMap/proposeDense.
+
+- [ ] **Step 3: Implement**
+
+In `tools/edge_proposer.py`: add near the imports
+
+```python
+_SRC_IMPORT_NOTE = None  # recall.* resolves via the _SRC path insert above
+from recall.embedder import blobToVec  # noqa: E402
+
+MODEL_ID = "BAAI/bge-small-en-v1.5"
+```
+
+Add:
+
+```python
+def buildFreqMap(store):
+    """{entityValue: live-atom count} in one query; the per-run freq cache.
+
+    Computing this once turns proposeForAtom's per-atom freq CTE into a dict
+    lookup: the pilot measured 1.12s/atom recomputing it, which is 4.4h over
+    the full memory population; this map builds in seconds.
+    """
+    rows = store._conn.execute(
+        "SELECT f.value, COUNT(*) FROM facets f "
+        "JOIN atoms a ON a.id = f.atom_id "
+        "WHERE f.key = 'entity' AND a.status = 'live' "
+        "GROUP BY f.value").fetchall()
+    return {r[0]: r[1] for r in rows}
+```
+
+Rework `proposeForAtom` to accept `freqMap=None`: when None, keep the existing CTE query exactly as-is; when given, run the simpler candidate query (no freq CTE) and score from the map:
+
+```python
+def proposeForAtom(store, memId, maxPerAtom=3, hubCap=500, minScore=0.02,
+                   freqMap=None):
+    if freqMap is None:
+        rows = store._conn.execute(
+            ... the existing CTE query unchanged ...
+        ).fetchall()
+    else:
+        mine = [r[0] for r in store._conn.execute(
+            "SELECT value FROM facets WHERE atom_id = ? AND key = 'entity'",
+            (memId,)).fetchall()]
+        keep = [v for v in mine if 0 < freqMap.get(v, 0) <= hubCap]
+        if not keep:
+            return []
+        marks = ",".join("?" for _ in keep)
+        rows = [
+            (chunkId, value, freqMap[value], project)
+            for chunkId, value, project in store._conn.execute(
+                "SELECT f.atom_id, f.value, a.project FROM facets f "
+                "JOIN atoms a ON a.id = f.atom_id "
+                f"WHERE f.key = 'entity' AND f.value IN ({marks}) "
+                "AND a.status = 'live' AND a.kind = 'document_chunk'",
+                keep).fetchall()
+        ]
+    ... rest of the function unchanged (byChunk accumulation onward),
+        with each entity proposal dict gaining "channel": "entity" ...
+```
+
+Add:
+
+```python
+def proposeDense(store, codeIndex, memId, modelId, topK=5, minSim=0.5):
+    """Semantic channel: the memory atom's STORED vector vs the code index.
+
+    Never embeds at proposal time: an atom without a stored embedding for
+    modelId yields []. Cosine scores below minSim are dropped. Chunks are
+    whatever the code-class index holds (live document_chunk by build).
+    """
+    row = store._conn.execute(
+        "SELECT vector FROM embeddings WHERE atom_id = ? AND model_id = ?",
+        (memId, modelId)).fetchone()
+    if row is None:
+        return []
+    vec = blobToVec(row[0])
+    hits = codeIndex.search(vec, topK)
+    return [
+        {"memId": memId, "chunkId": chunkId, "score": round(float(sim), 6),
+         "entities": [], "channel": "dense"}
+        for chunkId, sim in hits if sim >= minSim
+    ]
+```
+
+In `emitProposals`: build `freqMap = buildFreqMap(store)` and (lazily, only if denseK > 0) `codeIndex = buildClassIndexes(store, modelId)["code"]` once before the loop; per atom collect `props = proposeForAtom(..., freqMap=freqMap)` plus `proposeDense(store, codeIndex, memId, modelId, topK=denseK, minSim=minSim)`; merge with dedup by chunkId keeping the higher score entry; cap merged at `maxPerAtom + denseK`; count `entityProposals`, `denseProposals` (pre-dedup) and `merged` (post-dedup, == proposals). Lazy import of `buildClassIndexes` inside `emitProposals` so the no-dense path (denseK=0) never needs usearch. CLI gains `--dense-k` (default 5) and `--min-sim` (default 0.5).
+
+- [ ] **Step 4: Run the whole proposer suite**
+
+Run: `python3 -m pytest test/tools/test_edge_proposer.py -v`
+Expected: PASS, 9 tests (5 original untouched + 4 new).
+
+- [ ] **Step 5: Full tools suite + commit**
+
+Run: `python3 -m pytest test/tools/ -q` (0 failed), then commit:
+
+```bash
+cd ~/Projects/pensive/daemon
+git add tools/edge_proposer.py test/tools/test_edge_proposer.py
+git commit -m "$(cat <<'EOF'
+feat(tools): dense proposal channel + freq precompute for edge campaign
+
+Pilot showed the entity vocabulary connects mostly via hubs and dates
+(30 proposals from 200 atoms) at 1.12s/atom. buildFreqMap turns per-atom
+freq CTEs into dict lookups; proposeDense searches the code-class index
+with each memory atom's stored vector; emitProposals merges both channels
+with cross-channel dedup. Propose loose, verify hard.
+
+Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_016EoCM1vfsbmuVNCqMwRjnK
+EOF
+)"
+```
