@@ -227,6 +227,25 @@ def test_backfill_idempotent(store):
     assert backfillProjects(store) == {"backfilled": 0, "unresolvable": 0}
 
 
+def test_backfill_multi_provenance_atom_counted_once(store):
+    """A null-project atom with TWO resolving provenance rows must be
+    backfilled exactly once, not once per matching provenance row."""
+    aid = _putChunk(store, "b", "projects/foo/bar.py#c0")
+    store._conn.execute(
+        "INSERT INTO provenance(id, atom_id, source, session_id, agent, "
+        "source_ref, recorded_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+        (ulid(), aid, "bulk-import", None, None,
+         "projects/foo/baz.py#c1", 0),
+    )
+    store._conn.commit()
+    report = backfillProjects(store)
+    assert report["backfilled"] == 1
+    assert store._conn.execute(
+        "SELECT project FROM atoms WHERE id=?", (aid,)).fetchone()[0] == "foo"
+    second = backfillProjects(store)
+    assert second == {"backfilled": 0, "unresolvable": 0}
+
+
 def test_verifyRepair_flags_count_drift(store):
     _putChunk(store, "b", "projects/x/y.py#c0")
     pre = {"total": 99, "live": 99}   # wrong on purpose

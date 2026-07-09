@@ -195,10 +195,10 @@ def backfillProjects(store):
             if project is None:
                 report["unresolvable"] += 1
                 continue
-            store._conn.execute(
+            cur = store._conn.execute(
                 "UPDATE atoms SET project = ? WHERE id = ? AND project IS NULL",
                 (project, atomId))
-            report["backfilled"] += 1
+            report["backfilled"] += cur.rowcount
         store._conn.commit()
     except Exception:
         store._conn.rollback()

@@ -9,6 +9,10 @@ verification invariants. Exit code 1 if verification fails.
 
 Operational note: stop the pensive-v3 daemon (or accept that its resident
 index is stale until its next reindex) before an --apply on the live store.
+
+Dry-run purity depends on the store already being at the current schema
+version, since an out-of-date store would run migration DDL on open; the
+live store is at the current version.
 """
 import argparse
 import json
@@ -34,11 +38,13 @@ def _backup(storePath):
     ts = time.strftime("%Y%m%d-%H%M%S")
     dest = Path(str(storePath) + f".bak-pre-repair-{ts}")
     src = sqlite3.connect(storePath)
-    dst = sqlite3.connect(dest)
     try:
-        src.backup(dst)
+        dst = sqlite3.connect(dest)
+        try:
+            src.backup(dst)
+        finally:
+            dst.close()
     finally:
-        dst.close()
         src.close()
     return dest
 
