@@ -380,7 +380,7 @@ def handle_recall(ctx, args):
     out = recall(
         ctx.store, ctx.indexes, ctx.embedder, query,
         project=project, timeScope=timeScope, kinds=kinds,
-        k=k, tokenBudget=tokenBudget,
+        k=k, tokenBudget=tokenBudget, enrich=True,
     )
     response = out["payload"]
     _logReturnedRecall(ctx, out, query, "mcp.recall")
