@@ -183,7 +183,12 @@ def main():
     store = openStore(Path(args.store))
     try:
         if args.rollback:
+            # The sanctioned deletion takes the same backup gate as apply:
+            # rollback is scoped and idempotent, but defense-in-depth is the
+            # tool's own convention (final-review finding, 2026-07-09).
+            backupPath = _backup(args.store)
             out = rollbackCampaign(store, args.campaign)
+            out["backup"] = str(backupPath)
         elif args.sample is not None:
             out = sampleCampaignEdges(store, args.campaign, args.sample)
         elif args.verdicts is not None:

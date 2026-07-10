@@ -22,6 +22,7 @@ report, not in serve-time noise.
 """
 import re
 
+from recall.payload import GIST_CHARS as _GIST_CHARS
 from recall.refs import refToPath
 from store.store import getAtom
 
@@ -34,8 +35,8 @@ _MAX_FILE_BYTES = 5 * 1024 * 1024
 # and the on-disk file may disagree about blank lines and indentation width.
 _WS_RE = re.compile(r"\s+")
 
-# Gist rendering matches payload._gist (80 chars, whitespace collapsed).
-_GIST_CHARS = 80
+# Gist rendering shares payload's GIST_CHARS (imported above) so the two can
+# never diverge if the gist width is ever tuned.
 
 
 def _norm(text):
