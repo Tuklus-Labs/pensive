@@ -10,6 +10,9 @@
 - I6: Existing compat tool schemas, native handlers, result strings, and string-only MCP responses do not change.
 - I7: The actual serialized `CallToolResult`, including duplicated text and structured channels, is at most 1 MiB in UTF-8 bytes.
 - I8: Wire-size admission preserves rank and atomicity. The first whole record whose final response envelope exceeds the cap drops that record and the entire tail.
+- I9: Every served `recall_records` result, including dispatch errors, is at most 1 MiB in actual serialized UTF-8 bytes.
+- I10: Schema diagnostics identify only the failing output path and validator; stored values and `jsonschema` instance text never enter the error.
+- I11: A raw `recall_records` string already over the cap is replaced before `_callToolResult` construction, avoiding a giant intermediate envelope.
 
 ## Axis: State transitions
 
@@ -17,6 +20,7 @@
 - S2: A handler or serialization failure is contained by `dispatch`; the next valid tool call still succeeds.
 - S3: `recall_records` is read-only and does not reindex, mutate atoms, or change compatibility handlers.
 - S4: An oversized base envelope fails loudly inside dispatch containment; it never produces an over-cap success response.
+- S5: A corrupt-row error and an oversized served error are contained; the same server accepts the next valid `recall_records` call.
 
 ## Axis: Boundaries
 
@@ -30,6 +34,8 @@
 - B8: Results are capped at 32 records and each provenance array is bounded to 64 entries by the output contract.
 - B9: A candidate whose exact serialized `CallToolResult` is at the aggregate cap is admitted; one byte over is omitted atomically.
 - B10: UTF-8 wire bytes, not Python characters, determine aggregate admission for multibyte metadata and provenance.
+- B11: The final served boundary replaces an arbitrary over-cap `recall_records` result with one fixed concise error envelope; raw over-cap strings short-circuit before response construction.
+- B12: If the configured cap cannot hold even the fixed error envelope, serving fails with a bounded diagnostic instead of returning an over-cap result.
 
 ## Axis: Malformed inputs
 
@@ -37,6 +43,7 @@
 - M2: Missing stored atoms fail loudly instead of yielding partial records.
 - M3: Non-finite score, confidence, or importance fails deterministic JSON serialization inside dispatch containment.
 - M4: Stored nullable fields remain explicit JSON nulls; required stored fields are never silently defaulted.
+- M5: A real SQLite row with an overlong provenance field fails without echoing any portion of the corrupt instance.
 
 ## Axis: Concurrency
 
@@ -47,6 +54,7 @@
 - P1: The wire shape carries `atomSchemaVersion` so stored schema changes cannot be mistaken for the `recall_records` protocol version.
 - P2: All durable atom and provenance values come from `getAtom`; no reconstructed or inferred provenance may replace stored values.
 - P3: Missing or corrupt durable rows surface as errors and do not poison the following request.
+- P4: Store corruption cannot amplify into an unbounded MCP error response.
 
 ## Axis: Integration contracts
 
@@ -57,18 +65,20 @@
 - C5: MCP input validation and direct dispatch validation agree on unknown fields and type/bound rules.
 - C6: Recall telemetry contains only records actually admitted under the structured budget, never the dropped tail.
 - C7: Size measurement and MCP serving use the same private response-wrapper helper, preventing envelope drift.
+- C8: The final served-envelope guard applies only to `recall_records`; oversized legacy result text remains byte-for-byte unchanged.
+- C9: Raw over-cap strings short-circuit first; strings within the raw cap and all structured responses are measured using actual `CallToolResult.model_dump_json()` UTF-8 bytes so envelope and escaping overhead remain covered.
 
 ## Axis: Regression traps
 
 - [x] boundary: off-by-one in inclusive vs exclusive range, and zero treated as falsy in numeric context. Exact endpoint and just-over tests cover every numeric/text bound.
 - [x] concurrency: N/A, synchronous read-only handler with no internal shared-state transition.
-- [x] contract: API returns null where caller expects empty collection, and caller/callee shape mismatch. Empty results return `records: []`; exact engine arguments and schema fields are pinned.
+- [x] contract: API returns null where caller expects empty collection, caller/callee shape mismatch, and endpoint scope drift. Empty results return `records: []`; exact engine arguments and schema fields are pinned; the final error guard is `recall_records`-only.
 - [x] encoding: non-finite JSON numbers, JavaScript-unsafe integers, and Unicode byte/character mismatch. Serialization uses `allow_nan=False`; time bounds are safe integers; aggregate accounting measures serialized UTF-8 bytes.
 - [x] framework: Python booleans are integers and MCP may validate before dispatch. Both direct and transport paths reject bool-as-int inputs.
-- [x] io: HTTP response-envelope drift. A temporary-port streamable HTTP test asserts both output channels.
-- [x] persistence: schema migration leaves stale rows. Protocol and atom schema versions are separate and missing rows fail loudly.
-- [x] resource: unbounded response growth and child-process pipe backpressure. The exact duplicated MCP response is capped at 1 MiB; the transport probe writes daemon output to a temporary file instead of an undrained pipe.
-- [x] state: handler failure poisons next request. A bad stored row is followed by a valid call on the same context.
+- [x] io: HTTP response-envelope drift and error amplification. Transport tests assert both output channels, and the final served boundary measures the actual serialized result for success or error.
+- [x] persistence: schema migration leaves stale rows and corrupt stored strings enter diagnostics. Protocol and atom schema versions are separate; missing or malformed rows fail without echoing stored instances.
+- [x] resource: unbounded response and error growth plus child-process pipe backpressure. Raw over-cap errors are rejected before response construction, every served `recall_records` result is capped at 1 MiB, and the transport probe writes daemon output to a temporary file instead of an undrained pipe.
+- [x] state: handler failure poisons next request. Corrupt-row and arbitrary oversized-error calls are followed by valid calls on the same server.
 
 ## Coverage Matrix
 
@@ -87,3 +97,7 @@
 | Empty-result contract | `test_recall_records_empty_result_is_low_confidence` |
 | I7, I8, B9, B10, C6 | `test_recall_records_wire_cap_admits_exact_size_and_drops_one_byte_over`, `test_recall_records_wire_cap_counts_multibyte_utf8_and_logs_only_admitted`, `test_recall_records_bounds_schema_maximum_shape_without_building_it_all` |
 | S4, C7 | `test_recall_records_base_envelope_over_cap_fails_loudly`, `test_call_tool_result_wrapper_matches_served_envelope`, `test_server_and_wire_measurement_share_call_tool_result_wrapper` |
+| I9, I10, M5, P3, P4, S5 | `test_recall_records_contains_corrupt_provenance_at_served_boundary` |
+| I9, I11, B11, C9, S5 | `test_recall_records_served_boundary_replaces_oversized_dispatch_error`, `test_recall_records_served_boundary_counts_escaping_overhead` |
+| B12 | `test_recall_records_served_boundary_fails_when_cap_cannot_hold_error` |
+| I6, C4, C8 | `test_legacy_served_boundary_preserves_oversized_dispatch_error` |

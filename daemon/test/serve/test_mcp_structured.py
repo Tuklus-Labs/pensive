@@ -2,9 +2,15 @@ import json
 import math
 from types import SimpleNamespace
 
+import anyio
 import jsonschema
 import pytest
-from mcp.types import CallToolResult, TextContent
+from mcp.types import (
+    CallToolRequest,
+    CallToolRequestParams,
+    CallToolResult,
+    TextContent,
+)
 
 import serve.mcp as mcp_module
 from recall.payload import estimateTokens
@@ -100,6 +106,20 @@ def _wireResult(structured, isError=False):
 
 def _wireBytes(structured, isError=False):
     return len(_wireResult(structured, isError).model_dump_json().encode("utf-8"))
+
+
+def _modelBytes(result):
+    return len(result.model_dump_json().encode("utf-8"))
+
+
+def _serverHandler(ctx):
+    return buildServer(ctx).request_handlers[CallToolRequest]
+
+
+async def _serverCall(handler, name, arguments):
+    response = await handler(CallToolRequest(
+        params=CallToolRequestParams(name=name, arguments=arguments)))
+    return response.root
 
 
 def _resultSummary(result):
@@ -746,6 +766,209 @@ def test_recall_records_preserves_store_state(monkeypatch, ctx, store):  # S3
     )
     assert after == before, (
         f"atom-store immutability rule violated: before={before!r} after={after!r}"
+    )
+
+
+def test_recall_records_contains_corrupt_provenance_at_served_boundary(
+        monkeypatch, ctx, store):  # I9, I10, M5, P3, P4, S5
+    corruptId = _put(store, "corrupt provenance")
+    validId = _put(store, "valid provenance")
+    marker = "RAW_CORRUPT_PROVENANCE_"
+    corruptSource = marker + ("x" * (2 * 1024 * 1024))
+    store._conn.execute(
+        "UPDATE provenance SET source = ? WHERE atom_id = ?",
+        (corruptSource, corruptId),
+    )
+    store._conn.commit()
+
+    def fakeRecall(*args, **kwargs):
+        atomId = corruptId if args[3] == "corrupt" else validId
+        return _engineResult([_trust(atomId)])
+
+    monkeypatch.setattr(mcp_module, "recall", fakeRecall)
+
+    direct, directError = dispatch(
+        ctx, "recall_records", {"query": "corrupt"})
+    handler = _serverHandler(ctx)
+    served = anyio.run(
+        _serverCall, handler, "recall_records", {"query": "corrupt"})
+    recovered = anyio.run(
+        _serverCall, handler, "recall_records", {"query": "valid"})
+
+    assert directError is True and len(direct) < 512, (
+        f"bounded-schema-diagnostic rule violated: isError={directError} "
+        f"errorChars={len(direct)} limit=511 markerPresent={marker in direct}"
+    )
+    assert marker not in direct and "validator=maxLength" in direct, (
+        f"instance-free schema-diagnostic rule violated: errorChars={len(direct)} "
+        f"markerPresent={marker in direct} diagnosticPrefix={direct[:160]!r}"
+    )
+    assert served.isError is True and _modelBytes(served) <= (
+        mcp_module.MAX_RECALL_RECORDS_CALL_RESULT_BYTES
+    ), (
+        f"corrupt-row served-bound rule violated: isError={served.isError} "
+        f"wireBytes={_modelBytes(served)} "
+        f"cap={mcp_module.MAX_RECALL_RECORDS_CALL_RESULT_BYTES}"
+    )
+    assert marker not in served.content[0].text, (
+        f"corrupt-instance non-echo rule violated: "
+        f"textChars={len(served.content[0].text)} "
+        f"markerPresent={marker in served.content[0].text}"
+    )
+    assert (
+        recovered.isError is False
+        and recovered.structuredContent["records"][0]["id"] == validId
+    ), (
+        f"post-corrupt-row recovery rule violated: isError={recovered.isError} "
+        f"structuredContent={recovered.structuredContent!r}"
+    )
+
+
+def test_recall_records_served_boundary_replaces_oversized_dispatch_error(
+        monkeypatch, ctx):  # I9, I11, B11, C9, S5
+    marker = "OVERSIZED_RECALL_ERROR_"
+    oversized = "error: " + marker + ("x" * (2 * 1024 * 1024))
+    recoveredValue = _recallValue("recovered", [])
+    recoveredResult = mcp_module.StructuredResult(
+        value=recoveredValue,
+        text=json.dumps(recoveredValue, sort_keys=True, separators=(",", ":")),
+    )
+    dispatchCalls = 0
+
+    def fakeDispatch(*_args):
+        nonlocal dispatchCalls
+        dispatchCalls += 1
+        if dispatchCalls == 1:
+            return oversized, True
+        return recoveredResult, False
+
+    wrapped = []
+    originalWrapper = mcp_module._callToolResult
+
+    def trackedWrapper(result, isError):
+        wrapped.append((result, isError))
+        return originalWrapper(result, isError)
+
+    monkeypatch.setattr(mcp_module, "dispatch", fakeDispatch)
+    monkeypatch.setattr(mcp_module, "_callToolResult", trackedWrapper)
+    handler = _serverHandler(ctx)
+
+    response = anyio.run(
+        _serverCall, handler, "recall_records", {"query": "oversized"})
+    recovered = anyio.run(
+        _serverCall, handler, "recall_records", {"query": "recovered"})
+    text = response.content[0].text
+
+    assert response.isError is True and _modelBytes(response) <= (
+        mcp_module.MAX_RECALL_RECORDS_CALL_RESULT_BYTES
+    ), (
+        f"final-error-envelope bound rule violated: isError={response.isError} "
+        f"wireBytes={_modelBytes(response)} "
+        f"cap={mcp_module.MAX_RECALL_RECORDS_CALL_RESULT_BYTES}"
+    )
+    assert text == "error: recall_records response exceeds wire-size cap", (
+        f"fixed-oversize-error rule violated: textChars={len(text)} "
+        f"markerPresent={marker in text} prefix={text[:96]!r}"
+    )
+    assert all(result is not oversized for result, _ in wrapped), (
+        f"raw-oversize preconstruction rule violated: wrapperCalls={len(wrapped)} "
+        f"giantArgCalls={sum(result is oversized for result, _ in wrapped)}"
+    )
+    assert (
+        dispatchCalls == 2
+        and len(wrapped) == 2
+        and recovered.isError is False
+        and recovered.structuredContent == recoveredValue
+    ), (
+        f"post-oversize recovery rule violated: dispatchCalls={dispatchCalls} "
+        f"wrapperCalls={len(wrapped)} isError={recovered.isError} "
+        f"structuredContent={recovered.structuredContent!r}"
+    )
+
+
+def test_recall_records_served_boundary_counts_escaping_overhead(
+        monkeypatch, ctx):  # I9, B11, C9
+    escaping = "error: " + ("\x00" * 200_000)
+    assert len(escaping.encode("utf-8")) < (
+        mcp_module.MAX_RECALL_RECORDS_CALL_RESULT_BYTES
+    ), (
+        f"escaping-overhead precondition violated: rawBytes={len(escaping.encode('utf-8'))} "
+        f"cap={mcp_module.MAX_RECALL_RECORDS_CALL_RESULT_BYTES}"
+    )
+    originalEnvelope = mcp_module._callToolResult(escaping, True)
+    assert _modelBytes(originalEnvelope) > (
+        mcp_module.MAX_RECALL_RECORDS_CALL_RESULT_BYTES
+    ), (
+        f"escaping-envelope precondition violated: wireBytes={_modelBytes(originalEnvelope)} "
+        f"cap={mcp_module.MAX_RECALL_RECORDS_CALL_RESULT_BYTES}"
+    )
+    wrapped = []
+    originalWrapper = mcp_module._callToolResult
+
+    def trackedWrapper(result, isError):
+        wrapped.append(result)
+        return originalWrapper(result, isError)
+
+    monkeypatch.setattr(
+        mcp_module, "dispatch", lambda *_args: (escaping, True))
+    monkeypatch.setattr(mcp_module, "_callToolResult", trackedWrapper)
+
+    response = anyio.run(
+        _serverCall, _serverHandler(ctx), "recall_records", {"query": "q"})
+
+    assert wrapped and wrapped[0] is escaping, (
+        f"within-raw-cap construction rule violated: wrapperCalls={len(wrapped)} "
+        f"originalSeen={any(result is escaping for result in wrapped)}"
+    )
+    assert response.content[0].text == (
+        "error: recall_records response exceeds wire-size cap"
+    ) and _modelBytes(response) <= mcp_module.MAX_RECALL_RECORDS_CALL_RESULT_BYTES, (
+        f"escaping-overhead final-bound rule violated: wireBytes={_modelBytes(response)} "
+        f"cap={mcp_module.MAX_RECALL_RECORDS_CALL_RESULT_BYTES} "
+        f"text={response.content[0].text[:96]!r}"
+    )
+
+
+def test_recall_records_served_boundary_fails_when_cap_cannot_hold_error(
+        monkeypatch, ctx):  # B12
+    oversized = "error: " + ("x" * 1024)
+    monkeypatch.setattr(
+        mcp_module, "dispatch", lambda *_args: (oversized, True))
+    monkeypatch.setattr(
+        mcp_module, "MAX_RECALL_RECORDS_CALL_RESULT_BYTES", 1)
+
+    response = anyio.run(
+        _serverCall, _serverHandler(ctx), "recall_records", {"query": "q"})
+    text = response.content[0].text
+
+    assert response.isError is True and text == (
+        "recall_records: wire cap cannot hold bounded error response"
+    ), (
+        f"unrepresentable-cap loud-failure rule violated: isError={response.isError} "
+        f"textChars={len(text)} diagnostic={text[:96]!r}"
+    )
+    assert _modelBytes(response) < 512, (
+        f"bounded cap-configuration diagnostic rule violated: "
+        f"wireBytes={_modelBytes(response)} limit=511"
+    )
+
+
+def test_legacy_served_boundary_preserves_oversized_dispatch_error(
+        monkeypatch, ctx):  # I6, C4, C8
+    oversized = "error: LEGACY_BYTES_" + ("z" * (2 * 1024 * 1024))
+    monkeypatch.setattr(
+        mcp_module, "dispatch", lambda *_args: (oversized, True))
+
+    response = anyio.run(
+        _serverCall, _serverHandler(ctx), "pensive_recall", {"query": "q"})
+
+    assert response.isError is True and response.content[0].text == oversized, (
+        f"legacy-error byte-preservation rule violated: isError={response.isError} "
+        f"expectedChars={len(oversized)} actualChars={len(response.content[0].text)}"
+    )
+    assert _modelBytes(response) > mcp_module.MAX_RECALL_RECORDS_CALL_RESULT_BYTES, (
+        f"recall-records-only guard scope rule violated: wireBytes={_modelBytes(response)} "
+        f"cap={mcp_module.MAX_RECALL_RECORDS_CALL_RESULT_BYTES}"
     )
 
 

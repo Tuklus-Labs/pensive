@@ -23,3 +23,16 @@ Aggregate wire-cap follow-up evidence, 2026-07-15:
 | Unslop locator over every changed file | no new candidates; pre-existing MCP section dividers kept |
 
 The cap, UTF-8 accounting, atomic tail-stop, and shared-wrapper production mutations each failed their named regression and were restored. Inverting one assertion in each new test produced 6 failures; restoration produced 6 passes.
+
+Served-error follow-up evidence, 2026-07-16:
+
+| Gate | Result |
+|------|--------|
+| Focused corrupt-row/error-boundary selection | 5 passed, 47 deselected in 0.50s |
+| `PYTHONPATH=daemon/src python3 -m pytest daemon/test/serve -q` | 116 passed in 16.52s |
+| `PYTHONPATH=daemon/src python3 -m pytest daemon/test/recall daemon/test/store -q` | 199 passed, 1 skipped in 10.40s |
+| `python3 -m compileall -q daemon/src/serve daemon/src/recall daemon/src/store` | exit 0 |
+| `git diff --check` | exit 0 |
+| Unslop locator over every changed file | no new candidates; pre-existing MCP section dividers kept |
+
+All five production mutations failed their named regression and were restored. Inverting one assertion in each new test produced `5 failed, 47 deselected`; restoration produced `5 passed, 47 deselected`.

@@ -91,6 +91,12 @@ _LISTING_GIST_CHARS = 300
 _MAX_JSON_INTEGER = 9_007_199_254_740_991
 _RECALL_KINDS = ["atom", "narrative", "snapshot", "document_chunk"]
 MAX_RECALL_RECORDS_CALL_RESULT_BYTES = 1 << 20
+_RECALL_RECORDS_OVERSIZE_ERROR = (
+    "error: recall_records response exceeds wire-size cap"
+)
+_RECALL_RECORDS_UNREPRESENTABLE_CAP_ERROR = (
+    "recall_records: wire cap cannot hold bounded error response"
+)
 
 _NULLABLE_ID_SCHEMA = {
     "type": ["string", "null"],
@@ -357,7 +363,8 @@ def _structuredResult(value):
         error = errors[0]
         path = ".".join(str(part) for part in error.absolute_path) or "<root>"
         raise ValueError(
-            f"recall_records: structured output violates schema at {path}: {error.message}"
+            f"recall_records: structured output violates schema at {path}: "
+            f"validator={error.validator}"
         )
     return StructuredResult(
         value=value,
@@ -1083,6 +1090,24 @@ def buildServer(ctx):
     @server.call_tool()
     async def call_tool(name, arguments):
         result, isError = dispatch(ctx, name, arguments or {})
-        return _callToolResult(result, isError)
+        if (
+            name == "recall_records"
+            and isinstance(result, str)
+            and len(result.encode("utf-8"))
+            > MAX_RECALL_RECORDS_CALL_RESULT_BYTES
+        ):
+            result = _RECALL_RECORDS_OVERSIZE_ERROR
+            isError = True
+        response = _callToolResult(result, isError)
+        if name != "recall_records":
+            return response
+        responseBytes = len(response.model_dump_json().encode("utf-8"))
+        if responseBytes <= MAX_RECALL_RECORDS_CALL_RESULT_BYTES:
+            return response
+        bounded = _callToolResult(_RECALL_RECORDS_OVERSIZE_ERROR, True)
+        boundedBytes = len(bounded.model_dump_json().encode("utf-8"))
+        if boundedBytes > MAX_RECALL_RECORDS_CALL_RESULT_BYTES:
+            raise ValueError(_RECALL_RECORDS_UNREPRESENTABLE_CAP_ERROR)
+        return bounded
 
     return server
