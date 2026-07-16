@@ -66,6 +66,7 @@ __all__ = [
     "TOOLS",
     "HANDLERS",
     "StructuredResult",
+    "MAX_RECALL_RECORDS_CALL_RESULT_BYTES",
     "dispatch",
     "buildServer",
 ]
@@ -89,6 +90,7 @@ _LISTING_GIST_CHARS = 300
 
 _MAX_JSON_INTEGER = 9_007_199_254_740_991
 _RECALL_KINDS = ["atom", "narrative", "snapshot", "document_chunk"]
+MAX_RECALL_RECORDS_CALL_RESULT_BYTES = 1 << 20
 
 _NULLABLE_ID_SCHEMA = {
     "type": ["string", "null"],
@@ -369,6 +371,23 @@ def _structuredResult(value):
     )
 
 
+def _callToolResult(result, isError):
+    if isinstance(result, StructuredResult):
+        return CallToolResult(
+            content=[TextContent(type="text", text=result.text)],
+            structuredContent=result.value,
+            isError=isError,
+        )
+    return CallToolResult(
+        content=[TextContent(type="text", text=result)],
+        isError=isError,
+    )
+
+
+def _callToolResultBytes(result, isError):
+    return len(_callToolResult(result, isError).model_dump_json().encode("utf-8"))
+
+
 def _gistLine(text):
     """One-line, whitespace-collapsed, length-capped preview of an atom body."""
     return " ".join((text or "").split())[:_LISTING_GIST_CHARS]
@@ -635,8 +654,28 @@ def handle_recall_records(ctx, args):
 
     records = []
     tokens = 0
-    truncated = False
-    for result in ranked:
+    truncated = bool(ranked)
+
+    def makeStructured(candidateRecords, candidateTokens, candidateTruncated):
+        return _structuredResult({
+            "schemaVersion": 1,
+            "query": query,
+            "project": project,
+            "records": candidateRecords,
+            "estimatedTokens": candidateTokens,
+            "lowConfidence": out["lowConfidence"],
+            "truncated": candidateTruncated,
+        })
+
+    structured = makeStructured(records, tokens, truncated)
+    baseBytes = _callToolResultBytes(structured, False)
+    if baseBytes > MAX_RECALL_RECORDS_CALL_RESULT_BYTES:
+        raise ValueError(
+            f"recall_records: base envelope is {baseBytes} bytes, exceeds cap "
+            f"{MAX_RECALL_RECORDS_CALL_RESULT_BYTES}"
+        )
+
+    for index, result in enumerate(ranked):
         atom = getAtom(ctx.store, result["atomId"])
         if atom is None:
             raise ValueError(
@@ -650,7 +689,7 @@ def handle_recall_records(ctx, args):
         if tokens + recordTokens > tokenBudget:
             truncated = True
             break
-        records.append({
+        record = {
             "id": atom["id"],
             "kind": atom["kind"],
             "project": atom["project"],
@@ -667,18 +706,25 @@ def handle_recall_records(ctx, args):
             "why": result["why"],
             "supersededBy": result.get("supersededBy"),
             "estimatedTokens": recordTokens,
-        })
-        tokens += recordTokens
+        }
+        candidateRecords = [*records, record]
+        candidateTokens = tokens + recordTokens
+        candidateTruncated = index < len(ranked) - 1
+        candidate = makeStructured(
+            candidateRecords, candidateTokens, candidateTruncated)
+        if (
+            _callToolResultBytes(candidate, False)
+            > MAX_RECALL_RECORDS_CALL_RESULT_BYTES
+        ):
+            truncated = True
+            break
+        records = candidateRecords
+        tokens = candidateTokens
+        truncated = candidateTruncated
+        structured = candidate
 
-    structured = _structuredResult({
-        "schemaVersion": 1,
-        "query": query,
-        "project": project,
-        "records": records,
-        "estimatedTokens": tokens,
-        "lowConfidence": out["lowConfidence"],
-        "truncated": truncated,
-    })
+    if truncated:
+        structured = makeStructured(records, tokens, True)
     _logReturnedRecall(
         ctx, out, query, "mcp.recall_records",
         atomIds=[record["id"] for record in records],
@@ -1037,15 +1083,6 @@ def buildServer(ctx):
     @server.call_tool()
     async def call_tool(name, arguments):
         result, isError = dispatch(ctx, name, arguments or {})
-        if isinstance(result, StructuredResult):
-            return CallToolResult(
-                content=[TextContent(type="text", text=result.text)],
-                structuredContent=result.value,
-                isError=isError,
-            )
-        return CallToolResult(
-            content=[TextContent(type="text", text=result)],
-            isError=isError,
-        )
+        return _callToolResult(result, isError)
 
     return server

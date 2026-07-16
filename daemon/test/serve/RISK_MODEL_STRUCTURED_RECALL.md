@@ -8,12 +8,15 @@
 - I4: `estimatedTokens` equals the sum of admitted record body estimates and never exceeds `tokenBudget`.
 - I5: The deterministic text fallback parses to the exact structured value and contains no NaN or non-JSON values.
 - I6: Existing compat tool schemas, native handlers, result strings, and string-only MCP responses do not change.
+- I7: The actual serialized `CallToolResult`, including duplicated text and structured channels, is at most 1 MiB in UTF-8 bytes.
+- I8: Wire-size admission preserves rank and atomicity. The first whole record whose final response envelope exceeds the cap drops that record and the entire tail.
 
 ## Axis: State transitions
 
 - S1: A malformed call returns an MCP error without invoking recall or changing daemon state.
 - S2: A handler or serialization failure is contained by `dispatch`; the next valid tool call still succeeds.
 - S3: `recall_records` is read-only and does not reindex, mutate atoms, or change compatibility handlers.
+- S4: An oversized base envelope fails loudly inside dispatch containment; it never produces an over-cap success response.
 
 ## Axis: Boundaries
 
@@ -25,6 +28,8 @@
 - B6: `kinds` accepts null or a non-empty unique subset of the four stored kinds; it rejects empty arrays, duplicates, unknown values, strings, and non-string members.
 - B7: A record whose body exactly fits the remaining budget is admitted; one token over drops it and the tail.
 - B8: Results are capped at 32 records and each provenance array is bounded to 64 entries by the output contract.
+- B9: A candidate whose exact serialized `CallToolResult` is at the aggregate cap is admitted; one byte over is omitted atomically.
+- B10: UTF-8 wire bytes, not Python characters, determine aggregate admission for multibyte metadata and provenance.
 
 ## Axis: Malformed inputs
 
@@ -51,17 +56,18 @@
 - C4: Existing string tools still return identical text and `structuredContent is None` over real MCP.
 - C5: MCP input validation and direct dispatch validation agree on unknown fields and type/bound rules.
 - C6: Recall telemetry contains only records actually admitted under the structured budget, never the dropped tail.
+- C7: Size measurement and MCP serving use the same private response-wrapper helper, preventing envelope drift.
 
 ## Axis: Regression traps
 
 - [x] boundary: off-by-one in inclusive vs exclusive range, and zero treated as falsy in numeric context. Exact endpoint and just-over tests cover every numeric/text bound.
 - [x] concurrency: N/A, synchronous read-only handler with no internal shared-state transition.
 - [x] contract: API returns null where caller expects empty collection, and caller/callee shape mismatch. Empty results return `records: []`; exact engine arguments and schema fields are pinned.
-- [x] encoding: non-finite JSON numbers and JavaScript-unsafe integers. Serialization uses `allow_nan=False`; time bounds are safe integers.
+- [x] encoding: non-finite JSON numbers, JavaScript-unsafe integers, and Unicode byte/character mismatch. Serialization uses `allow_nan=False`; time bounds are safe integers; aggregate accounting measures serialized UTF-8 bytes.
 - [x] framework: Python booleans are integers and MCP may validate before dispatch. Both direct and transport paths reject bool-as-int inputs.
 - [x] io: HTTP response-envelope drift. A temporary-port streamable HTTP test asserts both output channels.
 - [x] persistence: schema migration leaves stale rows. Protocol and atom schema versions are separate and missing rows fail loudly.
-- [x] resource: unbounded response growth and child-process pipe backpressure. `k`, `tokenBudget`, record count, text lengths, and provenance count are bounded; the transport probe writes daemon output to a temporary file instead of an undrained pipe.
+- [x] resource: unbounded response growth and child-process pipe backpressure. The exact duplicated MCP response is capped at 1 MiB; the transport probe writes daemon output to a temporary file instead of an undrained pipe.
 - [x] state: handler failure poisons next request. A bad stored row is followed by a valid call on the same context.
 
 ## Coverage Matrix
@@ -79,3 +85,5 @@
 | C3-C5, resource pipe backpressure | `test_build_server_wraps_structured_and_string_results`, `test_structured_recall_round_trips_over_temporary_http_transport` |
 | S3 | `test_recall_records_preserves_store_state` |
 | Empty-result contract | `test_recall_records_empty_result_is_low_confidence` |
+| I7, I8, B9, B10, C6 | `test_recall_records_wire_cap_admits_exact_size_and_drops_one_byte_over`, `test_recall_records_wire_cap_counts_multibyte_utf8_and_logs_only_admitted`, `test_recall_records_bounds_schema_maximum_shape_without_building_it_all` |
+| S4, C7 | `test_recall_records_base_envelope_over_cap_fails_loudly`, `test_call_tool_result_wrapper_matches_served_envelope`, `test_server_and_wire_measurement_share_call_tool_result_wrapper` |

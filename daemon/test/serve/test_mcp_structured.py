@@ -4,6 +4,7 @@ from types import SimpleNamespace
 
 import jsonschema
 import pytest
+from mcp.types import CallToolResult, TextContent
 
 import serve.mcp as mcp_module
 from recall.payload import estimateTokens
@@ -87,6 +88,96 @@ def _trust(atomId, *, score=0.9, confidence=0.8, shouldTrust=True,
     if supersededBy is not None:
         value["supersededBy"] = supersededBy
     return value
+
+
+def _wireResult(structured, isError=False):
+    return CallToolResult(
+        content=[TextContent(type="text", text=structured.text)],
+        structuredContent=structured.value,
+        isError=isError,
+    )
+
+
+def _wireBytes(structured, isError=False):
+    return len(_wireResult(structured, isError).model_dump_json().encode("utf-8"))
+
+
+def _resultSummary(result):
+    if isinstance(result, mcp_module.StructuredResult):
+        return {
+            "recordIds": [record["id"] for record in result.value["records"]],
+            "truncated": result.value["truncated"],
+            "wireBytes": _wireBytes(result),
+        }
+    return result
+
+
+def _structuredValue(value):
+    return SimpleNamespace(
+        value=value,
+        text=json.dumps(
+            value,
+            ensure_ascii=False,
+            allow_nan=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ),
+    )
+
+
+def _recordValue(atom, trust):
+    return {
+        "id": atom["id"],
+        "kind": atom["kind"],
+        "project": atom["project"],
+        "content": atom["text"],
+        "createdAt": atom["createdAt"],
+        "occurredAt": atom["occurredAt"],
+        "importance": atom["importance"],
+        "status": atom["status"],
+        "atomSchemaVersion": atom["schemaVersion"],
+        "provenance": atom["provenance"],
+        "score": trust["score"],
+        "confidence": trust["confidence"],
+        "shouldTrust": trust["shouldTrust"],
+        "why": trust["why"],
+        "supersededBy": trust.get("supersededBy"),
+        "estimatedTokens": estimateTokens(atom["text"]),
+    }
+
+
+def _recallValue(query, records, *, lowConfidence=False, truncated=False):
+    return {
+        "schemaVersion": 1,
+        "query": query,
+        "project": None,
+        "records": records,
+        "estimatedTokens": sum(record["estimatedTokens"] for record in records),
+        "lowConfidence": lowConfidence,
+        "truncated": truncated,
+    }
+
+
+def _addProvenanceRows(
+        store, atomId, count, *, fill="p", sourceChars=256, textChars=2048):
+    rows = []
+    for index in range(count):
+        unique = f"{index:026d}"
+        rows.append((
+            unique,
+            atomId,
+            fill * sourceChars,
+            fill * textChars,
+            fill * textChars,
+            fill * textChars,
+            1_780_000_000 + index,
+        ))
+    store._conn.executemany(
+        "INSERT INTO provenance(id, atom_id, source, session_id, agent, source_ref, recorded_at) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?)",
+        rows,
+    )
+    store._conn.commit()
 
 
 def test_recall_records_schemas_are_strict():  # I1, B8, C2
@@ -407,6 +498,151 @@ def test_recall_records_applies_atomic_rank_order_budget(monkeypatch, ctx, store
     ], f"served-record telemetry rule violated: rows={logged!r}"
 
 
+def test_recall_records_wire_cap_admits_exact_size_and_drops_one_byte_over(
+        monkeypatch, ctx, store):  # I7, I8, B9, C6
+    atomId = _put(store, "whole record")
+    ranked = [_trust(atomId)]
+    monkeypatch.setattr(mcp_module, "recall", lambda *a, **kw: _engineResult(ranked))
+    atom = getAtom(store, atomId)
+    record = _recordValue(atom, ranked[0])
+    candidate = _structuredValue(_recallValue("wire boundary", [record]))
+    exactBytes = _wireBytes(candidate)
+
+    monkeypatch.setattr(
+        mcp_module, "MAX_RECALL_RECORDS_CALL_RESULT_BYTES", exactBytes, raising=False)
+    exact, exactError = dispatch(ctx, "recall_records", {"query": "wire boundary"})
+    monkeypatch.setattr(
+        mcp_module, "MAX_RECALL_RECORDS_CALL_RESULT_BYTES", exactBytes - 1, raising=False)
+    over, overError = dispatch(ctx, "recall_records", {"query": "wire boundary"})
+
+    assert exactError is False and [r["id"] for r in exact.value["records"]] == [atomId], (
+        f"exact-wire-cap admission rule violated: cap={exactBytes} "
+        f"result={_resultSummary(exact)!r} "
+        f"isError={exactError}"
+    )
+    assert _wireBytes(exact) == exactBytes, (
+        f"exact-wire-size rule violated: expected={exactBytes} actual={_wireBytes(exact)}"
+    )
+    assert overError is False and over.value["records"] == [], (
+        f"one-byte-over atomic omission rule violated: cap={exactBytes - 1} "
+        f"result={_resultSummary(over)!r} isError={overError}"
+    )
+    assert over.value["truncated"] is True and _wireBytes(over) <= exactBytes - 1, (
+        f"one-byte-over bounded-envelope rule violated: cap={exactBytes - 1} "
+        f"result={_resultSummary(over)!r}"
+    )
+    logged = store._conn.execute(
+        "SELECT atom_id, source_ref FROM recall_log ORDER BY rowid"
+    ).fetchall()
+    assert logged == [(atomId, "mcp.recall_records")], (
+        f"wire-admission telemetry rule violated: admitted={[atomId]!r} rows={logged!r}"
+    )
+
+
+def test_recall_records_wire_cap_counts_multibyte_utf8_and_logs_only_admitted(
+        monkeypatch, ctx, store):  # I7, I8, B10, C6
+    firstId = _put(store, "first")
+    secondId = _put(store, "second")
+    _addProvenanceRows(store, secondId, 63, fill="\U0001f9e0")
+    ranked = [_trust(firstId), _trust(secondId)]
+    firstRecord = _recordValue(getAtom(store, firstId), ranked[0])
+    secondRecord = _recordValue(getAtom(store, secondId), ranked[1])
+    firstEnvelope = _structuredValue(
+        _recallValue("unicode wire", [firstRecord], truncated=True))
+    bothEnvelope = _structuredValue(
+        _recallValue("unicode wire", [firstRecord, secondRecord]))
+    characterCount = len(_wireResult(bothEnvelope).model_dump_json())
+    byteCount = _wireBytes(bothEnvelope)
+    cap = mcp_module.MAX_RECALL_RECORDS_CALL_RESULT_BYTES
+    assert cap == 1 << 20, (
+        f"aggregate-wire-cap constant rule violated: cap={cap} expected={1 << 20}"
+    )
+    assert _wireBytes(firstEnvelope) <= cap, (
+        f"multibyte-test first-record precondition violated: "
+        f"wireBytes={_wireBytes(firstEnvelope)} cap={cap}"
+    )
+    assert characterCount < cap < byteCount, (
+        f"multibyte-test precondition violated: chars={characterCount} cap={cap} bytes={byteCount}"
+    )
+    monkeypatch.setattr(mcp_module, "recall", lambda *a, **kw: _engineResult(ranked))
+
+    result, isError = dispatch(ctx, "recall_records", {"query": "unicode wire"})
+
+    assert isError is False and [r["id"] for r in result.value["records"]] == [firstId], (
+        f"UTF-8 byte admission rule violated: chars={characterCount} cap={cap} "
+        f"bytes={byteCount} result={_resultSummary(result)!r} isError={isError}"
+    )
+    assert result.value["truncated"] is True and _wireBytes(result) <= cap, (
+        f"multibyte bounded-envelope rule violated: cap={cap} "
+        f"result={_resultSummary(result)!r}"
+    )
+    logged = store._conn.execute(
+        "SELECT atom_id, source_ref FROM recall_log ORDER BY rowid"
+    ).fetchall()
+    assert logged == [(firstId, "mcp.recall_records")], (
+        f"multibyte telemetry rule violated: admitted={[firstId]!r} rows={logged!r}"
+    )
+
+
+def test_recall_records_base_envelope_over_cap_fails_loudly(monkeypatch, ctx):  # S4
+    monkeypatch.setattr(
+        mcp_module, "recall", lambda *a, **kw: _engineResult(lowConfidence=True))
+    base = _structuredValue(
+        _recallValue("base boundary", [], lowConfidence=True, truncated=False))
+    baseBytes = _wireBytes(base)
+    monkeypatch.setattr(
+        mcp_module, "MAX_RECALL_RECORDS_CALL_RESULT_BYTES", baseBytes - 1, raising=False)
+
+    bad, badError = dispatch(ctx, "recall_records", {"query": "base boundary"})
+    monkeypatch.setattr(
+        mcp_module, "MAX_RECALL_RECORDS_CALL_RESULT_BYTES", baseBytes, raising=False)
+    good, goodError = dispatch(ctx, "recall_records", {"query": "base boundary"})
+
+    assert badError is True and "base envelope" in bad and "cap" in bad, (
+        f"base-envelope loud-failure rule violated: cap={baseBytes - 1} "
+        f"result={bad!r} isError={badError}"
+    )
+    assert goodError is False and _wireBytes(good) == baseBytes, (
+        f"base-envelope exact-cap rule violated: cap={baseBytes} "
+        f"result={good!r} isError={goodError}"
+    )
+
+
+def test_recall_records_bounds_schema_maximum_shape_without_building_it_all(
+        monkeypatch, ctx, store):  # I7, I8, B8
+    atomId = _put(store, "bounded shape")
+    _addProvenanceRows(
+        store, atomId, 63, fill="\U0001f9e0", sourceChars=16, textChars=16)
+    ranked = [_trust(atomId) for _ in range(32)]
+    calls = []
+    originalGetAtom = mcp_module.getAtom
+
+    def trackedGetAtom(*args):
+        calls.append(args[1])
+        return originalGetAtom(*args)
+
+    monkeypatch.setattr(mcp_module, "getAtom", trackedGetAtom)
+    monkeypatch.setattr(mcp_module, "recall", lambda *a, **kw: _engineResult(ranked))
+    monkeypatch.setattr(
+        mcp_module, "MAX_RECALL_RECORDS_CALL_RESULT_BYTES", 4096, raising=False)
+
+    result, isError = dispatch(ctx, "recall_records", {
+        "query": "bounded maximum shape", "k": 32, "tokenBudget": 8000,
+    })
+
+    assert isError is False and result.value["records"] == [], (
+        f"maximum-shape aggregate bound rule violated: "
+        f"result={_resultSummary(result)!r} isError={isError}"
+    )
+    assert result.value["truncated"] is True and _wireBytes(result) <= 4096, (
+        f"maximum-shape bounded-envelope rule violated: "
+        f"result={_resultSummary(result)!r}"
+    )
+    assert calls == [atomId], (
+        f"first-oversize tail-stop rule violated: getAtomCalls={calls!r} expected={[atomId]!r}"
+    )
+
+
 def test_recall_records_empty_result_is_low_confidence(monkeypatch, ctx):  # contract: empty
     monkeypatch.setattr(
         mcp_module, "recall", lambda *a, **kw: _engineResult(lowConfidence=True))
@@ -510,6 +746,74 @@ def test_recall_records_preserves_store_state(monkeypatch, ctx, store):  # S3
     )
     assert after == before, (
         f"atom-store immutability rule violated: before={before!r} after={after!r}"
+    )
+
+
+def test_call_tool_result_wrapper_matches_served_envelope():  # C7
+    value = _recallValue("wrapper", [])
+    structured = mcp_module.StructuredResult(
+        value=value,
+        text=json.dumps(value, sort_keys=True, separators=(",", ":")),
+    )
+    wrapper = getattr(mcp_module, "_callToolResult", None)
+
+    assert callable(wrapper), (
+        f"shared-wrapper existence rule violated: wrapper={wrapper!r}"
+    )
+    structuredResult = wrapper(structured, False)
+    stringResult = wrapper("legacy string", True)
+    assert structuredResult.model_dump_json() == _wireResult(structured).model_dump_json(), (
+        f"structured-wrapper exact-envelope rule violated: result={structuredResult!r}"
+    )
+    assert stringResult == CallToolResult(
+        content=[TextContent(type="text", text="legacy string")],
+        isError=True,
+    ), f"string-wrapper compatibility rule violated: result={stringResult!r}"
+
+
+def test_server_and_wire_measurement_share_call_tool_result_wrapper(
+        monkeypatch, ctx):  # C7
+    import anyio
+    from mcp.types import CallToolRequest, CallToolRequestParams
+
+    wrapper = getattr(mcp_module, "_callToolResult", None)
+    assert callable(wrapper), (
+        f"shared-wrapper existence rule violated: wrapper={wrapper!r}"
+    )
+    calls = []
+
+    def trackedWrapper(result, isError):
+        calls.append((result, isError))
+        return wrapper(result, isError)
+
+    monkeypatch.setattr(mcp_module, "_callToolResult", trackedWrapper)
+    monkeypatch.setattr(
+        mcp_module, "recall", lambda *a, **kw: _engineResult(lowConfidence=True))
+
+    measured, measuredError = dispatch(ctx, "recall_records", {"query": "measure"})
+    assert measuredError is False and len(calls) == 1, (
+        f"wire-measurement shared-wrapper rule violated: calls={calls!r} "
+        f"result={measured!r} isError={measuredError}"
+    )
+
+    calls.clear()
+    monkeypatch.setattr(
+        mcp_module, "dispatch", lambda *_args: (measured, False))
+    server = buildServer(ctx)
+    handler = server.request_handlers[CallToolRequest]
+
+    async def call():
+        response = await handler(CallToolRequest(
+            params=CallToolRequestParams(
+                name="recall_records", arguments={"query": "serve"})))
+        return response.root
+
+    response = anyio.run(call)
+    assert (
+        len(calls) == 1
+        and response.model_dump_json() == _wireResult(measured).model_dump_json()
+    ), (
+        f"server shared-wrapper rule violated: calls={calls!r} response={response!r}"
     )
 
 
