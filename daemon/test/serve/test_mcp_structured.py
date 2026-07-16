@@ -1,0 +1,565 @@
+import json
+import math
+from types import SimpleNamespace
+
+import jsonschema
+import pytest
+
+import serve.mcp as mcp_module
+from recall.payload import estimateTokens
+from serve.mcp import NATIVE_TOOLS, buildServer, dispatch
+from store.store import getAtom, openStore, putAtom
+
+
+def _tool(name):
+    for tool in NATIVE_TOOLS:
+        if tool.name == name:
+            return tool
+    raise AssertionError(f"native-tool registration rule violated: missing tool={name!r}")
+
+
+def _assertStrictObjects(schema, path="$Schema"):
+    if schema.get("type") == "object":
+        assert schema.get("additionalProperties") is False, (
+            f"strict-schema rule violated: object path={path!r} "
+            f"additionalProperties={schema.get('additionalProperties')!r}"
+        )
+    for name, child in schema.get("properties", {}).items():
+        _assertStrictObjects(child, f"{path}.{name}")
+    items = schema.get("items")
+    if isinstance(items, dict):
+        _assertStrictObjects(items, f"{path}[]")
+
+
+@pytest.fixture
+def store(tmp_path):
+    value = openStore(tmp_path / "structured.db")
+    try:
+        yield value
+    finally:
+        value.close()
+
+
+@pytest.fixture
+def ctx(store):
+    return SimpleNamespace(
+        store=store,
+        indexes={"memory": object()},
+        embedder=object(),
+        defaultK=10,
+        defaultTokenBudget=1500,
+        recallLogErrors=0,
+    )
+
+
+def _put(store, content, *, kind="atom", project="grok-kernel", importance=0.0,
+         occurredAt=None, source="explicit-emit", agent="grok-kernel"):
+    atomInput = {
+        "text": content,
+        "kind": kind,
+        "project": project,
+        "importance": importance,
+        "provenance": {"source": source, "agent": agent},
+    }
+    if occurredAt is not None:
+        atomInput["occurredAt"] = occurredAt
+    return putAtom(store, atomInput)
+
+
+def _engineResult(results=(), *, lowConfidence=False):
+    return {
+        "results": list(results),
+        "payload": "unused by structured recall",
+        "tokensUsed": 0,
+        "lowConfidence": lowConfidence,
+    }
+
+
+def _trust(atomId, *, score=0.9, confidence=0.8, shouldTrust=True,
+           why="both signals agree", supersededBy=None):
+    value = {
+        "atomId": atomId,
+        "score": score,
+        "confidence": confidence,
+        "shouldTrust": shouldTrust,
+        "why": why,
+    }
+    if supersededBy is not None:
+        value["supersededBy"] = supersededBy
+    return value
+
+
+def test_recall_records_schemas_are_strict():  # I1, B8, C2
+    tool = _tool("recall_records")
+    inputSchema = tool.inputSchema
+    outputSchema = tool.outputSchema
+
+    jsonschema.Draft202012Validator.check_schema(inputSchema)
+    jsonschema.Draft202012Validator.check_schema(outputSchema)
+    _assertStrictObjects(inputSchema, "input")
+    _assertStrictObjects(outputSchema, "output")
+
+    assert inputSchema["required"] == ["query"], (
+        f"required-input rule violated: required={inputSchema['required']!r}"
+    )
+    assert set(inputSchema["properties"]) == {
+        "query", "project", "timeScope", "kinds", "k", "tokenBudget",
+    }, f"input-field rule violated: properties={sorted(inputSchema['properties'])!r}"
+    assert inputSchema["properties"]["query"]["minLength"] == 1, (
+        f"query-min rule violated: schema={inputSchema['properties']['query']!r}"
+    )
+    assert inputSchema["properties"]["query"]["maxLength"] == 8192, (
+        f"query-max rule violated: schema={inputSchema['properties']['query']!r}"
+    )
+    assert inputSchema["properties"]["k"]["minimum"] == 1, (
+        f"k-min rule violated: schema={inputSchema['properties']['k']!r}"
+    )
+    assert inputSchema["properties"]["k"]["maximum"] == 32, (
+        f"k-max rule violated: schema={inputSchema['properties']['k']!r}"
+    )
+    assert inputSchema["properties"]["tokenBudget"]["minimum"] == 1, (
+        f"budget-min rule violated: schema={inputSchema['properties']['tokenBudget']!r}"
+    )
+    assert inputSchema["properties"]["tokenBudget"]["maximum"] == 8000, (
+        f"budget-max rule violated: schema={inputSchema['properties']['tokenBudget']!r}"
+    )
+
+    expectedTop = {
+        "schemaVersion", "query", "project", "records", "estimatedTokens",
+        "lowConfidence", "truncated",
+    }
+    expectedRecord = {
+        "id", "kind", "project", "content", "createdAt", "occurredAt",
+        "importance", "status", "atomSchemaVersion", "provenance", "score",
+        "confidence", "shouldTrust", "why", "supersededBy", "estimatedTokens",
+    }
+    expectedProvenance = {
+        "id", "atomId", "source", "sessionId", "agent", "sourceRef", "recordedAt",
+    }
+    assert set(outputSchema["required"]) == expectedTop, (
+        f"output-required rule violated: required={sorted(outputSchema['required'])!r}"
+    )
+    recordSchema = outputSchema["properties"]["records"]["items"]
+    provenanceSchema = recordSchema["properties"]["provenance"]["items"]
+    assert set(recordSchema["required"]) == expectedRecord, (
+        f"record-required rule violated: required={sorted(recordSchema['required'])!r}"
+    )
+    assert set(provenanceSchema["required"]) == expectedProvenance, (
+        f"provenance-required rule violated: required={sorted(provenanceSchema['required'])!r}"
+    )
+    assert outputSchema["properties"]["records"]["maxItems"] == 32, (
+        f"record-cap rule violated: schema={outputSchema['properties']['records']!r}"
+    )
+    assert recordSchema["properties"]["provenance"]["maxItems"] == 64, (
+        f"provenance-cap rule violated: schema={recordSchema['properties']['provenance']!r}"
+    )
+    assert recordSchema["properties"]["provenance"]["minItems"] == 1, (
+        f"provenance-required-content rule violated: "
+        f"schema={recordSchema['properties']['provenance']!r}"
+    )
+    assert recordSchema["properties"]["status"]["enum"] == ["live", "superseded"], (
+        f"recallable-status rule violated: schema={recordSchema['properties']['status']!r}"
+    )
+
+
+@pytest.mark.parametrize(("args", "field"), [
+    ({}, "query"),
+    ({"query": None}, "query"),
+    ({"query": 7}, "query"),
+    ({"query": "   "}, "query"),
+    ({"query": "q" * 8193}, "query"),
+    ({"query": "q", "project": ""}, "project"),
+    ({"query": "q", "project": "p" * 257}, "project"),
+    ({"query": "q", "project": False}, "project"),
+    ({"query": "q", "k": True}, "k"),
+    ({"query": "q", "k": 0}, "k"),
+    ({"query": "q", "k": 33}, "k"),
+    ({"query": "q", "k": 1.0}, "k"),
+    ({"query": "q", "k": "10"}, "k"),
+    ({"query": "q", "tokenBudget": False}, "tokenBudget"),
+    ({"query": "q", "tokenBudget": 0}, "tokenBudget"),
+    ({"query": "q", "tokenBudget": 8001}, "tokenBudget"),
+    ({"query": "q", "tokenBudget": 1.0}, "tokenBudget"),
+    ({"query": "q", "timeScope": []}, "timeScope"),
+    ({"query": "q", "timeScope": [0]}, "timeScope"),
+    ({"query": "q", "timeScope": [0, 1, 2]}, "timeScope"),
+    ({"query": "q", "timeScope": [False, 1]}, "timeScope"),
+    ({"query": "q", "timeScope": [-1, 1]}, "timeScope"),
+    ({"query": "q", "timeScope": [0, 9_007_199_254_740_992]}, "timeScope"),
+    ({"query": "q", "timeScope": [2, 1]}, "timeScope"),
+    ({"query": "q", "kinds": []}, "kinds"),
+    ({"query": "q", "kinds": "atom"}, "kinds"),
+    ({"query": "q", "kinds": ["atom", "atom"]}, "kinds"),
+    ({"query": "q", "kinds": ["unknown"]}, "kinds"),
+    ({"query": "q", "kinds": [1]}, "kinds"),
+    ({"query": "q", "surprise": 1}, "unknown fields"),
+])
+def test_recall_records_argument_contract(monkeypatch, ctx, args, field):  # B1-B6, M1, C5, S1
+    calls = []
+    monkeypatch.setattr(mcp_module, "recall", lambda *a, **kw: calls.append((a, kw)))
+
+    text, isError = dispatch(ctx, "recall_records", args)
+
+    assert isError is True, (
+        f"invalid-argument containment rule violated: args={args!r} result={text!r}"
+    )
+    expectedError = f"recall_records: {field}"
+    assert expectedError in text, (
+        f"field-naming error rule violated: field={field!r} args={args!r} result={text!r}"
+    )
+    assert calls == [], (
+        f"validate-before-recall rule violated: args={args!r} engineCalls={calls!r}"
+    )
+
+
+def test_recall_records_calls_engine_once_with_normalized_arguments(monkeypatch, ctx):  # C1
+    calls = []
+
+    def fakeRecall(*args, **kwargs):
+        calls.append((args, kwargs))
+        return _engineResult()
+
+    monkeypatch.setattr(mcp_module, "recall", fakeRecall)
+    query = "  preserve this query exactly  "
+    value, isError = dispatch(ctx, "recall_records", {
+        "query": query,
+        "project": None,
+        "timeScope": [0, 9_007_199_254_740_991],
+        "kinds": ["atom", "document_chunk"],
+        "k": 32,
+        "tokenBudget": 8000,
+    })
+
+    assert isError is False, (
+        f"valid-argument rule violated: isError={isError} result={value!r}"
+    )
+    assert len(calls) == 1, (
+        f"single-engine-call rule violated: callCount={len(calls)} calls={calls!r}"
+    )
+    positional, keywords = calls[0]
+    assert positional == (ctx.store, ctx.indexes, ctx.embedder, query), (
+        f"engine-positional contract violated: positional={positional!r}"
+    )
+    assert keywords == {
+        "project": None,
+        "timeScope": (0, 9_007_199_254_740_991),
+        "kinds": ("atom", "document_chunk"),
+        "k": 32,
+        "tokenBudget": 8000,
+    }, f"engine-keyword contract violated: keywords={keywords!r}"
+
+
+def test_recall_records_accepts_inclusive_argument_endpoints(monkeypatch, ctx):  # B1-B6
+    calls = []
+
+    def fakeRecall(*args, **kwargs):
+        calls.append((args, kwargs))
+        return _engineResult()
+
+    monkeypatch.setattr(mcp_module, "recall", fakeRecall)
+    cases = [
+        {"query": "q", "project": "p", "k": 1, "tokenBudget": 1},
+        {"query": "q" * 8192, "project": "p" * 256, "k": 32,
+         "tokenBudget": 8000},
+        {"query": "q", "timeScope": [0, 0],
+         "kinds": ["atom", "narrative", "snapshot", "document_chunk"]},
+        {"query": "q", "project": None, "timeScope": None, "kinds": None},
+    ]
+
+    results = [dispatch(ctx, "recall_records", args) for args in cases]
+
+    assert all(isError is False for _, isError in results), (
+        f"inclusive-endpoint rule violated: cases={cases!r} results={results!r}"
+    )
+    assert len(calls) == len(cases), (
+        f"endpoint-forwarding rule violated: callCount={len(calls)} cases={len(cases)}"
+    )
+    assert calls[0][1]["k"] == 1 and calls[0][1]["tokenBudget"] == 1, (
+        f"minimum-endpoint forwarding rule violated: keywords={calls[0][1]!r}"
+    )
+    assert calls[1][1]["k"] == 32 and calls[1][1]["tokenBudget"] == 8000, (
+        f"maximum-endpoint forwarding rule violated: keywords={calls[1][1]!r}"
+    )
+    assert calls[2][1]["timeScope"] == (0, 0), (
+        f"zero-timescope forwarding rule violated: keywords={calls[2][1]!r}"
+    )
+    assert calls[3][1] == {
+        "project": None,
+        "timeScope": None,
+        "kinds": None,
+        "k": 10,
+        "tokenBudget": 1500,
+    }, f"default-argument rule violated: keywords={calls[3][1]!r}"
+
+
+def test_recall_records_preserves_rank_metadata_provenance_and_trust(
+        monkeypatch, ctx, store):  # I2, I4, M4, P1, P2
+    firstId = _put(
+        store, "first complete body", kind="narrative", project=None,
+        importance=0.75, occurredAt=1_780_000_000, source="explicit-emit",
+    )
+    secondId = _put(store, "historical body", project="grok-kernel")
+    successorId = _put(store, "current body", project="grok-kernel")
+    store._conn.execute(
+        "INSERT INTO provenance(id, atom_id, source, session_id, agent, source_ref, recorded_at) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?)",
+        ("01SECONDPROVENANCE00000000", firstId, "codex", "session-7", None,
+         "turn/14", 1_780_000_001),
+    )
+    store._conn.execute("UPDATE atoms SET status = 'superseded' WHERE id = ?", (secondId,))
+    store._conn.commit()
+    ranked = [
+        _trust(firstId, score=1.25, confidence=0.91, why="lexical+dense agreement"),
+        _trust(secondId, score=0.5, confidence=0.4, shouldTrust=False,
+               why="superseded by newer atom", supersededBy=successorId),
+    ]
+    monkeypatch.setattr(mcp_module, "recall", lambda *a, **kw: _engineResult(ranked))
+
+    result, isError = dispatch(ctx, "recall_records", {
+        "query": "durable context", "project": "grok-kernel", "tokenBudget": 8000,
+    })
+
+    assert isError is False, (
+        f"structured-record success rule violated: isError={isError} result={result!r}"
+    )
+    value = result.value
+    assert [record["id"] for record in value["records"]] == [firstId, secondId], (
+        f"rank-order rule violated: records={value['records']!r}"
+    )
+    first, second = value["records"]
+    atom = getAtom(store, firstId)
+    assert first == {
+        "id": firstId,
+        "kind": "narrative",
+        "project": None,
+        "content": "first complete body",
+        "createdAt": atom["createdAt"],
+        "occurredAt": 1_780_000_000,
+        "importance": 0.75,
+        "status": "live",
+        "atomSchemaVersion": atom["schemaVersion"],
+        "provenance": atom["provenance"],
+        "score": 1.25,
+        "confidence": 0.91,
+        "shouldTrust": True,
+        "why": "lexical+dense agreement",
+        "supersededBy": None,
+        "estimatedTokens": estimateTokens("first complete body"),
+    }, f"metadata-provenance rule violated: record={first!r} atom={atom!r}"
+    assert second["status"] == "superseded" and second["supersededBy"] == successorId, (
+        f"supersession-field rule violated: record={second!r}"
+    )
+    expectedTokens = sum(record["estimatedTokens"] for record in value["records"])
+    assert value["estimatedTokens"] == expectedTokens <= 8000, (
+        f"token-sum rule violated: total={value['estimatedTokens']} "
+        f"recordTokens={[r['estimatedTokens'] for r in value['records']]!r}"
+    )
+    assert json.loads(result.text) == value, (
+        f"deterministic-fallback equivalence rule violated: text={result.text!r} value={value!r}"
+    )
+    assert result.text == json.dumps(
+        value, ensure_ascii=False, allow_nan=False, sort_keys=True, separators=(",", ":")), (
+        f"deterministic-fallback formatting rule violated: text={result.text!r}"
+    )
+    jsonschema.validate(value, _tool("recall_records").outputSchema)
+
+
+def test_recall_records_applies_atomic_rank_order_budget(monkeypatch, ctx, store):  # I3, B7, C6
+    firstId = _put(store, "abcdef")                 # 2 tokens
+    secondId = _put(store, "x" * 30)                # 10 tokens
+    thirdId = _put(store, "end")                    # 1 token
+    ranked = [_trust(firstId), _trust(secondId), _trust(thirdId)]
+    monkeypatch.setattr(mcp_module, "recall", lambda *a, **kw: _engineResult(ranked))
+
+    exact, exactError = dispatch(ctx, "recall_records", {
+        "query": "context precedence", "tokenBudget": 12,
+    })
+    short, shortError = dispatch(ctx, "recall_records", {
+        "query": "context precedence", "tokenBudget": 11,
+    })
+
+    assert exactError is False and shortError is False, (
+        f"budget-call success rule violated: exactError={exactError} shortError={shortError}"
+    )
+    assert [r["id"] for r in exact.value["records"]] == [firstId, secondId], (
+        f"exact-fit admission rule violated: records={exact.value['records']!r}"
+    )
+    assert exact.value["estimatedTokens"] == 12 and exact.value["truncated"] is True, (
+        f"tail-truncation rule violated: value={exact.value!r}"
+    )
+    assert [r["id"] for r in short.value["records"]] == [firstId], (
+        f"first-nonfit tail-drop rule violated: records={short.value['records']!r}"
+    )
+    assert short.value["estimatedTokens"] == 2 and short.value["truncated"] is True, (
+        f"short-budget accounting rule violated: value={short.value!r}"
+    )
+    originalBodies = {"abcdef", "x" * 30, "end"}
+    assert all(r["content"] in originalBodies for r in exact.value["records"]), (
+        f"atomic-body rule violated: records={exact.value['records']!r}"
+    )
+    logged = store._conn.execute(
+        "SELECT atom_id, source_ref FROM recall_log ORDER BY rowid"
+    ).fetchall()
+    assert logged == [
+        (firstId, "mcp.recall_records"),
+        (secondId, "mcp.recall_records"),
+        (firstId, "mcp.recall_records"),
+    ], f"served-record telemetry rule violated: rows={logged!r}"
+
+
+def test_recall_records_empty_result_is_low_confidence(monkeypatch, ctx):  # contract: empty
+    monkeypatch.setattr(
+        mcp_module, "recall", lambda *a, **kw: _engineResult(lowConfidence=True))
+
+    result, isError = dispatch(ctx, "recall_records", {"query": "no match"})
+
+    assert isError is False, (
+        f"empty-result success rule violated: isError={isError} result={result!r}"
+    )
+    assert result.value["records"] == [], (
+        f"empty-collection rule violated: value={result.value!r}"
+    )
+    assert result.value["lowConfidence"] is True, (
+        f"low-confidence propagation rule violated: value={result.value!r}"
+    )
+    assert result.value["estimatedTokens"] == 0 and result.value["truncated"] is False, (
+        f"empty-accounting rule violated: value={result.value!r}"
+    )
+
+
+def test_recall_records_missing_atom_errors_then_next_call_succeeds(
+        monkeypatch, ctx, store):  # S2, M2, P3
+    goodId = _put(store, "present atom")
+
+    def fakeRecall(*args, **kwargs):
+        query = args[3]
+        atomId = "01MISSINGXXXXXXXXXXXXXXXXXX" if query == "bad" else goodId
+        return _engineResult([_trust(atomId)])
+
+    monkeypatch.setattr(mcp_module, "recall", fakeRecall)
+
+    bad, badError = dispatch(ctx, "recall_records", {"query": "bad"})
+    good, goodError = dispatch(ctx, "recall_records", {"query": "good"})
+
+    assert badError is True and "absent from the store" in bad, (
+        f"missing-record loudness rule violated: isError={badError} result={bad!r}"
+    )
+    assert goodError is False and good.value["records"][0]["id"] == goodId, (
+        f"post-error serving rule violated: isError={goodError} result={good!r}"
+    )
+
+
+def test_recall_records_serialization_failure_is_contained(
+        monkeypatch, ctx, store):  # I5, M3, S2
+    atomId = _put(store, "finite atom")
+
+    def fakeRecall(*args, **kwargs):
+        score = math.nan if args[3] == "bad json" else 0.9
+        return _engineResult([_trust(atomId, score=score)])
+
+    monkeypatch.setattr(mcp_module, "recall", fakeRecall)
+
+    bad, badError = dispatch(ctx, "recall_records", {"query": "bad json"})
+    good, goodError = dispatch(ctx, "recall_records", {"query": "good json"})
+
+    assert badError is True and "JSON" in bad, (
+        f"non-finite JSON containment rule violated: isError={badError} result={bad!r}"
+    )
+    assert goodError is False and json.loads(good.text) == good.value, (
+        f"post-serialization-error rule violated: isError={goodError} result={good!r}"
+    )
+
+
+def test_recall_records_output_schema_failure_is_contained(
+        monkeypatch, ctx):  # I1, S2, M4
+    calls = 0
+
+    def fakeRecall(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        return _engineResult(lowConfidence="yes" if calls == 1 else True)
+
+    monkeypatch.setattr(mcp_module, "recall", fakeRecall)
+
+    bad, badError = dispatch(ctx, "recall_records", {"query": "bad shape"})
+    good, goodError = dispatch(ctx, "recall_records", {"query": "good shape"})
+
+    assert badError is True and "structured output" in bad, (
+        f"output-schema containment rule violated: isError={badError} result={bad!r}"
+    )
+    assert goodError is False and good.value["lowConfidence"] is True, (
+        f"post-output-schema-error rule violated: isError={goodError} result={good!r}"
+    )
+
+
+def test_recall_records_preserves_store_state(monkeypatch, ctx, store):  # S3
+    atomId = _put(store, "read-only atom")
+    monkeypatch.setattr(
+        mcp_module, "recall", lambda *a, **kw: _engineResult([_trust(atomId)]))
+    before = store._conn.execute(
+        "SELECT id, text, kind, project, status, schema_version FROM atoms ORDER BY id"
+    ).fetchall()
+
+    result, isError = dispatch(ctx, "recall_records", {"query": "read only"})
+    after = store._conn.execute(
+        "SELECT id, text, kind, project, status, schema_version FROM atoms ORDER BY id"
+    ).fetchall()
+
+    assert isError is False and result.value["records"][0]["id"] == atomId, (
+        f"read-only call success rule violated: isError={isError} result={result!r}"
+    )
+    assert after == before, (
+        f"atom-store immutability rule violated: before={before!r} after={after!r}"
+    )
+
+
+def test_build_server_wraps_structured_and_string_results(monkeypatch, ctx):  # C3, C4
+    import anyio
+    from mcp.types import CallToolRequest, CallToolRequestParams
+
+    value = {
+        "schemaVersion": 1,
+        "query": "q",
+        "project": None,
+        "records": [],
+        "estimatedTokens": 0,
+        "lowConfidence": True,
+        "truncated": False,
+    }
+    structured = mcp_module.StructuredResult(
+        value=value,
+        text=json.dumps(value, sort_keys=True, separators=(",", ":")),
+    )
+
+    def fakeDispatch(_ctx, name, _args):
+        if name == "recall_records":
+            return structured, False
+        return "legacy string", False
+
+    monkeypatch.setattr(mcp_module, "dispatch", fakeDispatch)
+    server = buildServer(ctx)
+    handler = server.request_handlers[CallToolRequest]
+
+    async def call(name, arguments):
+        response = await handler(CallToolRequest(
+            params=CallToolRequestParams(name=name, arguments=arguments)))
+        return response.root
+
+    recordsResponse = anyio.run(call, "recall_records", {"query": "q"})
+    stringResponse = anyio.run(call, "recall", {"query": "q"})
+
+    assert recordsResponse.isError is False, (
+        f"structured-server success rule violated: response={recordsResponse!r}"
+    )
+    assert recordsResponse.structuredContent == value, (
+        f"structured-server envelope rule violated: response={recordsResponse!r}"
+    )
+    assert recordsResponse.content[0].text == structured.text, (
+        f"structured-server fallback rule violated: response={recordsResponse!r}"
+    )
+    assert stringResponse.isError is False and stringResponse.content[0].text == "legacy string", (
+        f"string-server compatibility rule violated: response={stringResponse!r}"
+    )
+    assert stringResponse.structuredContent is None, (
+        f"string-server unstructured rule violated: response={stringResponse!r}"
+    )

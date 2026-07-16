@@ -13,10 +13,11 @@ Two audiences share one server:
   drift here reads as a broken agent. The DATA is served from the v3 engine and
   written to the v3 store; only the envelope is legacy.
 
-- **Natives** (``recall``, ``history``, ``correct``, ``pin``). These expose the v3
-  capabilities the legacy names cannot: the rich tiered ``recall`` payload, a
-  ``history`` view (Tier-2 neighborhood + supersession chain), a one-flow
-  ``correct`` (put + supersede, the trust layer's decades rule), and ``pin``.
+- **Natives** (``recall``, ``history``, ``correct``, ``pin``, ``recall_records``).
+  These expose the v3 capabilities the legacy names cannot: the rich tiered
+  ``recall`` payload, a ``history`` view (Tier-2 neighborhood + supersession
+  chain), a one-flow ``correct`` (put + supersede, the trust layer's decades
+  rule), ``pin``, and bounded machine-readable records.
 
 Design rules fixed by the task brief:
 
@@ -30,21 +31,22 @@ Design rules fixed by the task brief:
 - Emits write to the v3 store ONLY here; the double-write tee to the old store is
   Task 13's job, not this one.
 
-The tool handlers are plain ``(ctx, args) -> str`` functions dispatched by
-:func:`dispatch`, which is exactly the path the server's ``call_tool`` takes --
-so the handlers are testable directly against a real store + real models without
-spawning the daemon.
+Handlers return a string or ``StructuredResult`` through :func:`dispatch`, which
+is exactly the path the server's ``call_tool`` takes. Tests can exercise the same
+boundary directly against a real store and models without spawning the daemon.
 """
+from dataclasses import dataclass
 import json
 import uuid
 
+from jsonschema import Draft202012Validator
 from mcp.server import Server
 from mcp.types import CallToolResult, TextContent, Tool
 
 from recall.engine import recall
 from recall.embedder import embedMissing
 from recall.vector_index import buildClassIndexes
-from recall.payload import assembleTier2
+from recall.payload import assembleTier2, estimateTokens
 from serve import viz
 from store.store import (
     putAtom,
@@ -63,6 +65,7 @@ __all__ = [
     "NATIVE_TOOLS",
     "TOOLS",
     "HANDLERS",
+    "StructuredResult",
     "dispatch",
     "buildServer",
 ]
@@ -83,6 +86,133 @@ _HANDLE = "p3://"
 # keep each "- [NN%] (proj) ..." line readable. Structural shape, not content, is
 # what the shadow diff pins.
 _LISTING_GIST_CHARS = 300
+
+_MAX_JSON_INTEGER = 9_007_199_254_740_991
+_RECALL_KINDS = ["atom", "narrative", "snapshot", "document_chunk"]
+
+_NULLABLE_ID_SCHEMA = {
+    "type": ["string", "null"],
+    "minLength": 1,
+    "maxLength": 256,
+}
+_NULLABLE_TEXT_SCHEMA = {
+    "type": ["string", "null"],
+    "maxLength": 2048,
+}
+
+RECALL_RECORDS_INPUT_SCHEMA = {
+    "type": "object",
+    "additionalProperties": False,
+    "properties": {
+        "query": {
+            "type": "string", "minLength": 1, "maxLength": 8192,
+            "pattern": r".*\S.*",
+        },
+        "project": {
+            "type": ["string", "null"], "minLength": 1, "maxLength": 256,
+            "pattern": r".*\S.*",
+        },
+        "timeScope": {
+            "type": ["array", "null"],
+            "items": {
+                "type": "integer", "minimum": 0, "maximum": _MAX_JSON_INTEGER,
+            },
+            "minItems": 2,
+            "maxItems": 2,
+        },
+        "kinds": {
+            "type": ["array", "null"],
+            "items": {"type": "string", "enum": _RECALL_KINDS},
+            "minItems": 1,
+            "maxItems": len(_RECALL_KINDS),
+            "uniqueItems": True,
+        },
+        "k": {"type": "integer", "minimum": 1, "maximum": 32, "default": 10},
+        "tokenBudget": {
+            "type": "integer", "minimum": 1, "maximum": 8000, "default": 1500,
+        },
+    },
+    "required": ["query"],
+}
+
+_PROVENANCE_OUTPUT_SCHEMA = {
+    "type": "object",
+    "additionalProperties": False,
+    "properties": {
+        "id": {"type": "string", "minLength": 1, "maxLength": 256},
+        "atomId": {"type": "string", "minLength": 1, "maxLength": 256},
+        "source": {"type": "string", "minLength": 1, "maxLength": 256},
+        "sessionId": _NULLABLE_TEXT_SCHEMA,
+        "agent": _NULLABLE_TEXT_SCHEMA,
+        "sourceRef": _NULLABLE_TEXT_SCHEMA,
+        "recordedAt": {
+            "type": "integer", "minimum": 0, "maximum": _MAX_JSON_INTEGER,
+        },
+    },
+    "required": [
+        "id", "atomId", "source", "sessionId", "agent", "sourceRef", "recordedAt",
+    ],
+}
+
+_RECORD_OUTPUT_SCHEMA = {
+    "type": "object",
+    "additionalProperties": False,
+    "properties": {
+        "id": {"type": "string", "minLength": 1, "maxLength": 256},
+        "kind": {"type": "string", "enum": _RECALL_KINDS},
+        "project": {
+            "type": ["string", "null"], "minLength": 1, "maxLength": 256,
+        },
+        "content": {"type": "string", "maxLength": 24_000},
+        "createdAt": {
+            "type": "integer", "minimum": 0, "maximum": _MAX_JSON_INTEGER,
+        },
+        "occurredAt": {
+            "type": ["integer", "null"], "minimum": 0,
+            "maximum": _MAX_JSON_INTEGER,
+        },
+        "importance": {"type": "number"},
+        "status": {"type": "string", "enum": ["live", "superseded"]},
+        "atomSchemaVersion": {
+            "type": "integer", "minimum": 1, "maximum": _MAX_JSON_INTEGER,
+        },
+        "provenance": {
+            "type": "array", "items": _PROVENANCE_OUTPUT_SCHEMA,
+            "minItems": 1,
+            "maxItems": 64,
+        },
+        "score": {"type": "number"},
+        "confidence": {"type": "number", "minimum": 0.0, "maximum": 1.0},
+        "shouldTrust": {"type": "boolean"},
+        "why": {"type": "string", "minLength": 1, "maxLength": 2048},
+        "supersededBy": _NULLABLE_ID_SCHEMA,
+        "estimatedTokens": {"type": "integer", "minimum": 0, "maximum": 8000},
+    },
+    "required": [
+        "id", "kind", "project", "content", "createdAt", "occurredAt",
+        "importance", "status", "atomSchemaVersion", "provenance", "score",
+        "confidence", "shouldTrust", "why", "supersededBy", "estimatedTokens",
+    ],
+}
+
+RECALL_RECORDS_OUTPUT_SCHEMA = {
+    "type": "object",
+    "additionalProperties": False,
+    "properties": {
+        "schemaVersion": {"type": "integer", "const": 1},
+        "query": {"type": "string", "minLength": 1, "maxLength": 8192},
+        "project": {"type": ["string", "null"], "minLength": 1, "maxLength": 256},
+        "records": {"type": "array", "items": _RECORD_OUTPUT_SCHEMA, "maxItems": 32},
+        "estimatedTokens": {"type": "integer", "minimum": 0, "maximum": 8000},
+        "lowConfidence": {"type": "boolean"},
+        "truncated": {"type": "boolean"},
+    },
+    "required": [
+        "schemaVersion", "query", "project", "records", "estimatedTokens",
+        "lowConfidence", "truncated",
+    ],
+}
+_RECALL_RECORDS_OUTPUT_VALIDATOR = Draft202012Validator(RECALL_RECORDS_OUTPUT_SCHEMA)
 
 
 # --------------------------------------------------------------------------- #
@@ -141,6 +271,102 @@ def _require(args, names):
         value = args.get(name)
         if value is None or (isinstance(value, str) and not value.strip()):
             raise ValueError(f"missing required field: {name}")
+
+
+def _boundedText(value, name, minimum, maximum):
+    if not isinstance(value, str):
+        raise ValueError(f"recall_records: {name} must be a string")
+    if not value.strip():
+        raise ValueError(f"recall_records: {name} must not be blank")
+    if not minimum <= len(value) <= maximum:
+        raise ValueError(
+            f"recall_records: {name} length must be in {minimum}..{maximum}"
+        )
+    return value
+
+
+def _boundedJSONInt(value, name, minimum, maximum):
+    if type(value) is not int:
+        raise ValueError(f"recall_records: {name} must be an integer")
+    if not minimum <= value <= maximum:
+        raise ValueError(
+            f"recall_records: {name} must be in {minimum}..{maximum}"
+        )
+    return value
+
+
+def _timeScope(value):
+    if value is None:
+        return None
+    if not isinstance(value, list) or len(value) != 2:
+        raise ValueError("recall_records: timeScope must be [start, end]")
+    start = _boundedJSONInt(value[0], "timeScope start", 0, _MAX_JSON_INTEGER)
+    end = _boundedJSONInt(value[1], "timeScope end", 0, _MAX_JSON_INTEGER)
+    if start > end:
+        raise ValueError("recall_records: timeScope start must be <= end")
+    return start, end
+
+
+def _recallKinds(value):
+    if value is None:
+        return None
+    if not isinstance(value, list) or not value:
+        raise ValueError("recall_records: kinds must be a non-empty array")
+    if any(not isinstance(kind, str) for kind in value):
+        raise ValueError("recall_records: kinds entries must be strings")
+    if len(value) != len(set(value)):
+        raise ValueError("recall_records: kinds must not contain duplicates")
+    unknown = sorted(set(value) - set(_RECALL_KINDS))
+    if unknown:
+        raise ValueError(f"recall_records: kinds contains unknown values: {unknown}")
+    return tuple(value)
+
+
+def _recallRecordsArgs(args):
+    allowed = {"query", "project", "timeScope", "kinds", "k", "tokenBudget"}
+    unknown = sorted(set(args) - allowed)
+    if unknown:
+        raise ValueError(f"recall_records: unknown fields: {unknown}")
+    query = _boundedText(args.get("query"), "query", 1, 8192)
+    project = args.get("project")
+    if project is not None:
+        project = _boundedText(project, "project", 1, 256)
+    timeScope = _timeScope(args.get("timeScope"))
+    kinds = _recallKinds(args.get("kinds"))
+    k = _boundedJSONInt(args.get("k", 10), "k", 1, 32)
+    tokenBudget = _boundedJSONInt(
+        args.get("tokenBudget", 1500), "tokenBudget", 1, 8000
+    )
+    return query, project, timeScope, kinds, k, tokenBudget
+
+
+@dataclass(frozen=True)
+class StructuredResult:
+    value: dict
+    text: str
+
+
+def _structuredResult(value):
+    errors = sorted(
+        _RECALL_RECORDS_OUTPUT_VALIDATOR.iter_errors(value),
+        key=lambda error: tuple(str(part) for part in error.absolute_path),
+    )
+    if errors:
+        error = errors[0]
+        path = ".".join(str(part) for part in error.absolute_path) or "<root>"
+        raise ValueError(
+            f"recall_records: structured output violates schema at {path}: {error.message}"
+        )
+    return StructuredResult(
+        value=value,
+        text=json.dumps(
+            value,
+            ensure_ascii=False,
+            allow_nan=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ),
+    )
 
 
 def _gistLine(text):
@@ -204,9 +430,10 @@ def _returnedAtomIds(out):
     return [r["atomId"] for r in out["results"]]
 
 
-def _logReturnedRecall(ctx, out, query, sourceRef):
+def _logReturnedRecall(ctx, out, query, sourceRef, atomIds=None):
     try:
-        atomIds = _returnedAtomIds(out)
+        if atomIds is None:
+            atomIds = _returnedAtomIds(out)
         logRecall(ctx.store, atomIds, query=query, sourceRef=sourceRef)
         viz.emitRecallEvent(ctx, query, atomIds, sourceRef)
     except Exception:  # noqa: BLE001 -- recall serving wins over telemetry
@@ -385,6 +612,78 @@ def handle_recall(ctx, args):
     response = out["payload"]
     _logReturnedRecall(ctx, out, query, "mcp.recall")
     return response
+
+
+def handle_recall_records(ctx, args):
+    query, project, timeScope, kinds, k, tokenBudget = _recallRecordsArgs(args)
+    out = recall(
+        ctx.store,
+        ctx.indexes,
+        ctx.embedder,
+        query,
+        project=project,
+        timeScope=timeScope,
+        kinds=kinds,
+        k=k,
+        tokenBudget=tokenBudget,
+    )
+    ranked = out["results"]
+    if len(ranked) > k:
+        raise ValueError(
+            f"recall_records: engine returned {len(ranked)} results for k={k}"
+        )
+
+    records = []
+    tokens = 0
+    truncated = False
+    for result in ranked:
+        atom = getAtom(ctx.store, result["atomId"])
+        if atom is None:
+            raise ValueError(
+                f"recall_records: atom {result['atomId']!r} absent from the store"
+            )
+        if len(atom["provenance"]) > 64:
+            raise ValueError(
+                f"recall_records: atom {atom['id']!r} has more than 64 provenance rows"
+            )
+        recordTokens = estimateTokens(atom["text"])
+        if tokens + recordTokens > tokenBudget:
+            truncated = True
+            break
+        records.append({
+            "id": atom["id"],
+            "kind": atom["kind"],
+            "project": atom["project"],
+            "content": atom["text"],
+            "createdAt": atom["createdAt"],
+            "occurredAt": atom["occurredAt"],
+            "importance": atom["importance"],
+            "status": atom["status"],
+            "atomSchemaVersion": atom["schemaVersion"],
+            "provenance": atom["provenance"],
+            "score": result["score"],
+            "confidence": result["confidence"],
+            "shouldTrust": result["shouldTrust"],
+            "why": result["why"],
+            "supersededBy": result.get("supersededBy"),
+            "estimatedTokens": recordTokens,
+        })
+        tokens += recordTokens
+
+    structured = _structuredResult({
+        "schemaVersion": 1,
+        "query": query,
+        "project": project,
+        "records": records,
+        "estimatedTokens": tokens,
+        "lowConfidence": out["lowConfidence"],
+        "truncated": truncated,
+    })
+    _logReturnedRecall(
+        ctx, out, query, "mcp.recall_records",
+        atomIds=[record["id"] for record in records],
+    )
+    return structured
 
 
 def _supersessionChain(store, atomId):
@@ -667,6 +966,12 @@ NATIVE_TOOLS = [
             "required": ["atomId"],
         },
     ),
+    Tool(
+        name="recall_records",
+        description="Versioned structured recall records for kernel-owned memory adapters.",
+        inputSchema=RECALL_RECORDS_INPUT_SCHEMA,
+        outputSchema=RECALL_RECORDS_OUTPUT_SCHEMA,
+    ),
 ]
 
 TOOLS = COMPAT_TOOLS + NATIVE_TOOLS
@@ -682,6 +987,7 @@ HANDLERS = {
     "pensive_analytics": handle_pensive_analytics,
     # natives
     "recall": handle_recall,
+    "recall_records": handle_recall_records,
     "history": handle_history,
     "correct": handle_correct,
     "pin": handle_pin,
@@ -694,7 +1000,7 @@ HANDLERS = {
 
 
 def dispatch(ctx, name, args):
-    """Run one tool and return ``(text, isError)`` -- the server's inner path.
+    """Run one tool and return ``(result, isError)`` -- the server's inner path.
 
     This is the single place a handler exception is turned into an error
     response, so the daemon NEVER dies on a tool error: an unknown tool, a bad
@@ -730,9 +1036,15 @@ def buildServer(ctx):
 
     @server.call_tool()
     async def call_tool(name, arguments):
-        text, isError = dispatch(ctx, name, arguments or {})
+        result, isError = dispatch(ctx, name, arguments or {})
+        if isinstance(result, StructuredResult):
+            return CallToolResult(
+                content=[TextContent(type="text", text=result.text)],
+                structuredContent=result.value,
+                isError=isError,
+            )
         return CallToolResult(
-            content=[TextContent(type="text", text=text)],
+            content=[TextContent(type="text", text=result)],
             isError=isError,
         )
 

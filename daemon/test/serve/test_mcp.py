@@ -28,6 +28,7 @@ tests need no model. The tool handlers are exercised through ``dispatch`` -- the
 exact path the server's ``call_tool`` takes -- so the "never dies on a tool
 error" contract is tested without spawning the daemon for every case.
 """
+import json
 import os
 import re
 import signal
@@ -208,11 +209,22 @@ def test_compat_tool_schemas_are_verbatim():
 
 def test_native_tools_present_with_required_fields():
     names = {t.name for t in NATIVE_TOOLS}
-    assert names == {"recall", "history", "correct", "pin"}
-    assert _tool(NATIVE_TOOLS, "recall").inputSchema["required"] == ["query"]
-    assert _tool(NATIVE_TOOLS, "history").inputSchema["required"] == ["atomId"]
-    assert _tool(NATIVE_TOOLS, "correct").inputSchema["required"] == ["oldAtomId", "newText"]
-    assert _tool(NATIVE_TOOLS, "pin").inputSchema["required"] == ["atomId"]
+    assert names == {"recall", "history", "correct", "pin", "recall_records"}, (
+        f"native-tool set rule violated: names={sorted(names)!r}"
+    )
+    expectedRequired = {
+        "recall": ["query"],
+        "recall_records": ["query"],
+        "history": ["atomId"],
+        "correct": ["oldAtomId", "newText"],
+        "pin": ["atomId"],
+    }
+    for name, required in expectedRequired.items():
+        actual = _tool(NATIVE_TOOLS, name).inputSchema["required"]
+        assert actual == required, (
+            f"native-required-fields rule violated: tool={name!r} "
+            f"actual={actual!r} expected={required!r}"
+        )
 
 
 def test_tools_is_compat_plus_natives_no_overlap():
@@ -616,7 +628,7 @@ def _free_port():
 
 
 @pytest.mark.filterwarnings("ignore::DeprecationWarning")
-def test_smoke_daemon_serves_over_transport_and_stops_on_sigint(tmp_path):
+def test_structured_recall_round_trips_over_temporary_http_transport(tmp_path):
     # Seed a tiny store the daemon will serve.
     dbPath = tmp_path / "smoke.db"
     seed = openStore(dbPath)
@@ -635,39 +647,68 @@ def test_smoke_daemon_serves_over_transport_and_stops_on_sigint(tmp_path):
     env["HIP_VISIBLE_DEVICES"] = ""
     env["CUDA_VISIBLE_DEVICES"] = ""
 
-    proc = subprocess.Popen(
-        [sys.executable, "-m", "serve.daemon"],
-        cwd=srcRoot, env=env,
-        stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-    )
-    try:
-        _wait_for_port("127.0.0.1", port, proc, timeout=240)
-        result = _run_smoke_client(port)
-    finally:
-        rc = _shutdown(proc)
+    logPath = tmp_path / "daemon.log"
+    with logPath.open("w+b") as daemonLog:
+        proc = subprocess.Popen(
+            [sys.executable, "-m", "serve.daemon"],
+            cwd=srcRoot, env=env,
+            stdout=daemonLog, stderr=subprocess.STDOUT,
+        )
+        try:
+            _wait_for_port("127.0.0.1", port, proc, daemonLog, timeout=240)
+            result = _run_smoke_client(port)
+        finally:
+            rc = _shutdown(proc)
 
-    recall_text, emit_text = result
-    assert recall_text.startswith("Found ") or recall_text == SENTINEL_LOW_CONFIDENCE
+    (recall_text, emit_text, records_text, records_value, recall_structured,
+     bad_bool_error, bad_unknown_error) = result
+    assert recall_text.startswith("Found ") or recall_text == SENTINEL_LOW_CONFIDENCE, (
+        f"legacy-recall transport rule violated: text={recall_text!r}"
+    )
     assert re.search(
         r"atom \[succeeded\] emitted \(emission_id: " + _UUID_RE + r"\).*\(ok\)",
         emit_text,
+    ), f"legacy-emit transport rule violated: text={emit_text!r}"
+    assert recall_structured is None, (
+        f"existing-string transport rule violated: structuredContent={recall_structured!r}"
+    )
+    assert records_value["schemaVersion"] == 1, (
+        f"structured-version transport rule violated: value={records_value!r}"
+    )
+    assert json.loads(records_text) == records_value, (
+        f"structured-fallback transport rule violated: text={records_text!r} "
+        f"value={records_value!r}"
+    )
+    assert bad_bool_error is True and bad_unknown_error is True, (
+        f"transport-input validation rule violated: boolError={bad_bool_error} "
+        f"unknownError={bad_unknown_error}"
     )
     # Clean SIGINT shutdown: the process exited on the interrupt, not a kill.
-    assert rc == 0
+    assert rc == 0, f"clean-SIGINT transport rule violated: returnCode={rc}"
 
 
-def _wait_for_port(host, port, proc, timeout):
+def _subprocess_output(logFile):
+    offset = logFile.tell()
+    logFile.seek(0)
+    output = logFile.read().decode(errors="replace")
+    logFile.seek(offset)
+    return output
+
+
+def _wait_for_port(host, port, proc, logFile, timeout):
     deadline = time.time() + timeout
     while time.time() < deadline:
         if proc.poll() is not None:
-            out = proc.stdout.read().decode(errors="replace") if proc.stdout else ""
+            out = _subprocess_output(logFile)
             raise AssertionError(f"daemon exited early (rc={proc.returncode}):\n{out}")
         try:
             with socket.create_connection((host, port), timeout=1):
                 return
         except OSError:
             time.sleep(0.5)
-    raise AssertionError("daemon did not bind the port in time")
+    raise AssertionError(
+        f"daemon did not bind the port in time; output:\n{_subprocess_output(logFile)}"
+    )
 
 
 def _run_smoke_client(port):
@@ -681,7 +722,9 @@ def _run_smoke_client(port):
             async with ClientSession(read, write) as session:
                 await session.initialize()
                 tools = {t.name for t in (await session.list_tools()).tools}
-                assert "pensive_recall" in tools and "recall" in tools
+                assert {"pensive_recall", "recall", "recall_records"} <= tools, (
+                    f"transport-tool-registration rule violated: tools={sorted(tools)!r}"
+                )
                 r = await session.call_tool(
                     "pensive_recall", {"query": "acoustic modem range data rate"})
                 e = await session.call_tool("engram_emit_atom", {
@@ -689,7 +732,22 @@ def _run_smoke_client(port):
                     "outcome": "succeeded", "reason": "it served",
                     "principle": "the transport round-trips end to end",
                 })
-                return r.content[0].text, e.content[0].text
+                badBool = await session.call_tool(
+                    "recall_records", {"query": "q", "k": True})
+                badUnknown = await session.call_tool(
+                    "recall_records", {"query": "q", "surprise": 1})
+                records = await session.call_tool("recall_records", {
+                    "query": "acoustic modem range data rate", "tokenBudget": 8000,
+                })
+                return (
+                    r.content[0].text,
+                    e.content[0].text,
+                    records.content[0].text,
+                    records.structuredContent,
+                    r.structuredContent,
+                    badBool.isError,
+                    badUnknown.isError,
+                )
 
     return anyio.run(go)
 
