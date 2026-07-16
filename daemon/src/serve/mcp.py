@@ -1077,9 +1077,10 @@ def buildServer(ctx):
     """Build the low-level MCP ``Server`` bound to ``ctx``.
 
     Uses the low-level API (not FastMCP) so the compat tools' ``inputSchema`` is
-    the verbatim legacy dict, not one derived from a Python signature. ``call_tool``
-    routes through :func:`dispatch`, so it can never raise -- the returned
-    ``CallToolResult`` carries ``isError`` and the daemon keeps serving.
+    the verbatim legacy dict, not one derived from a Python signature. Ordinary
+    tool failures route through :func:`dispatch`; an impossible
+    ``recall_records`` wire-cap configuration raises into MCP's bounded error
+    response. In either case, the daemon keeps serving.
     """
     server = Server(SERVER_NAME)
 
