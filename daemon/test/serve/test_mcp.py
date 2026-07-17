@@ -385,6 +385,83 @@ def test_emit_snapshot_writes_snapshot_kind_and_legacy_result(ctx):
     assert kinds == ["snapshot"]
 
 
+# --------------------------------------------------------------------------- #
+# Kind-scoped reindex: a write rebuilds its own class's index and no other       #
+# --------------------------------------------------------------------------- #
+
+
+@pytest.mark.parametrize("tool,args", [
+    ("engram_emit_atom", {
+        "project": "pensive", "shape": "reindex hot loop",
+        "approach": "scope the rebuild", "outcome": "succeeded",
+        "reason": "emits never write code atoms",
+        "principle": "rebuild only the class the write touched",
+    }),
+    ("engram_emit_narrative", {
+        "project": "pensive",
+        "narrative": "the per-emit full rebuild was the whole disease",
+    }),
+    ("engram_emit_snapshot", {
+        "project": "pensive",
+        "hypothesis": "the burn is the code-class HNSW rebuild, not the embed",
+    }),
+])
+def test_emit_rebuilds_memory_index_but_not_code_index(ctx, tool, args):
+    # Every emit writes a memory-class atom (atom/narrative/snapshot); the code
+    # class (the bulk document_chunk corpus, past the HNSW threshold in
+    # production) has no in-daemon write path besides `correct`. Rebuilding its
+    # index per emit is therefore pure waste at full-graph-build cost, so an
+    # emit must rebuild ONLY the memory-class index.
+    _put(ctx.store, "def spread(): return activation", kind="document_chunk")
+    ctx.reindex()
+    codeBefore = ctx.indexes["code"]
+    memoryBefore = ctx.indexes["memory"]
+
+    _, isError = dispatch(ctx, tool, args)
+
+    assert isError is False
+    assert ctx.indexes["code"] is codeBefore
+    assert ctx.indexes["memory"] is not memoryBefore
+
+
+def test_correct_rebuilds_only_the_corrected_atoms_class(ctx):
+    # `correct` inherits the old atom's kind, so it is the one mutating tool
+    # that can touch either class: a memory correction must leave the code
+    # index alone, and a code correction must rebuild it (the superseded chunk
+    # has to drop out of the dense index).
+    chunk = _put(ctx.store, "class HnswIndex: ...", kind="document_chunk")
+    note = _put(ctx.store, "the chassis fans are slaved to the GPU sensor")
+    ctx.reindex()
+
+    codeBefore = ctx.indexes["code"]
+    _, err = dispatch(ctx, "correct", {
+        "oldAtomId": note,
+        "newText": "the chassis fans follow the GPU temp sensor, not the CPU",
+    })
+    assert err is False
+    assert ctx.indexes["code"] is codeBefore
+
+    memoryBefore = ctx.indexes["memory"]
+    _, err = dispatch(ctx, "correct", {
+        "oldAtomId": chunk,
+        "newText": "class HnswIndex: pass",
+    })
+    assert err is False
+    assert ctx.indexes["code"] is not codeBefore
+    assert ctx.indexes["memory"] is memoryBefore
+
+
+def test_reindex_default_still_rebuilds_every_class(ctx):
+    # Pins the kinds=None path (construction and any caller that cannot name
+    # what changed): every class rebuilds, same as the original contract.
+    _put(ctx.store, "a bulk chunk", kind="document_chunk")
+    _put(ctx.store, "a reasoning note")
+    before = dict(ctx.indexes)
+    ctx.reindex()
+    assert ctx.indexes["code"] is not before["code"]
+    assert ctx.indexes["memory"] is not before["memory"]
+
+
 def test_emitted_atom_is_recallable_after_emit(ctx, _rerankerWarm):
     # The living-memory contract: emit then recall must see it (the emit reindexes
     # so both the lexical and dense signals cover the new atom).

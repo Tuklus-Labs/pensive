@@ -45,7 +45,8 @@ from mcp.types import CallToolResult, TextContent, Tool
 
 from recall.engine import recall
 from recall.embedder import embedMissing
-from recall.vector_index import buildClassIndexes
+from recall.strata import KIND_CLASSES
+from recall.vector_index import buildClassIndexes, selectIndex
 from recall.payload import assembleTier2, estimateTokens
 from serve import viz
 from store.store import (
@@ -237,12 +238,13 @@ class ServeContext:
     memory and code atoms are searched from separate pools instead of one mixed
     index. ``agent`` is stamped into emit provenance when the caller is known.
 
-    ``reindex`` embeds any not-yet-embedded live atoms and rebuilds the per-class
+    ``reindex`` embeds any not-yet-embedded live atoms and rebuilds per-class
     indexes, so an atom written by an emit/correct becomes recallable by BOTH the
-    lexical (query-time) and dense (index) signals on the next call. It runs at
-    construction and after every mutating tool. A full rebuild per emit is the
-    known cost an incremental index would later retire; for the shadow daemon it is
-    correct and cheap enough.
+    lexical (query-time) and dense (index) signals on the next call. Construction
+    rebuilds every class; mutating tools pass the kind they wrote so only the
+    touched class rebuilds. The scoping is load-bearing at scale: the bulk code
+    class sits past the HNSW threshold, and a full graph build there is a
+    multi-core, event-loop-blocking cost no memory-class emit ever needed to pay.
     """
 
     def __init__(self, store, embedder, modelId, agent=None,
@@ -257,10 +259,25 @@ class ServeContext:
         self.recallLogErrors = 0
         self.reindex()
 
-    def reindex(self):
-        """Embed missing live atoms and rebuild the per-class dense indexes."""
+    def reindex(self, kinds=None):
+        """Embed missing live atoms and rebuild dense indexes.
+
+        ``kinds=None`` rebuilds every class -- construction, and any caller that
+        cannot name what changed. A tuple of written kinds rebuilds only the
+        classes covering them, each over its FULL kind tuple (an index always
+        spans its whole class; the written kinds just select WHICH classes are
+        stale). A kind belonging to no class rebuilds nothing: it was never in
+        a per-class dense index to begin with.
+        """
         embedMissing(self.store, self.embedder)
-        self.indexes = buildClassIndexes(self.store, self.modelId)
+        if kinds is None:
+            self.indexes = buildClassIndexes(self.store, self.modelId)
+            return
+        wanted = set(kinds)
+        for name, classKinds in KIND_CLASSES:
+            if wanted.intersection(classKinds):
+                self.indexes[name] = selectIndex(self.store, self.modelId,
+                                                 classKinds)
 
 
 # --------------------------------------------------------------------------- #
@@ -488,7 +505,7 @@ def handle_emit_atom(ctx, args):
     })
     for tag in dict.fromkeys(_splitCsv(args.get("tags", ""))):
         addFacet(ctx.store, atomId, "tag", tag)
-    ctx.reindex()
+    ctx.reindex(kinds=("atom",))
     emissionId = _emissionId()
     return (f"atom [{outcome}] emitted (emission_id: {emissionId}): "
             f"{principle[:80]} (ok)")
@@ -531,7 +548,7 @@ def handle_emit_narrative(ctx, args):
         "importance": 0.0,
         "provenance": _emitProvenance(ctx),
     })
-    ctx.reindex()
+    ctx.reindex(kinds=("narrative",))
     return f"Narrative fragment emitted (emission_id: {_emissionId()})"
 
 
@@ -552,7 +569,7 @@ def handle_emit_snapshot(ctx, args):
         "importance": 0.0,
         "provenance": _emitProvenance(ctx),
     })
-    ctx.reindex()
+    ctx.reindex(kinds=("snapshot",))
     return f"snapshot emitted: {hypothesis[:80]} (ok)"
 
 
@@ -840,7 +857,7 @@ def handle_correct(ctx, args):
         "provenance": provenance,
     })
     supersede(ctx.store, oldId, newId, provenance)
-    ctx.reindex()
+    ctx.reindex(kinds=(old["kind"],))
     return f"corrected {_HANDLE}{oldId} -> {_HANDLE}{newId} (ok)"
 
 
