@@ -160,6 +160,7 @@ def runShadow(ctx, counters, rawBody, logPath):
         out = recall(
             ctx.store, ctx.indexes, ctx.embedder, query,
             project=project, k=ctx.defaultK, tokenBudget=ctx.defaultTokenBudget,
+            aux=ctx.aux,
         )
         latencyMs = (time.perf_counter() - t0) * 1000.0
         record = buildShadowRecord(query, oldResultText, out, latencyMs, project=project)

@@ -56,6 +56,7 @@ def ctx(store):
         defaultK=10,
         defaultTokenBudget=1500,
         recallLogErrors=0,
+        aux=None,
     )
 
 
@@ -357,6 +358,7 @@ def test_recall_records_calls_engine_once_with_normalized_arguments(monkeypatch,
         "kinds": ("atom", "document_chunk"),
         "k": 32,
         "tokenBudget": 8000,
+        "aux": ctx.aux,
     }, f"engine-keyword contract violated: keywords={keywords!r}"
 
 
@@ -400,6 +402,7 @@ def test_recall_records_accepts_inclusive_argument_endpoints(monkeypatch, ctx): 
         "kinds": None,
         "k": 10,
         "tokenBudget": 1500,
+        "aux": ctx.aux,
     }, f"default-argument rule violated: keywords={calls[3][1]!r}"
 
 

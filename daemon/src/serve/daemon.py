@@ -22,6 +22,11 @@ Configuration (all env, documented so nothing is a mystery):
 - ``PENSIVE_V3_MODEL``  -- embedding model id. Default ``BAAI/bge-small-en-v1.5``.
 - ``PENSIVE_V3_AGENT``  -- agent name stamped into emit provenance. Default unset
   (NULL agent).
+- ``PENSIVE_V3_OPENAI_MODEL`` -- aux dense model id (e.g.
+  ``text-embedding-3-large``). Default unset = feature off, recall byte-identical
+  to the two-signal engine. When set, its backfilled vectors (see
+  ``~/Projects/pensive-embeddings/``) fuse as a third recall signal over the
+  memory class; a missing key/SDK logs and disables rather than failing startup.
 
 Shutdown: uvicorn installs SIGINT/SIGTERM handlers and drains cleanly, so a
 SIGINT stops the daemon with exit 0 (the house "SIGINT first" rule).
@@ -84,8 +89,22 @@ def buildContext():
 
     _getReranker()
 
+    # Aux dense signal (optional): construction failure means feature-off, never
+    # a dead daemon -- recall must come up on base signals no matter what.
+    aux = None
+    openaiModel = os.environ.get("PENSIVE_V3_OPENAI_MODEL")
+    if openaiModel:
+        try:
+            from recall.aux_dense import AuxDense, OpenAIEmbedder
+
+            aux = AuxDense(OpenAIEmbedder(openaiModel))
+            _log(f"aux dense signal enabled: {openaiModel}")
+        except Exception as exc:
+            _log(f"aux dense signal DISABLED ({exc}); serving base signals only")
+            aux = None
+
     _log("embedding backlog + building dense index")
-    ctx = ServeContext(store, embedder, modelId, agent=agent)
+    ctx = ServeContext(store, embedder, modelId, agent=agent, aux=aux)
     _log("context ready")
     return ctx
 

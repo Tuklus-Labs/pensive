@@ -36,6 +36,7 @@ below is one of those intentional internal reads.
 The public shape is the ``RecallResult`` dict Tasks 11 (eval) and 12 (MCP) build
 on: ``{results, payload, tokensUsed, lowConfidence}``.
 """
+import sys
 import time
 
 from recall.strata import classesForKinds, interleave, splitByClass
@@ -64,9 +65,39 @@ RERANK_HEAD = 64
 # signals-module default; named here so the orchestrator states its own contract.
 _SIGNAL_K = 200
 
+# Aux-signal failure counter for log throttling (powers of two), module-level so
+# a dead API logs a handful of lines across thousands of recalls, not thousands.
+_auxFailures = 0
+
+
+def _auxHits(aux, query, k):
+    """Embed the query on the aux model and search its class indexes.
+
+    Any failure returns ``[]``: the aux signal is optional evidence and recall
+    must never fail because a remote embedder did. Failures log to stderr,
+    throttled to power-of-two occurrences so a dead API cannot flood the journal.
+    """
+    global _auxFailures
+    try:
+        vecs = aux.embedder.embed([query])
+    except Exception as exc:
+        _auxFailures += 1
+        if _auxFailures & (_auxFailures - 1) == 0:
+            print(
+                f"[recall] aux dense signal failed ({_auxFailures}x): {exc}",
+                file=sys.stderr, flush=True,
+            )
+        return []
+    if not vecs:
+        return []
+    hits = []
+    for index in aux.indexes.values():
+        hits.extend(index.search(vecs[0], k))
+    return hits
+
 
 def recall(store, indexes, embedder, query, project=None, timeScope=None,
-           kinds=None, k=10, tokenBudget=1500, enrich=False):
+           kinds=None, k=10, tokenBudget=1500, enrich=False, aux=None):
     """Run the full recall pipeline and assemble a tiered payload.
 
     ``store`` is the canonical store, ``indexes`` a ``{className: VectorIndex}``
@@ -89,6 +120,11 @@ def recall(store, indexes, embedder, query, project=None, timeScope=None,
     - ``enrich``: attach serve-time enrichment lines (chunk file location and
       related memory) to document_chunk results. Off by default; the eval gate
       and legacy callers measure the bare pipeline.
+    - ``aux``: an optional ``recall.aux_dense.AuxDense`` (a second embedder plus
+      its own per-class indexes). When present its hits fuse as one more RRF
+      list and count as dense-family evidence (tagged both ``dense`` and
+      ``openai`` in signalHits). When None -- or when the aux embed fails at
+      query time -- the pipeline is byte-identical to the two-signal engine.
 
     Returns the ``RecallResult`` dict ``{results, payload, tokensUsed,
     lowConfidence}``.
@@ -134,13 +170,22 @@ def recall(store, indexes, embedder, query, project=None, timeScope=None,
         if classIndex is not None:
             dnHits.extend(dense(classIndex, embedder, query, _SIGNAL_K))
 
+    # Aux dense hits (optional third list). One aux embed per call, guarded:
+    # a query-time failure yields [] and the pipeline continues on base signals.
+    oaHits = _auxHits(aux, query, _SIGNAL_K) if aux is not None else []
+
     # signalHits: which of {bm25, dense, facet} hit each atom, drawn from the raw
     # top-200 lists and the boostSet. Trust reads this as explanation evidence.
+    # Aux hits tag BOTH "dense" (they are dense-cosine evidence, and trust's
+    # agreement math keys on the dense family) and "openai" (kept distinct for
+    # debugging and future trust tuning; trust ignores unknown names).
     signalHits = {}
     for atomId, _ in bmHits:
         signalHits.setdefault(atomId, set()).add("bm25")
     for atomId, _ in dnHits:
         signalHits.setdefault(atomId, set()).add("dense")
+    for atomId, _ in oaHits:
+        signalHits.setdefault(atomId, set()).update(("dense", "openai"))
     for atomId in boostSet:
         signalHits.setdefault(atomId, set()).add("facet")
 
@@ -148,9 +193,15 @@ def recall(store, indexes, embedder, query, project=None, timeScope=None,
     if filterSet is not None:
         bmHits = [pair for pair in bmHits if pair[0] in filterSet]
         dnHits = [pair for pair in dnHits if pair[0] in filterSet]
+        oaHits = [pair for pair in oaHits if pair[0] in filterSet]
 
     # 4. Reciprocal-rank fusion (rank-only; per-signal scores are not comparable).
-    fused = rrf([bmHits, dnHits])
+    #    The aux list rides along only when the feature is on, so aux=None keeps
+    #    fusion arithmetic byte-identical to the two-signal engine.
+    signalLists = [bmHits, dnHits]
+    if aux is not None:
+        signalLists.append(oaHits)
+    fused = rrf(signalLists)
 
     # 5. Post-fusion facet boost, applied before priors. applyPriors re-sorts, so
     #    the boosted scores feed the ranking that decides the rerank head.

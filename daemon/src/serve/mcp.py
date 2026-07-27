@@ -248,7 +248,7 @@ class ServeContext:
     """
 
     def __init__(self, store, embedder, modelId, agent=None,
-                 defaultK=10, defaultTokenBudget=1500):
+                 defaultK=10, defaultTokenBudget=1500, aux=None):
         self.store = store
         self.embedder = embedder
         self.modelId = modelId
@@ -256,6 +256,7 @@ class ServeContext:
         self.defaultK = defaultK
         self.defaultTokenBudget = defaultTokenBudget
         self.indexes = {}
+        self.aux = aux
         self.recallLogErrors = 0
         self.reindex()
 
@@ -267,9 +268,13 @@ class ServeContext:
         classes covering them, each over its FULL kind tuple (an index always
         spans its whole class; the written kinds just select WHICH classes are
         stale). A kind belonging to no class rebuilds nothing: it was never in
-        a per-class dense index to begin with.
+        a per-class dense index to begin with. The aux signal (when configured)
+        reindexes under the same scoping -- a cheap read of already-backfilled
+        vectors, never an embed call.
         """
         embedMissing(self.store, self.embedder)
+        if self.aux is not None:
+            self.aux.reindex(self.store, kinds)
         if kinds is None:
             self.indexes = buildClassIndexes(self.store, self.modelId)
             return
@@ -581,6 +586,7 @@ def handle_pensive_recall(ctx, args):
     out = recall(
         ctx.store, ctx.indexes, ctx.embedder, query,
         project=project, k=limit, tokenBudget=ctx.defaultTokenBudget,
+        aux=ctx.aux,
     )
     results = out["results"]
     if not results:
@@ -650,7 +656,7 @@ def handle_recall(ctx, args):
     out = recall(
         ctx.store, ctx.indexes, ctx.embedder, query,
         project=project, timeScope=timeScope, kinds=kinds,
-        k=k, tokenBudget=tokenBudget, enrich=True,
+        k=k, tokenBudget=tokenBudget, enrich=True, aux=ctx.aux,
     )
     response = out["payload"]
     _logReturnedRecall(ctx, out, query, "mcp.recall")
@@ -669,6 +675,7 @@ def handle_recall_records(ctx, args):
         kinds=kinds,
         k=k,
         tokenBudget=tokenBudget,
+        aux=ctx.aux,
     )
     ranked = out["results"]
     if len(ranked) > k:
