@@ -45,6 +45,7 @@ from serve.mcp import (
     TOOLS,
     COMPAT_TOOLS,
     NATIVE_TOOLS,
+    _NULLABLE_TEXT_SCHEMA,
     dispatch,
 )
 from recall.embedder import Embedder
@@ -197,12 +198,33 @@ _LEGACY_SCHEMAS = {
 }
 
 
+# The five emit tools carry one property the production server does not: an
+# optional `agent`, so several residents sharing this daemon accumulate distinct
+# histories. It is subtracted below rather than folded into _LEGACY_SCHEMAS,
+# which keeps the two facts separate: what production shipped, and what we added
+# on purpose. The pin therefore still fires on any OTHER drift, including a
+# second uninvited property.
+_AGENT_STAMPED_TOOLS = frozenset({
+    "engram_emit_atom",
+    "engram_emit_discovery",
+    "engram_emit_failure",
+    "engram_emit_narrative",
+    "engram_emit_snapshot",
+})
+
+
 def test_compat_tool_schemas_are_verbatim():
-    # Every legacy tool is present under its exact name with its exact inputSchema.
+    # Every legacy tool is present under its exact name with its exact inputSchema,
+    # modulo the one deliberate additive property above.
     # A drift here is a broken agent in shadow, so the whole dict is compared.
     for name, schema in _LEGACY_SCHEMAS.items():
-        tool = _tool(COMPAT_TOOLS, name)
-        assert tool.inputSchema == schema, f"{name} inputSchema drifted from legacy"
+        served = dict(_tool(COMPAT_TOOLS, name).inputSchema)
+        if name in _AGENT_STAMPED_TOOLS:
+            properties = dict(served["properties"])
+            assert properties.pop("agent", None) == _NULLABLE_TEXT_SCHEMA, (
+                f"{name}: agent must be the shared nullable-text schema")
+            served["properties"] = properties
+        assert served == schema, f"{name} inputSchema drifted from legacy"
     # COMPAT_TOOLS is EXACTLY the seven legacy tools, nothing more.
     assert {t.name for t in COMPAT_TOOLS} == set(_LEGACY_SCHEMAS)
 
@@ -383,6 +405,153 @@ def test_emit_snapshot_writes_snapshot_kind_and_legacy_result(ctx):
                     "not the trust layer (ok)")
     kinds = [r[0] for r in ctx.store._conn.execute("SELECT kind FROM atoms").fetchall()]
     assert kinds == ["snapshot"]
+
+
+# --------------------------------------------------------------------------- #
+# Per-caller stamping: several residents share one daemon                       #
+# --------------------------------------------------------------------------- #
+
+# PENSIVE_V3_AGENT is read once at daemon start and baked into ServeContext, so
+# one daemon can stamp exactly one name. The house runs six residents against
+# this daemon; without a per-call agent their atoms are indistinguishable from
+# each other and from Heph's. A caller-supplied `agent` therefore wins over the
+# daemon-wide default, mirroring what `correct` has always done with its
+# `provenance` argument.
+
+_MINIMAL_EMIT_ARGS = {
+    "engram_emit_atom": {
+        "project": "porchlight", "shape": "s", "approach": "a",
+        "outcome": "succeeded", "reason": "r", "principle": "p",
+    },
+    "engram_emit_discovery": {"project": "porchlight", "principle": "p"},
+    "engram_emit_failure": {"project": "porchlight", "principle": "p"},
+    "engram_emit_narrative": {"project": "porchlight", "narrative": "n"},
+    "engram_emit_snapshot": {"project": "porchlight", "hypothesis": "h"},
+}
+
+
+@pytest.fixture
+def makeCtx(tmp_path, embedder):
+    """Build a ServeContext with a chosen daemon-wide agent, over its own store.
+
+    Stamping is about several callers sharing ONE daemon, so these tests need
+    contexts that differ only in ``agent``; the module ``ctx`` fixture is pinned
+    to "heph" and its store is shared with the rest of the test.
+    """
+    opened = []
+
+    def _make(agent):
+        s = openStore(tmp_path / f"stamp-{len(opened)}.db")
+        opened.append(s)
+        return ServeContext(s, embedder, MODEL_ID, agent=agent)
+
+    try:
+        yield _make
+    finally:
+        for s in opened:
+            s.close()
+
+
+def _soleProvenance(ctx):
+    """Provenance of the one atom in this store; loud if there is not exactly one."""
+    rows = ctx.store._conn.execute("SELECT id FROM atoms").fetchall()
+    assert len(rows) == 1, f"expected exactly one atom, found {len(rows)}"
+    return getAtom(ctx.store, rows[0][0])["provenance"][0]
+
+
+def test_emit_atom_stamps_a_caller_supplied_agent(makeCtx):
+    """A caller-supplied agent wins over the daemon-wide default.
+
+    Several residents share one Pensive daemon, so a process-wide
+    PENSIVE_V3_AGENT can only ever stamp one of them. Without this the atoms of
+    six residents are indistinguishable from each other and from Heph's.
+    """
+    ctx = makeCtx(None)
+    text, isError = dispatch(ctx, "engram_emit_atom", {
+        **_MINIMAL_EMIT_ARGS["engram_emit_atom"],
+        "agent": "sol-agent",
+    })
+    assert isError is False, text
+    assert _soleProvenance(ctx)["agent"] == "sol-agent"
+
+
+def test_emit_atom_without_an_agent_is_byte_identical_to_today(makeCtx):
+    """The compat contract: absent means absent.
+
+    Mid-shadow callers (the tee forward and every existing session) send no
+    agent, and their atoms must keep landing exactly as they do now: no agent
+    key at all when the daemon has no PENSIVE_V3_AGENT, and ctx.agent when it
+    does.
+    """
+    unset = makeCtx(None)
+    _, isError = dispatch(unset, "engram_emit_atom", _MINIMAL_EMIT_ARGS["engram_emit_atom"])
+    assert isError is False
+    assert _soleProvenance(unset).get("agent") is None
+
+    configured = makeCtx("heph")
+    _, isError = dispatch(configured, "engram_emit_atom", _MINIMAL_EMIT_ARGS["engram_emit_atom"])
+    assert isError is False
+    assert _soleProvenance(configured)["agent"] == "heph"
+
+
+def test_a_caller_agent_beats_the_daemon_default(makeCtx):
+    ctx = makeCtx("heph")
+    _, isError = dispatch(ctx, "engram_emit_atom", {
+        **_MINIMAL_EMIT_ARGS["engram_emit_atom"],
+        "agent": "grok-agent",
+    })
+    assert isError is False
+    assert _soleProvenance(ctx)["agent"] == "grok-agent"
+
+
+@pytest.mark.parametrize("junk", ["", "   ", 42, None, ["sol-agent"]])
+def test_a_blank_or_non_string_agent_falls_back_rather_than_stamping_junk(makeCtx, junk):
+    """Fail soft to the default, never stamp an empty or wrong-typed name.
+
+    An atom stamped "" is worse than one stamped NULL: it looks like an answer.
+    """
+    ctx = makeCtx("heph")
+    _, isError = dispatch(ctx, "engram_emit_atom", {
+        **_MINIMAL_EMIT_ARGS["engram_emit_atom"],
+        "agent": junk,
+    })
+    assert isError is False
+    assert _soleProvenance(ctx)["agent"] == "heph"
+
+
+@pytest.mark.parametrize("tool", sorted(_MINIMAL_EMIT_ARGS))
+def test_every_emit_tool_stamps_the_caller_agent(makeCtx, tool):
+    """All five actually stamp, not just the one with the obvious call site.
+
+    ``engram_emit_discovery`` and ``engram_emit_failure`` do not build their own
+    provenance: they rebuild an argument dict and delegate to
+    ``handle_emit_atom``, copying a fixed list of keys across. A key missing from
+    that list is dropped in silence, so those two would accept an agent, return
+    success, and stamp nothing. Schema coverage cannot see that; only a real
+    emit can.
+    """
+    ctx = makeCtx(None)
+    _, isError = dispatch(ctx, tool, {**_MINIMAL_EMIT_ARGS[tool], "agent": "fable-agent"})
+    assert isError is False
+    assert _soleProvenance(ctx)["agent"] == "fable-agent"
+
+
+def test_every_emit_tool_accepts_agent_and_none_requires_it():
+    """All five, and none of them changes its required fields.
+
+    Adding agent to a required list would break every existing caller at once.
+    """
+    for name in _AGENT_STAMPED_TOOLS:
+        schema = _tool(COMPAT_TOOLS, name).inputSchema
+        assert "agent" in schema["properties"], name
+        assert "agent" not in schema.get("required", []), name
+
+
+def test_the_agent_property_is_scoped_to_the_emit_tools():
+    # Reading and analytics have no author to record. A stray agent field there
+    # would be a second, unowned stamping surface.
+    for name in ("pensive_recall", "pensive_analytics"):
+        assert "agent" not in _tool(COMPAT_TOOLS, name).inputSchema["properties"], name
 
 
 # --------------------------------------------------------------------------- #

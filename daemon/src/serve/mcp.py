@@ -23,8 +23,9 @@ Design rules fixed by the task brief:
 
 - Emits map to ``putAtom``: ``kind='atom'`` (narrative -> ``'narrative'``,
   snapshot -> ``'snapshot'``), provenance ``source='explicit-emit'`` with ``agent``
-  from the calling context when known, ``importance`` 0.0, and the emit's project
-  in the project COLUMN (which is what ``recall.signals.facetSignal`` filters on).
+  from the call when the caller named one and from the calling context otherwise,
+  ``importance`` 0.0, and the emit's project in the project COLUMN (which is what
+  ``recall.signals.facetSignal`` filters on).
 - A tool error NEVER kills the daemon: :func:`dispatch` catches every handler
   exception and returns an MCP error response; the next call still works. Handlers
   fail LOUD (raise with the component's message) rather than swallowing.
@@ -434,10 +435,29 @@ def _splitCsv(value):
     return [s.strip() for s in value.split(",") if s.strip()]
 
 
-def _emitProvenance(ctx):
+def _emitProvenance(ctx, args=None):
+    """Provenance for one emit: source, plus an agent if one can be determined.
+
+    A caller-supplied ``agent`` wins over the daemon-wide ``PENSIVE_V3_AGENT`` so
+    that several agents sharing one daemon accumulate distinct histories. This
+    mirrors what ``correct`` has always done with its ``provenance`` arg. The
+    Parlor sidecar is the only caller that sets it, and it sets it from the
+    machine binding rather than from anything a model said.
+
+    Absent, blank, or wrong-typed falls back to ``ctx.agent``, so every existing
+    caller (the tee forward, every current session) is byte-identical to before.
+    An atom stamped "" would look like an answer.
+    """
     prov = {"source": _EMIT_SOURCE}
-    if ctx.agent:
-        prov["agent"] = ctx.agent
+    agent = None
+    if isinstance(args, dict):
+        candidate = args.get("agent")
+        if isinstance(candidate, str) and candidate.strip():
+            agent = candidate.strip()
+    if agent is None and ctx.agent:
+        agent = ctx.agent
+    if agent:
+        prov["agent"] = agent
     return prov
 
 
@@ -506,7 +526,7 @@ def handle_emit_atom(ctx, args):
         "kind": "atom",
         "project": args["project"],
         "importance": 0.0,
-        "provenance": _emitProvenance(ctx),
+        "provenance": _emitProvenance(ctx, args),
     })
     for tag in dict.fromkeys(_splitCsv(args.get("tags", ""))):
         addFacet(ctx.store, atomId, "tag", tag)
@@ -523,7 +543,9 @@ def handle_emit_discovery(ctx, args):
         "project": args["project"], "shape": "discovery", "approach": "observed",
         "outcome": "succeeded", "reason": principle, "principle": principle,
     }
-    for key in ("narrative", "stakes", "topic", "trigger", "domain", "tags"):
+    # `agent` has to be on this list: a key left off is dropped in silence, and the
+    # emit would report success while stamping nothing.
+    for key in ("narrative", "stakes", "topic", "trigger", "domain", "tags", "agent"):
         if key in args:
             delegated[key] = args[key]
     return handle_emit_atom(ctx, delegated)
@@ -537,7 +559,9 @@ def handle_emit_failure(ctx, args):
         "approach": "attempted", "outcome": "failed",
         "reason": principle, "principle": principle,
     }
-    for key in ("narrative", "stakes", "topic", "trigger", "domain", "tags"):
+    # `agent` has to be on this list: a key left off is dropped in silence, and the
+    # emit would report success while stamping nothing.
+    for key in ("narrative", "stakes", "topic", "trigger", "domain", "tags", "agent"):
         if key in args:
             delegated[key] = args[key]
     return handle_emit_atom(ctx, delegated)
@@ -551,7 +575,7 @@ def handle_emit_narrative(ctx, args):
         "kind": "narrative",
         "project": args["project"],
         "importance": 0.0,
-        "provenance": _emitProvenance(ctx),
+        "provenance": _emitProvenance(ctx, args),
     })
     ctx.reindex(kinds=("narrative",))
     return f"Narrative fragment emitted (emission_id: {_emissionId()})"
@@ -572,7 +596,7 @@ def handle_emit_snapshot(ctx, args):
         "kind": "snapshot",
         "project": args["project"],
         "importance": 0.0,
-        "provenance": _emitProvenance(ctx),
+        "provenance": _emitProvenance(ctx, args),
     })
     ctx.reindex(kinds=("snapshot",))
     return f"snapshot emitted: {hypothesis[:80]} (ok)"
@@ -884,6 +908,15 @@ def handle_pin(ctx, args):
 # COMPAT: inputSchema dicts copied VERBATIM from the production server
 # (~/Projects/Engram/tools/pensive-mcp-server). Do not "improve" these -- an agent
 # mid-shadow is calling them exactly as written.
+#
+# ONE deliberate addition, and it is the only one: every emit tool carries an
+# optional `agent`. PENSIVE_V3_AGENT is read once at daemon start, so without a
+# per-call field one daemon can stamp exactly one name and the six residents that
+# share this one are indistinguishable from each other and from Heph's. The
+# property is optional and appears in no `required` list, so a mid-shadow caller
+# that has never heard of it is unaffected. `test_compat_tool_schemas_are_verbatim`
+# subtracts exactly this key before comparing, so it still catches every other
+# drift.
 COMPAT_TOOLS = [
     Tool(
         name="engram_emit_atom",
@@ -905,6 +938,7 @@ COMPAT_TOOLS = [
                 "stakes":    {"type": "string", "enum": ["high", "medium", "low"], "description": "How much this moment mattered"},
                 "dynamics":  {"type": "string", "enum": ["collaborative", "challenging", "tense", "exploratory", "teaching", "debugging"], "description": "Session dynamic"},
                 "topic":     {"type": "string", "description": "Short phrase for arc detection"},
+                "agent":     _NULLABLE_TEXT_SCHEMA,
             },
             "required": ["project", "shape", "approach", "outcome", "reason", "principle"],
         },
@@ -919,6 +953,7 @@ COMPAT_TOOLS = [
                 "hypothesis": {"type": "string", "description": "Current working theory"},
                 "dead_ends":  {"type": "string", "description": "Comma-separated dead ends", "default": ""},
                 "next_steps": {"type": "string", "description": "Comma-separated next steps", "default": ""},
+                "agent":      _NULLABLE_TEXT_SCHEMA,
             },
             "required": ["project", "hypothesis"],
         },
@@ -944,6 +979,7 @@ COMPAT_TOOLS = [
             "properties": {
                 "project":   {"type": "string", "description": "Project name"},
                 "principle": {"type": "string", "description": "What was discovered"},
+                "agent":     _NULLABLE_TEXT_SCHEMA,
             },
             "required": ["project", "principle"],
         },
@@ -956,6 +992,7 @@ COMPAT_TOOLS = [
             "properties": {
                 "project":   {"type": "string", "description": "Project name"},
                 "principle": {"type": "string", "description": "What failed and why"},
+                "agent":     _NULLABLE_TEXT_SCHEMA,
             },
             "required": ["project", "principle"],
         },
@@ -972,6 +1009,7 @@ COMPAT_TOOLS = [
                 "dynamics":  {"type": "string", "enum": ["collaborative", "challenging", "tense", "exploratory", "teaching", "debugging"]},
                 "stakes":    {"type": "string", "enum": ["high", "medium", "low"], "default": "medium"},
                 "topic":     {"type": "string", "description": "Short phrase for arc detection"},
+                "agent":     _NULLABLE_TEXT_SCHEMA,
             },
             "required": ["project", "narrative"],
         },
