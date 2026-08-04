@@ -1093,3 +1093,47 @@ def test_build_server_wraps_structured_and_string_results(monkeypatch, ctx):  # 
     assert stringResponse.structuredContent is None, (
         f"string-server unstructured rule violated: response={stringResponse!r}"
     )
+
+
+def test_recall_records_budget_starvation_serves_stub_not_empty(
+        monkeypatch, ctx, store):  # fail-open finding 2026-08-03: empty is not no-match
+    bigId = _put(store, "y" * 60)                   # 20 tokens, exceeds budget alone
+    ranked = [_trust(bigId)]
+    monkeypatch.setattr(mcp_module, "recall", lambda *a, **kw: _engineResult(ranked))
+
+    starved, starvedError = dispatch(ctx, "recall_records", {
+        "query": "budget starvation", "tokenBudget": 10,
+    })
+    assert starvedError is False, (
+        f"starved-call success rule violated: error={starvedError}"
+    )
+    assert len(starved.value["records"]) == 1, (
+        "budget-starvation stub rule violated: a budget smaller than the top "
+        f"body must serve a stub, not records:[] — value={starved.value!r}"
+    )
+    stub = starved.value["records"][0]
+    assert stub["id"] == bigId and stub["content"] != "y" * 60, (
+        f"stub-identity rule violated: stub={stub!r}"
+    )
+    assert "tokenBudget 10" in stub["content"] and "20-token" in stub["content"], (
+        f"stub-cost disclosure rule violated: content={stub['content']!r}"
+    )
+    assert stub["estimatedTokens"] == 20, (
+        f"stub real-cost accounting rule violated: {stub['estimatedTokens']!r}"
+    )
+    assert starved.value["truncated"] is True, (
+        f"starvation truncation-flag rule violated: value={starved.value!r}"
+    )
+
+    # Negative control: genuinely-empty results stay empty — the stub must not
+    # invent a match where the engine returned none.
+    monkeypatch.setattr(mcp_module, "recall", lambda *a, **kw: _engineResult([]))
+    empty, emptyError = dispatch(ctx, "recall_records", {
+        "query": "budget starvation", "tokenBudget": 10,
+    })
+    assert emptyError is False and empty.value["records"] == [], (
+        f"no-match emptiness rule violated: value={empty.value!r}"
+    )
+    assert empty.value["truncated"] is False, (
+        f"no-match truncation-flag rule violated: value={empty.value!r}"
+    )

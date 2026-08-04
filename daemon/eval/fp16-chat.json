@@ -1,0 +1,70 @@
+{
+ "corpus_docs": 97779,
+ "backfill": {
+  "ingested": 97779,
+  "skipped": 0,
+  "byKind": {
+   "document_chunk": 97779
+  },
+  "tagFacets": 0,
+  "entityFacets": 210425
+ },
+ "bm25": {
+  "r_at_1": 0.358,
+  "r_at_5": 0.528,
+  "r_at_10": 0.5833333333333334,
+  "r_at_20": 0.6373333333333333,
+  "mrr_at_10": 0.43206693121693124,
+  "n": 1500
+ },
+ "v3_baseline": {
+  "r_at_1": 0.32666666666666666,
+  "r_at_5": 0.5926666666666667,
+  "r_at_10": 0.6793333333333333,
+  "r_at_20": 0.7526666666666667,
+  "mrr_at_10": 0.4412116402116402,
+  "n": 1500,
+  "p50_ms": 205.41257900185883,
+  "p95_ms": 2317.1036610146984,
+  "mean_ms": 499.71705097460654,
+  "low_confidence_rate": 0.0
+ },
+ "v3_plus_assoc": {
+  "r_at_1": 0.3426666666666667,
+  "r_at_5": 0.6113333333333333,
+  "r_at_10": 0.6893333333333334,
+  "r_at_20": 0.7513333333333333,
+  "mrr_at_10": 0.4560322751322751,
+  "n": 1500,
+  "p50_ms": 208.15831498475745,
+  "p95_ms": 1574.0505899884738,
+  "mean_ms": 425.77377341047395,
+  "low_confidence_rate": 0.0
+ },
+ "delta": {
+  "r_at_1": 0.016000000000000014,
+  "r_at_5": 0.01866666666666661,
+  "r_at_10": 0.010000000000000009,
+  "r_at_20": -0.0013333333333334085,
+  "mrr_at_10": 0.0148206349206349
+ },
+ "assoc_seed_k": 20,
+ "assoc_damping_formula": "facet: 1 / degree(f)^SPEC_POWER for shared entity/tag facets; stored edges: weight(s,t) * weight(t,c) / degree(t)^SPEC_POWER; SPEC_POWER=1.0; degree=count(live atoms or unique incident neighbors)",
+ "assoc_derived_graph": {
+  "facet_keys": [
+   "entity",
+   "tag"
+  ],
+  "hub_cap": 128,
+  "max_seed_facets": 32,
+  "seeds_with_neighbors": 44738,
+  "derived_neighbor_pairs": 2100194
+ },
+ "temporal_neighborhood": {
+  "status": "UNAVAILABLE",
+  "assumption": "unavailable: gate query records expose no metadata marking what-else-was-in-flight temporal-neighborhood queries",
+  "baseline": null,
+  "assoc": null,
+  "delta": null
+ }
+}

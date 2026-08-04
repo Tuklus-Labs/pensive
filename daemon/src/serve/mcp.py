@@ -741,9 +741,6 @@ def handle_recall_records(ctx, args):
                 f"recall_records: atom {atom['id']!r} has more than 64 provenance rows"
             )
         recordTokens = estimateTokens(atom["text"])
-        if tokens + recordTokens > tokenBudget:
-            truncated = True
-            break
         record = {
             "id": atom["id"],
             "kind": atom["kind"],
@@ -762,6 +759,36 @@ def handle_recall_records(ctx, args):
             "supersededBy": result.get("supersededBy"),
             "estimatedTokens": recordTokens,
         }
+        if tokens + recordTokens > tokenBudget:
+            truncated = True
+            if not records:
+                # A budget smaller than the top-ranked body must not fail open
+                # as records:[] — that shape is byte-identical to "no match"
+                # and sends callers away believing the memory absent (observed
+                # 2026-08-03: tokenBudget=400 vs long atom bodies read as
+                # missing memories at estimatedTokens=0). Same degradation
+                # ladder as recall.payload.assemblePayload: serve a stub with
+                # real metadata and a sentinel body naming the real cost,
+                # never an empty list. Record-level estimatedTokens keeps the
+                # FULL body cost — the actionable budget-sizing signal — while
+                # the envelope's estimatedTokens reflects the stub actually
+                # returned.
+                stubContent = (
+                    f"[recall: tokenBudget {tokenBudget} cannot hold this "
+                    f"record's {recordTokens}-token body; metadata is real, "
+                    f"body omitted — retry with a larger tokenBudget]"
+                )
+                stub = {**record, "content": stubContent}
+                stubTokens = estimateTokens(stubContent)
+                candidate = makeStructured([stub], stubTokens, True)
+                if (
+                    _callToolResultBytes(candidate, False)
+                    <= MAX_RECALL_RECORDS_CALL_RESULT_BYTES
+                ):
+                    records = [stub]
+                    tokens = stubTokens
+                    structured = candidate
+            break
         candidateRecords = [*records, record]
         candidateTokens = tokens + recordTokens
         candidateTruncated = index < len(ranked) - 1

@@ -1,0 +1,93 @@
+{
+ "corpus_docs": 17528,
+ "backfill": {
+  "ingested": 17528,
+  "skipped": 0,
+  "byKind": {
+   "document_chunk": 3759,
+   "atom": 13456,
+   "narrative": 313
+  },
+  "tagFacets": 41,
+  "entityFacets": 39414
+ },
+ "bm25": {
+  "r_at_1": 0.562,
+  "r_at_5": 0.732,
+  "r_at_10": 0.782,
+  "r_at_20": 0.862,
+  "mrr_at_10": 0.6385642857142857,
+  "n": 500
+ },
+ "v3_baseline": {
+  "r_at_1": 0.658,
+  "r_at_5": 0.802,
+  "r_at_10": 0.844,
+  "r_at_20": 0.876,
+  "mrr_at_10": 0.7167682539682539,
+  "n": 500,
+  "p50_ms": 191.92162103718147,
+  "p95_ms": 3360.6645630206913,
+  "mean_ms": 575.8830223665573,
+  "low_confidence_rate": 0.0
+ },
+ "v3_plus_assoc": {
+  "r_at_1": 0.66,
+  "r_at_5": 0.8,
+  "r_at_10": 0.848,
+  "r_at_20": 0.88,
+  "mrr_at_10": 0.7203833333333334,
+  "n": 500,
+  "p50_ms": 190.97418599994853,
+  "p95_ms": 2076.5488850302063,
+  "mean_ms": 441.14652895275503,
+  "low_confidence_rate": 0.0
+ },
+ "delta": {
+  "r_at_1": 0.0020000000000000018,
+  "r_at_5": -0.0020000000000000018,
+  "r_at_10": 0.0040000000000000036,
+  "r_at_20": 0.0040000000000000036,
+  "mrr_at_10": 0.003615079365079432
+ },
+ "assoc_seed_k": 20,
+ "assoc_damping_formula": "facet: 1 / degree(f)^SPEC_POWER for shared entity/tag facets; stored edges: weight(s,t) * weight(t,c) / degree(t)^SPEC_POWER; SPEC_POWER=1.0; degree=count(live atoms or unique incident neighbors)",
+ "assoc_derived_graph": {
+  "facet_keys": [
+   "entity",
+   "tag"
+  ],
+  "hub_cap": 128,
+  "max_seed_facets": 32,
+  "seeds_with_neighbors": 5998,
+  "derived_neighbor_pairs": 150346
+ },
+ "temporal_neighborhood": {
+  "assumption": "identified by query metadata fields whose normalized value contains temporal-neighborhood, in-flight, in_flight, or what-else-was-in-flight",
+  "baseline": {
+   "r_at_1": 0.6666666666666666,
+   "r_at_5": 0.6666666666666666,
+   "r_at_10": 0.6666666666666666,
+   "r_at_20": 1.0,
+   "mrr_at_10": 0.6666666666666666,
+   "n": 3
+  },
+  "assoc": {
+   "r_at_1": 0.6666666666666666,
+   "r_at_5": 0.6666666666666666,
+   "r_at_10": 0.6666666666666666,
+   "r_at_20": 1.0,
+   "mrr_at_10": 0.6666666666666666,
+   "n": 3
+  },
+  "delta": {
+   "r_at_1": 0.0,
+   "r_at_5": 0.0,
+   "r_at_10": 0.0,
+   "r_at_20": 0.0,
+   "mrr_at_10": 0.0
+  }
+ },
+ "cluster_key": "project",
+ "eligible_queries": 1126
+}
