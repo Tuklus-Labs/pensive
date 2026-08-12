@@ -435,27 +435,116 @@ def _splitCsv(value):
     return [s.strip() for s in value.split(",") if s.strip()]
 
 
-def _emitProvenance(ctx, args=None):
-    """Provenance for one emit: source, plus an agent if one can be determined.
+_AGENT_MAX_LEN = 64
 
-    A caller-supplied ``agent`` wins over the daemon-wide ``PENSIVE_V3_AGENT`` so
-    that several agents sharing one daemon accumulate distinct histories. This
-    mirrors what ``correct`` has always done with its ``provenance`` arg. The
-    Parlor sidecar is the only caller that sets it, and it sets it from the
-    machine binding rather than from anything a model said.
 
-    Absent, blank, or wrong-typed falls back to ``ctx.agent``, so every existing
-    caller (the tee forward, every current session) is byte-identical to before.
-    An atom stamped "" would look like an answer.
+def _sanitizeAgent(raw):
+    """An identity, or None. Applied to the TRANSPORT-derived agent only.
+
+    Guards the column at the write boundary rather than trusting whatever rides
+    in on a URL. Filesystem paths have historically leaked into this column
+    (``/root/v3_publication_controller``, 8 rows as of 2026-08-12), and a
+    query-string identity is a new surface, so it is validated where it enters.
+
+    Deliberately NOT applied to the caller-supplied ``agent`` argument: that path
+    promises byte-identical behavior to every existing caller, and tightening it
+    here would be an unreviewed behavior change to a live daemon. The malformed
+    values already in the store arrived that way and are reported by
+    ``aegis-pensive-who``; cleaning them is a separate, operator-gated job.
     """
-    prov = {"source": _EMIT_SOURCE}
+    if not isinstance(raw, str):
+        return None
+    value = raw.strip()
+    if not value or len(value) > _AGENT_MAX_LEN:
+        return None
+    # Not identities: paths, slugs with separators, anything with a control byte.
+    if value.startswith("/") or value.startswith("./") or "\\" in value:
+        return None
+    if any(ch < " " for ch in value):
+        return None
+    return value
+
+
+def _transportAgent():
+    """The identity carried by the HTTP request itself, or None.
+
+    Read from ``?agent=`` on the MCP URL, so a client declares who it is once in
+    its config (``http://127.0.0.1:5999/mcp?agent=grok``) instead of every caller
+    remembering to pass an argument on every emit. Attribution stops being a
+    thing an agent has to remember and becomes a property of the connection.
+
+    Why the query string and not ``clientInfo``: this daemon runs the session
+    manager with ``stateless=True``, which builds a fresh transport per request
+    with ``mcp_session_id=None``. ``ServerSession`` is constructed already
+    Initialized in that mode and ``_client_params`` is only populated by an
+    actual ``initialize`` message, which lands on a DIFFERENT throwaway session
+    than the tool call. So ``session.client_params`` is None at emit time and
+    there is no session id to correlate on either. The Starlette request is the
+    one thing that is genuinely per-call: streamable_http attaches it as
+    ``ServerMessageMetadata.request_context`` and the lowlevel server hands it
+    through as ``RequestContext.request``.
+
+    Fails closed to None in every direction (no context, stdio transport where
+    ``request`` is None, malformed value), because a wrong name in this column is
+    worse than an absent one: NULL is honestly unattributed, but a wrong stamp is
+    counterfeit provenance.
+    """
+    try:
+        from mcp.server.lowlevel.server import request_ctx
+    except Exception:
+        return None
+    rc = request_ctx.get(None)
+    if rc is None:
+        return None
+    request = getattr(rc, "request", None)
+    if request is None:
+        return None
+    try:
+        return _sanitizeAgent(request.query_params.get("agent"))
+    except Exception:
+        return None
+
+
+def _resolveAgent(ctx, args=None):
+    """Agent precedence, most specific wins:
+
+    1. the caller-supplied ``agent`` argument  (an explicit claim about one emit)
+    2. the transport's ``?agent=``             (who this connection belongs to)
+    3. the daemon-wide ``PENSIVE_V3_AGENT``    (who this whole process is)
+    4. None                                    (honestly unattributed)
+
+    The order matters: a per-emit claim beats a per-connection default beats a
+    per-process default. Nothing here ever infers an identity, it only reads one
+    that was declared somewhere.
+    """
     agent = None
     if isinstance(args, dict):
         candidate = args.get("agent")
         if isinstance(candidate, str) and candidate.strip():
             agent = candidate.strip()
+    if agent is None:
+        agent = _transportAgent()
     if agent is None and ctx.agent:
         agent = ctx.agent
+    return agent
+
+
+def _emitProvenance(ctx, args=None):
+    """Provenance for one emit: source, plus an agent if one can be determined.
+
+    A caller-supplied ``agent`` wins over the connection's ``?agent=``, which
+    wins over the daemon-wide ``PENSIVE_V3_AGENT``, so several agents sharing one
+    daemon accumulate distinct histories. This mirrors what ``correct`` has
+    always done with its ``provenance`` arg. The Parlor sidecar is the only
+    caller that sets the argument, and it sets it from the machine binding rather
+    than from anything a model said.
+
+    Absent, blank, or wrong-typed still falls back exactly as before, so every
+    existing caller is byte-identical unless its connection declares an agent.
+    An atom stamped "" would look like an answer.
+    """
+    prov = {"source": _EMIT_SOURCE}
+    agent = _resolveAgent(ctx, args)
     if agent:
         prov["agent"] = agent
     return prov
@@ -904,8 +993,13 @@ def handle_correct(ctx, args):
     for key in ("agent", "sessionId", "sourceRef"):
         if prov.get(key) is not None:
             provenance[key] = prov[key]
-    if "agent" not in provenance and ctx.agent:
-        provenance["agent"] = ctx.agent
+    if "agent" not in provenance:
+        # Same precedence as an emit: the connection's declared identity fills in
+        # when the caller's provenance block omits one, before the process-wide
+        # default. A correction is authored by somebody too.
+        resolved = _resolveAgent(ctx, None)
+        if resolved:
+            provenance["agent"] = resolved
 
     newId = putAtom(ctx.store, {
         "text": newText,
