@@ -2,3 +2,4 @@
 # a committed report; the raw dumps and the binary do not.
 tiergate
 .gate-evidence/
+run.txt

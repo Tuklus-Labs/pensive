@@ -83,14 +83,28 @@ func run(c cfg) (*verdict.Report, error) {
 		}
 	}
 
+	// --- probes (built BEFORE contamination, which must exclude them) --------
+	gen, gerr := generatedProbes(c.storePath, c.genProbes, c.seed)
+	cur, cerr := curatedProbes("probes.json")
+
 	// --- contamination ------------------------------------------------------
 	// Refuse to measure a daemon under unknown load rather than quietly
 	// reporting a number that is mostly somebody else's retry loop.
+	//
+	// This guard previously filtered on `source_ref NOT LIKE '%tiergate%'`,
+	// which excluded nothing: the DAEMON writes source_ref ("mcp.recall"), not
+	// the caller, so the gate's `?agent=tiergate` never reached that column and
+	// the check counted its OWN probes as background. A single run looked clean
+	// only because no probe had run in the preceding 60s; two runs back to back
+	// made it read 130 and REJECT itself. An instrument that cannot tell its own
+	// traffic from the world's is measuring the wrong question, so exclude by
+	// the one thing the gate genuinely owns: the exact query strings it issues.
 	var bgPerMin float64
 	{
-		q := "QUESTION: is background recall traffic low enough that a latency number describes this gate's probes rather than another process's load?"
+		q := "QUESTION: is background recall traffic, EXCLUDING this gate's own probe queries, low enough that a latency number describes this gate rather than another process's load?"
 		n, err := scalarInt(c.storePath, fmt.Sprintf(
-			"SELECT COUNT(*) FROM recall_log WHERE recorded_at > strftime('%%s','now') - 60 AND COALESCE(source_ref,'') NOT LIKE '%%tiergate%%'"))
+			"SELECT COUNT(*) FROM recall_log WHERE recorded_at > strftime('%%s','now') - 60 "+
+				"AND query NOT IN (%s)", sqlQuoteList(append(probeQueries(gen), probeQueries(cur)...))))
 		if err != nil {
 			add("contamination", "contamination.background-traffic", verdict.Fail,
 				c.ev("contamination", map[string]any{"question": q, "error": err.Error()}), nil)
@@ -186,9 +200,7 @@ func run(c cfg) (*verdict.Report, error) {
 			}), nil)
 	}
 
-	// --- probes for the semantic tiers --------------------------------------
-	gen, gerr := generatedProbes(c.storePath, c.genProbes, c.seed)
-	cur, cerr := curatedProbes("probes.json")
+	// --- probes for the semantic tiers (built above, before contamination) ---
 	nProbes := len(gen) + len(cur)
 	// A floor, not a nonzero check. The first version asserted len(gen) > 0 and
 	// went green on a SINGLE generated probe while the quality units below
@@ -398,4 +410,30 @@ func emit(c cfg, r *verdict.Report) {
 	fmt.Printf("tainted: %v\n", r.Tainted())
 	fmt.Printf("OUTCOME: %s\n", r.Outcome())
 	fmt.Printf("report: %s\n", p)
+}
+
+
+// probeQueries returns the exact query strings a probe set will issue, so the
+// contamination guard can subtract the gate's own traffic from the world's.
+func probeQueries(ps []probe) []string {
+	out := make([]string, 0, len(ps))
+	for _, p := range ps {
+		out = append(out, p.Query)
+	}
+	return out
+}
+
+// sqlQuoteList renders a SQL string list. Single quotes are doubled; nothing
+// else reaches SQL from a probe. An EMPTY list must not produce "NOT IN ()",
+// which is a syntax error that would make the guard fail to run at all rather
+// than fail loudly, so it yields a value no query can equal.
+func sqlQuoteList(vals []string) string {
+	if len(vals) == 0 {
+		return "''"
+	}
+	parts := make([]string, 0, len(vals))
+	for _, v := range vals {
+		parts = append(parts, "'"+strings.ReplaceAll(v, "'", "''")+"'")
+	}
+	return strings.Join(parts, ",")
 }
