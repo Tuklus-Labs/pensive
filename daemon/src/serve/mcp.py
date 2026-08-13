@@ -719,14 +719,18 @@ def _logReturnedRecall(ctx, out, query, sourceRef, atomIds=None):
 # --------------------------------------------------------------------------- #
 
 
-def handle_emit_atom(ctx, args):
-    _require(args, ["project", "shape", "approach", "outcome", "reason", "principle"])
-    outcome = args["outcome"]
-    principle = args["principle"]
-    text = _composeAtomText(
-        args["shape"], args["approach"], outcome, args["reason"], principle,
-        domain=args.get("domain", ""), narrative=args.get("narrative", ""),
-    )
+def _writeAtom(ctx, args, text, outcome, principle, shape):
+    """The single write path every atom emit takes.
+
+    Shared so a shorthand cannot drift from the full form. The shorthands used
+    to rebuild an argument dict and delegate here, copying a fixed list of keys
+    across, which meant a key left off that list was dropped in SILENCE: the
+    emit returned success and stamped nothing. One path removes that hazard
+    structurally instead of documenting it.
+
+    ``shape`` is recorded as a facet rather than as prose at the head of the
+    body. It is a property of the atom, not a sentence the reader has to skip.
+    """
     _boundedEmitText(text, "emit: atom body")
     atomId = putAtom(ctx.store, {
         "text": text,
@@ -735,43 +739,61 @@ def handle_emit_atom(ctx, args):
         "importance": 0.0,
         "provenance": _emitProvenance(ctx, args),
     })
+    if shape and shape.strip():
+        addFacet(ctx.store, atomId, "shape", shape.strip())
     for tag in dict.fromkeys(_splitCsv(args.get("tags", ""))):
         addFacet(ctx.store, atomId, "tag", tag)
     ctx.reindex(kinds=("atom",))
-    emissionId = _emissionId()
-    return (f"atom [{outcome}] emitted (emission_id: {emissionId}): "
+    return (f"atom [{outcome}] emitted (emission_id: {_emissionId()}): "
             f"{principle[:80]} (ok)")
 
 
+def _withNarrative(text, args):
+    """Trail an inline narrative as its own paragraph, as _composeAtomText does."""
+    narrative = args.get("narrative", "")
+    if narrative and narrative.strip():
+        return text + "\n\n" + narrative.strip()
+    return text
+
+
+def handle_emit_atom(ctx, args):
+    _require(args, ["project", "shape", "approach", "outcome", "reason", "principle"])
+    text = _composeAtomText(
+        args["shape"], args["approach"], args["outcome"], args["reason"],
+        args["principle"], domain=args.get("domain", ""),
+        narrative=args.get("narrative", ""),
+    )
+    return _writeAtom(ctx, args, text, args["outcome"], args["principle"],
+                      args["shape"])
+
+
 def handle_emit_discovery(ctx, args):
+    """One sentence in, that sentence stored.
+
+    Previously this synthesized shape="discovery", approach="observed",
+    outcome="succeeded" and set reason AND principle to the caller's single
+    sentence, so the stored body opened with 49 characters of scaffolding and
+    then said the sentence twice. `approach: observed` was never an approach; it
+    was a placeholder satisfying a required field, and it became permanent text
+    in 1,091 live rows.
+    """
     _require(args, ["project", "principle"])
     principle = args["principle"]
-    delegated = {
-        "project": args["project"], "shape": "discovery", "approach": "observed",
-        "outcome": "succeeded", "reason": principle, "principle": principle,
-    }
-    # `agent` has to be on this list: a key left off is dropped in silence, and the
-    # emit would report success while stamping nothing.
-    for key in ("narrative", "stakes", "topic", "trigger", "domain", "tags", "agent"):
-        if key in args:
-            delegated[key] = args[key]
-    return handle_emit_atom(ctx, delegated)
+    return _writeAtom(ctx, args, _withNarrative(principle.strip(), args),
+                      "succeeded", principle, "discovery")
 
 
 def handle_emit_failure(ctx, args):
+    """One sentence in, that sentence stored. See handle_emit_discovery.
+
+    This one also produced the stutter: shape="failed approach" followed by
+    "approach: attempted" rendered as "failed approach / approach: attempted",
+    53 characters before the reader reached any content, in 202 live rows.
+    """
     _require(args, ["project", "principle"])
     principle = args["principle"]
-    delegated = {
-        "project": args["project"], "shape": "failed approach",
-        "approach": "attempted", "outcome": "failed",
-        "reason": principle, "principle": principle,
-    }
-    # `agent` has to be on this list: a key left off is dropped in silence, and the
-    # emit would report success while stamping nothing.
-    for key in ("narrative", "stakes", "topic", "trigger", "domain", "tags", "agent"):
-        if key in args:
-            delegated[key] = args[key]
-    return handle_emit_atom(ctx, delegated)
+    return _writeAtom(ctx, args, _withNarrative(principle.strip(), args),
+                      "failed", principle, "failed approach")
 
 
 def handle_emit_narrative(ctx, args):

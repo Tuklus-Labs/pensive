@@ -365,7 +365,11 @@ def test_emit_atom_principle_truncated_to_80_in_result(ctx):
     assert "[partial]" in text
 
 
-def test_emit_discovery_and_failure_delegate_to_atom_shape(ctx):
+def test_emit_discovery_and_failure_keep_the_legacy_result_shape(ctx):
+    """Renamed 2026-08-12: they no longer DELEGATE. Both shorthands and the full
+    form now share one `_writeAtom` path instead of rebuilding an argument dict,
+    so this gate holds the frozen compat RESULT string still. What they STORE
+    changed deliberately and is gated by test_emit_body_shape.py."""
     d, derr = dispatch(ctx, "engram_emit_discovery",
                        {"project": "pensive", "principle": "spreading activation is sub-ms"})
     assert derr is False
