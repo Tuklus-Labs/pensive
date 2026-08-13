@@ -815,6 +815,46 @@ def test_mcp_mount_allows_same_origin_loopback(httpApp):
     assert r.status_code == 200, f"same-origin loopback MCP was rejected: {r.text}"
 
 
+def test_build_app_never_provisions_a_secret_on_the_filesystem(ctx, tmp_path, monkeypatch):
+    # buildApp() must have NO filesystem side effect. It is called by tests in
+    # test_viz.py and test_briefer.py as well as here, so a create-on-read would
+    # have every one of them writing a fresh credential into the operator's real
+    # ~/.local/share/pensive-v3/. That is not hypothetical: it happened once during
+    # this fix, which is why loadTeeSecret() defaults to create=False and only
+    # main() provisions.
+    from serve.daemon import buildApp
+
+    secretFile = tmp_path / "not-created" / "tee.secret"
+    monkeypatch.setenv(_SECRET_FILE_ENV, str(secretFile))
+
+    buildApp(ctx)
+
+    assert not secretFile.exists(), "buildApp() provisioned a secret file"
+    assert not secretFile.parent.exists(), "buildApp() created the secret's parent dir"
+
+
+def test_missing_secret_makes_writes_fail_closed_not_open(ctx, counters, tmp_path, monkeypatch):
+    # The end-to-end consequence of the above: with no secret on disk, the write
+    # routes refuse rather than serve unguarded. A daemon that cannot find its
+    # secret must not silently become the vulnerable version of itself.
+    import sqlite3
+    from starlette.testclient import TestClient
+    from serve.daemon import buildApp
+
+    _real_connect = sqlite3.connect
+    monkeypatch.setattr(
+        sqlite3, "connect",
+        lambda *a, **k: _real_connect(*a, **{**k, "check_same_thread": False}))
+    monkeypatch.setenv(_SECRET_FILE_ENV, str(tmp_path / "absent" / "tee.secret"))
+
+    with TestClient(buildApp(ctx)) as client:
+        r = client.post("/tee/emit", content=_emitBody(), headers=_localHeaders())
+
+    assert r.status_code == 503
+    assert r.json()["reason"] == "local-secret-unavailable"
+    assert _atomRows(ctx.store) == []
+
+
 def test_read_only_routes_are_not_gated(httpApp):
     # The guards belong on WRITES. /status and /brief change nothing, and gating
     # them would break the SessionStart hook that curls /brief for no security

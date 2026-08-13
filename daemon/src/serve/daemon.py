@@ -45,7 +45,7 @@ if str(_SRC) not in sys.path:
 from serve.mcp import ServeContext, buildServer, SERVER_NAME  # noqa: E402
 from serve.tee import (  # noqa: E402
     Counters, handleTeeEmit, checkLocalWriteRequest, checkRequestOrigin,
-    loadTeeSecret, defaultTeeSecretPath,
+    loadTeeSecret, defaultTeeSecretPath, LOCAL_WRITE_HEADER,
 )
 from serve.shadow import runShadow, defaultShadowLogPath  # noqa: E402
 from serve import viz  # noqa: E402
@@ -247,6 +247,19 @@ def buildApp(ctx):
 def main():
     _setProcTitle()
     port = int(os.environ.get("PENSIVE_V3_PORT", _DEFAULT_PORT))
+
+    # Provision the loopback write secret HERE, in the process entry point, and
+    # nowhere else. buildApp() only reads it: that function is called by tests in
+    # three different files, and a create-by-default read would have them writing a
+    # credential into the real data dir just by constructing an app object.
+    secretPath = defaultTeeSecretPath()
+    if loadTeeSecret(create=True) is None:
+        _log(f"WARNING: could not read or create {secretPath}; "
+             "POST /tee/emit and POST /shadow/recall will refuse every request")
+    else:
+        _log(f"loopback write secret at {secretPath} "
+             f"(callers send it as {LOCAL_WRITE_HEADER})")
+
     ctx = buildContext()
     app = buildApp(ctx)
 

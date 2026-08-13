@@ -181,18 +181,26 @@ def defaultTeeSecretPath():
     return Path.home() / ".local" / "share" / "pensive-v3" / "tee.secret"
 
 
-def loadTeeSecret(path=None):
-    """Read the loopback secret, creating it 0600 on first run -> ``str`` or ``None``.
+def loadTeeSecret(path=None, create=False):
+    """Read the loopback secret -> ``str`` or ``None``. Creates it only if asked.
 
-    Self-provisioning is deliberate: a guard that requires a manual setup step is a
-    guard that gets disabled the first time it blocks someone. The file is created
-    with mode 0600 BEFORE anything is written to it (via ``O_CREAT|O_EXCL`` with the
-    mode passed to ``os.open``), so the secret is never briefly world-readable --
-    a chmod after the write would leave exactly that window.
+    ``create`` defaults to FALSE, and that default is load-bearing. Generating the
+    secret is a filesystem side effect, and :func:`serve.daemon.buildApp` is called
+    by a dozen tests across three test files -- with creation on by default, merely
+    building an app object wrote a credential into the real
+    ``~/.local/share/pensive-v3/`` (observed exactly once, which is why this
+    argument exists). Only the daemon's ``main()`` entry point provisions; every
+    other caller reads what is already there.
 
-    Returns ``None`` if the secret cannot be read or created. Callers must treat
-    ``None`` as "refuse writes", never as "skip the check": see
-    :func:`checkLocalWriteRequest`.
+    Self-provisioning at ``main()`` is still deliberate: a guard that needs a manual
+    setup step is a guard someone disables the first time it blocks them. The file
+    is created with mode 0600 BEFORE anything is written to it (the mode is passed
+    to ``os.open`` alongside ``O_CREAT|O_EXCL``), so the secret is never briefly
+    world-readable -- a chmod after the write would leave exactly that window.
+
+    Returns ``None`` if the secret cannot be read, or is absent and ``create`` is
+    False. Callers must treat ``None`` as "refuse writes", never as "skip the
+    check": see :func:`checkLocalWriteRequest`.
     """
     path = Path(path) if path is not None else defaultTeeSecretPath()
     try:
@@ -205,6 +213,9 @@ def loadTeeSecret(path=None):
         # Unreadable (bad perms, bad mount). Fail closed rather than regenerate:
         # silently replacing a secret we merely cannot read would lock out every
         # legitimate caller that already holds the real one.
+        return None
+
+    if not create:
         return None
 
     try:
