@@ -81,7 +81,123 @@ def _getExtractor():
     return _extractor
 
 
-def _sanitizeFtsQuery(query):
+# A term appearing in more than this FRACTION of live rows is dropped from the
+# MATCH expression. A fraction, not a row count, because a hardcoded count stops
+# pruning as the corpus grows -- the failure mode where an instrument silently
+# gets quieter over time.
+#
+# Measured on the live store 2026-08-12: "the" matched 180,501 of ~320k rows and
+# "what"/"do"/"to" pushed one query to 196,097 (61% of the store). The cost of a
+# lexical query tracks MATCH COUNT, because ORDER BY bm25(fts) scores every
+# matching row (the sort key is a function, so LIMIT cannot push down): MATCH
+# alone is 0.3ms, MATCH + ORDER BY bm25 is 65.6ms.
+DF_PRUNE_FRACTION = 0.01
+
+# Never prune below this many tokens. A query made entirely of saturating terms
+# must still ask something: an empty MATCH expression returns zero rows, which is
+# indistinguishable from an honest miss and is a worse failure than a slow query.
+MIN_KEPT_TOKENS = 1
+
+# Below this many live rows, pruning is DISABLED entirely.
+#
+# A fraction threshold is meaningless on a small corpus: in a five-atom store,
+# 1% is 0.05, so a term appearing in ONE document is "saturating" and every
+# query collapses to a single token. Six existing tests caught exactly that.
+# The guard is not a workaround for the tests, it is the honest scope of the
+# optimization: bm25 over a few thousand rows is already milliseconds, so there
+# is no cost here to remove and no DF signal worth trusting.
+MIN_CORPUS_FOR_PRUNING = 10_000
+
+
+def _ensureVocab(store):
+    """Create the fts5vocab shadow table ONCE per store connection.
+
+    It was created per lookup, i.e. once per token per query, and a schema
+    statement on every token put a ~10ms floor under every lexical query --
+    an optimization paying more than the cost it removed. Guarded by an
+    attribute on the store so the statement runs once and never again.
+    """
+    if getattr(store, "_ftsVocabReady", False):
+        return True
+    try:
+        store._conn.execute(
+            "CREATE VIRTUAL TABLE IF NOT EXISTS fts_vocab USING fts5vocab('fts','row')"
+        )
+    except Exception:
+        store._ftsVocabReady = False
+        return False
+    store._ftsVocabReady = True
+    return True
+
+
+def ftsDocFreq(store, term):
+    """Document frequency of ``term`` in the FTS index, or 0 if absent.
+
+    Backed by an ``fts5vocab`` shadow table and memoized per store: term
+    frequencies move only on write, and a query-time pruning decision that costs
+    a query defeats itself. The whole point is to spend microseconds deciding
+    not to spend milliseconds.
+    """
+    if not _ensureVocab(store):
+        # A vocab table we cannot build or read means we cannot prune. Fail
+        # toward the SLOW-but-correct query rather than toward a pruned one we
+        # cannot justify: an optimization that cannot verify its own premise
+        # must not fire.
+        return 0
+    cache = getattr(store, "_dfCache", None)
+    if cache is None:
+        cache = {}
+        store._dfCache = cache
+    key = term.lower()
+    if key in cache:
+        return cache[key]
+    try:
+        row = store._conn.execute(
+            "SELECT doc FROM fts_vocab WHERE term = ?", (key,)
+        ).fetchone()
+    except Exception:
+        return 0
+    value = row[0] if row else 0
+    cache[key] = value
+    return value
+
+
+def _liveRowCount(store):
+    """Live row count, memoized per store: a COUNT(*) over 320k rows on every
+    query is the same self-defeating shape as the schema statement was."""
+    cached = getattr(store, "_liveRowCountCache", None)
+    if cached is not None:
+        return cached
+    row = store._conn.execute(
+        "SELECT COUNT(*) FROM atoms WHERE status = 'live'"
+    ).fetchone()
+    value = row[0] if row else 0
+    store._liveRowCountCache = value
+    return value
+
+
+def _pruneSaturatingTokens(store, tokens):
+    """Drop tokens whose document frequency exceeds the prune fraction.
+
+    Keeps the ``MIN_KEPT_TOKENS`` rarest tokens no matter what, so a query of
+    entirely common words still asks a question. Returns the tokens in their
+    ORIGINAL order, because FTS5 phrase order is part of the expression and
+    reordering it would be a silent semantic change on top of a performance one.
+    """
+    total = _liveRowCount(store)
+    if total < MIN_CORPUS_FOR_PRUNING:
+        return tokens
+    ceiling = total * DF_PRUNE_FRACTION
+    freqs = {t: ftsDocFreq(store, t) for t in set(tokens)}
+    kept = [t for t in tokens if freqs.get(t, 0) <= ceiling]
+    if len(kept) >= MIN_KEPT_TOKENS:
+        return kept
+    # Everything saturates: keep the rarest, preserving original order.
+    rarest = sorted(set(tokens), key=lambda t: freqs.get(t, 0))[:MIN_KEPT_TOKENS]
+    return [t for t in tokens if t in set(rarest)][:MIN_KEPT_TOKENS]
+
+
+def _sanitizeFtsQuery(query, store=None):
     """Turn arbitrary text into a safe FTS5 MATCH expression, or None if empty.
 
     Tokenizes to word runs and wraps each in double quotes (an FTS5 phrase
@@ -99,6 +215,12 @@ def _sanitizeFtsQuery(query):
         return None
     if len(tokens) > _MAX_QUERY_TOKENS:
         tokens = tokens[:_MAX_QUERY_TOKENS]
+    # DF pruning is opt-in at the call site: a caller with no store keeps the
+    # previous behaviour byte for byte.
+    if store is not None:
+        tokens = _pruneSaturatingTokens(store, tokens)
+        if not tokens:
+            return None
     quoted = ['"' + t.replace('"', '""') + '"' for t in tokens]
     return " OR ".join(quoted)
 
@@ -115,7 +237,7 @@ def bm25(store, query, k=_DEFAULT_K, kinds=None):
     """
     if k <= 0:
         return []
-    match = _sanitizeFtsQuery(query)
+    match = _sanitizeFtsQuery(query, store=store)
     if match is None:
         return []
     kindClause, kindParams = kindInClause(kinds, alias="a")
