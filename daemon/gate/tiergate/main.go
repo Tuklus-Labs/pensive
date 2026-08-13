@@ -83,6 +83,7 @@ type cfg struct {
 	plant         string
 	epoch         string
 	evidenceDir   string
+	evErrs        []string
 }
 
 func main() {
@@ -106,7 +107,7 @@ func main() {
 	flag.StringVar(&c.evidenceDir, "evidence-dir", ".gate-evidence", "where raw output is written")
 	flag.Parse()
 
-	rep, err := run(c)
+	rep, err := run(&c)
 	if err != nil {
 		// A gate that cannot construct its report has FAILED, not passed. It
 		// must never exit 0 (STYLE.md: a check that did not run must never
@@ -114,7 +115,7 @@ func main() {
 		fmt.Fprintf(os.Stderr, "tiergate: INSTRUMENT FAILURE: %v\n", err)
 		os.Exit(3)
 	}
-	emit(c, rep)
+	emit(&c, rep)
 	switch rep.Outcome() {
 	case "ACCEPT":
 		os.Exit(0)

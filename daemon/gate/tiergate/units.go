@@ -3,6 +3,7 @@ package main
 import (
 	"encoding/json"
 	"fmt"
+	"math"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -13,14 +14,44 @@ import (
 	"aegis/gatekit/verdict"
 )
 
-// ev writes raw output to disk and returns the pointer. A verdict without a
-// pointer to its raw output is a rumor with a checkmark (STYLE.md L7).
-func (c cfg) ev(unit string, payload any) string {
+// ev writes raw output to disk and returns the pointer, or records a failure.
+// A verdict without a pointer to its raw output is a rumor with a checkmark
+// (STYLE.md L7).
+//
+// Every error used to be discarded and a path returned regardless, so on an
+// unwritable or full evidence directory the gate produced a full set of
+// components whose evidence strings named files that DID NOT EXIST. gatekit
+// validates that the string is non-empty, which such a path satisfies, so the
+// report constructed cleanly and the outcome was unchanged while no raw
+// evidence existed anywhere. Found by a cross-vendor review, 2026-08-12.
+//
+// Errors are now collected on the cfg and checked by the caller before the
+// report is built: an instrument that cannot record what it saw has failed,
+// and must not emit a verdict about anything else.
+func (c *cfg) ev(unit string, payload any) string {
 	dir := filepath.Join(c.evidenceDir, c.epoch)
-	_ = os.MkdirAll(dir, 0o755)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		c.evErrs = append(c.evErrs, fmt.Sprintf("%s: mkdir: %v", unit, err))
+		return "EVIDENCE-WRITE-FAILED"
+	}
 	p := filepath.Join(dir, unit+".json")
-	b, _ := json.MarshalIndent(payload, "", "  ")
-	_ = os.WriteFile(p, b, 0o644)
+	b, err := json.MarshalIndent(payload, "", "  ")
+	if err != nil {
+		c.evErrs = append(c.evErrs, fmt.Sprintf("%s: marshal: %v", unit, err))
+		return "EVIDENCE-WRITE-FAILED"
+	}
+	if err := os.WriteFile(p, b, 0o644); err != nil {
+		c.evErrs = append(c.evErrs, fmt.Sprintf("%s: write: %v", unit, err))
+		return "EVIDENCE-WRITE-FAILED"
+	}
+	// Read it back. A successful write call is not proof of a readable file,
+	// and this is the artifact a human is sent to when they doubt the verdict.
+	got, err := os.ReadFile(p)
+	if err != nil || len(got) != len(b) {
+		c.evErrs = append(c.evErrs, fmt.Sprintf("%s: readback: %v (%d/%d bytes)",
+			unit, err, len(got), len(b)))
+		return "EVIDENCE-WRITE-FAILED"
+	}
 	abs, err := filepath.Abs(p)
 	if err != nil {
 		return p
@@ -37,7 +68,7 @@ func state(ok bool) verdict.State {
 	return verdict.Fail
 }
 
-func run(c cfg) (*verdict.Report, error) {
+func run(c *cfg) (*verdict.Report, error) {
 	m := newMCP(c.daemonURL)
 	var comps []verdict.Component
 	add := func(check, unit string, st verdict.State, evidence string, score *verdict.Score) {
@@ -102,9 +133,18 @@ func run(c cfg) (*verdict.Report, error) {
 	var bgPerMin float64
 	{
 		q := "QUESTION: is background recall traffic, EXCLUDING this gate's own probe queries, low enough that a latency number describes this gate rather than another process's load?"
+		excl := sqlQuoteList(append(probeQueries(gen), probeQueries(cur)...))
+		// recall_log holds one row PER RETURNED ATOM, not per request, so a raw
+		// row count is in the wrong unit: one background request returning ten
+		// atoms read as ten "events" and tripped a ceiling of five. Estimate
+		// requests by distinct (query, recorded_at); a request writes all its
+		// rows under one timestamp.
 		n, err := scalarInt(c.storePath, fmt.Sprintf(
+			"SELECT COUNT(*) FROM (SELECT DISTINCT query, recorded_at FROM recall_log "+
+				"WHERE recorded_at > strftime('%%s','now') - 60 AND query NOT IN (%s))", excl))
+		rows, _ := scalarInt(c.storePath, fmt.Sprintf(
 			"SELECT COUNT(*) FROM recall_log WHERE recorded_at > strftime('%%s','now') - 60 "+
-				"AND query NOT IN (%s)", sqlQuoteList(append(probeQueries(gen), probeQueries(cur)...))))
+				"AND query NOT IN (%s)", excl))
 		if err != nil {
 			add("contamination", "contamination.background-traffic", verdict.Fail,
 				c.ev("contamination", map[string]any{"question": q, "error": err.Error()}), nil)
@@ -112,8 +152,14 @@ func run(c cfg) (*verdict.Report, error) {
 			bgPerMin = float64(n)
 			add("contamination", "contamination.background-traffic", state(bgPerMin <= c.maxBackground),
 				c.ev("contamination", map[string]any{
-					"question": q, "background_events_last_60s": n,
-					"ceiling_per_min": c.maxBackground,
+					"question":                       q,
+					"background_requests_est_last60s": n,
+					"background_rows_last60s":        rows,
+					"ceiling_requests_per_min":       c.maxBackground,
+					"KNOWN BLIND SPOT": "a background request that returns ZERO atoms writes no " +
+						"recall_log row and is invisible here, so this guard bounds noisy traffic, " +
+						"not all traffic. It also infers ownership from query equality, so another " +
+						"caller issuing an identical query would be excluded as ours.",
 					"verdict_meaning": "FAIL means this run's latency figures are contaminated and must not be quoted",
 				}), nil)
 		}
@@ -172,26 +218,37 @@ func run(c cfg) (*verdict.Report, error) {
 		var lastCode int
 		var lastErr error
 		exact := true
-		if kerr == nil {
+		ids, iderr := someLiveAtomIDs(c.storePath, c.iterations)
+		distinctProbed := len(ids)
+		if kerr == nil && iderr == nil {
 			for i := 0; i < c.iterations; i++ {
-				body, d, code, err := m.get(knownID)
+				id := ids[i%len(ids)]
+				body, d, code, err := m.get(id)
 				lastCode, lastErr = code, err
 				lats = append(lats, plantLatency(c, float64(d.Microseconds())/1000.0))
-				if err != nil || code != 200 || !strings.Contains(body, knownID) {
+				if err != nil || code != 200 || !strings.Contains(body, id) {
 					exact = false
 				}
 			}
 		} else {
 			exact = false
 		}
-		got := p95(lats)
 		routeUp := lastErr == nil && lastCode == 200
-		add("latency", "l1.latency.p95", state(routeUp && got <= c.l1Budget),
-			c.ev("l1-latency", map[string]any{
-				"question": q, "p95_ms": got, "p50_ms": median(lats), "budget_ms": c.l1Budget,
-				"n": len(lats), "http_status": lastCode, "error": errStr(lastErr), "plant": c.plant,
-				"verdict_meaning": "FAIL means either the lean L1 route does not exist yet, or it exists and is over budget. The http_status field distinguishes them.",
-			}), &verdict.Score{Value: got, Max: 0})
+		if !routeUp {
+			add("latency", "l1.latency.p95", verdict.Fail,
+				c.ev("l1-latency", map[string]any{
+					"question": q, "budget_ms": c.l1Budget, "n": len(lats),
+					"http_status": lastCode, "error": errStr(lastErr),
+					"verdict_meaning": "FAIL: the lean L1 route does not answer. No latency claim is made; " +
+						"a timing over a 404 measures the router, not the tier.",
+				}), nil)
+		} else {
+			st, evp, sc := latencyUnit(c, "l1-latency", q, lats, c.l1Budget, map[string]any{
+				"http_status": lastCode, "plant": c.plant,
+				"distinct_ids_probed": distinctProbed,
+			})
+			add("latency", "l1.latency.p95", st, evp, sc)
+		}
 		add("correctness", "l1.correctness.exact", state(routeUp && exact),
 			c.ev("l1-correctness", map[string]any{
 				"question":        "QUESTION: does exact lookup return exactly the atom requested, on every iteration?",
@@ -220,10 +277,13 @@ func run(c cfg) (*verdict.Report, error) {
 	// The L2 route does not exist yet. Absent is FAIL, never SKIP: an absent
 	// check and a passing check are indistinguishable in a tally.
 	{
-		q := fmt.Sprintf("QUESTION: is client-observed P95 for lexical+facet+local-dense retrieval (no cross-encoder, no remote) <= %.3gms?", c.l2Budget)
+		// Named for what it ASSERTS. It was called l2.latency.p95 and reported no
+		// latency at all, only an existence boolean: a unit whose name promises a
+		// measurement it never took is the drifted-question failure in miniature.
+		q := fmt.Sprintf("QUESTION: does an L2 tier (lexical+facet+local-dense, no cross-encoder, no remote) EXIST to measure against its %.3gms budget?", c.l2Budget)
 		_, _, code, err := m.get("__tier_probe__")
 		l2Exists := false // no L2 route implemented yet; asserted, not assumed
-		add("latency", "l2.latency.p95", state(l2Exists),
+		add("tier", "l2.tier.implemented", state(l2Exists),
 			c.ev("l2-latency", map[string]any{
 				"question": q, "budget_ms": c.l2Budget, "route_implemented": l2Exists,
 				"probe_http_status": code, "probe_error": errStr(err),
@@ -238,7 +298,7 @@ func run(c cfg) (*verdict.Report, error) {
 		var hits []int
 		all := append(append([]probe{}, gen...), cur...)
 		for _, p := range all {
-			payload, d, err := m.call("recall", map[string]any{"query": p.Query, "k": 10, "tokenBudget": 900})
+			payload, d, err := m.call("recall", map[string]any{"query": p.Query, "k": 10, "tokenBudget": 1500})
 			ms := plantLatency(c, float64(d.Microseconds())/1000.0)
 			lats = append(lats, ms)
 			ids := handleIDs(payload)
@@ -251,13 +311,10 @@ func run(c cfg) (*verdict.Report, error) {
 			}
 			hits = append(hits, rankOf(ids, p.Expected))
 		}
-		got := p95(lats)
-		add("latency", "l3.latency.p95", state(len(lats) > 0 && got <= c.l3Budget),
-			c.ev("l3-latency", map[string]any{
-				"question": q, "p95_ms": got, "p50_ms": median(lats), "budget_ms": c.l3Budget,
-				"n": len(lats), "plant": c.plant,
-				"verdict_meaning": "FAIL means full semantic retrieval is over the L3 budget as measured by a client",
-			}), &verdict.Score{Value: got, Max: 0})
+		st, evp, sc := latencyUnit(c, "l3-latency", q, lats, c.l3Budget, map[string]any{
+			"plant": c.plant, "token_budget_used": 1500,
+		})
+		add("latency", "l3.latency.p95", st, evp, sc)
 
 		r10, mrr := metrics(hits)
 		add("quality", "l3.quality.r_at_10", state(len(hits) > 0 && r10 >= c.rAt10Floor),
@@ -275,6 +332,14 @@ func run(c cfg) (*verdict.Report, error) {
 			}), &verdict.Score{Value: mrr, Max: 1.0})
 	}
 
+	// An instrument that could not record what it saw has failed. Checked before
+	// the report is constructed, so a run with unwritable evidence cannot emit a
+	// verdict about the daemon at all.
+	if len(c.evErrs) > 0 {
+		return nil, fmt.Errorf("L7: evidence could not be written (%d failures), "+
+			"refusing to emit a verdict backed by pointers to nothing: %s",
+			len(c.evErrs), strings.Join(c.evErrs, "; "))
+	}
 	return verdict.NewReport(id, "canary.known-id-roundtrips", comps)
 }
 
@@ -283,7 +348,7 @@ func run(c cfg) (*verdict.Report, error) {
 //   - "latency" is the slow-regression shape
 //   - "empty"   is the REWARD HACK shape: return nothing, very fast. The gate
 //     must reject it on quality even though every latency unit goes green.
-func plantLatency(c cfg, ms float64) float64 {
+func plantLatency(c *cfg, ms float64) float64 {
 	switch c.plant {
 	case "latency":
 		return ms + 500.0
@@ -386,7 +451,7 @@ func prefix(s string, n int) string {
 
 // emit prints the report and its accounting. Aggregates never travel without
 // their components (STYLE.md Law 3), so every component line is printed.
-func emit(c cfg, r *verdict.Report) {
+func emit(c *cfg, r *verdict.Report) {
 	a := r.Accounting()
 	b, _ := json.MarshalIndent(r, "", "  ")
 	p := filepath.Join(c.evidenceDir, c.epoch, "report.json")
@@ -436,4 +501,129 @@ func sqlQuoteList(vals []string) string {
 		parts = append(parts, "'"+strings.ReplaceAll(v, "'", "''")+"'")
 	}
 	return strings.Join(parts, ",")
+}
+
+
+// REQUIRED_ZERO_VIOLATION_N is the sample size at which observing ZERO
+// over-budget requests supports "at most 5% of requests exceed budget" at 95%
+// confidence. With k=0 violations the exact one-sided upper bound is
+// 1 - 0.05^(1/n), so n=19 supports only 14.6%, n=40 supports 7.2%, and n=59 is
+// the first n that reaches 5%.
+//
+// This exists because the gate used to report a nearest-rank "p95" over as few
+// as 19 observations, where that statistic IS the sample maximum. If 6% of real
+// requests exceeded budget, a 19-request sample would miss every one of them
+// about 31% of the time and the gate would print a passing P95. A percentile
+// name does not confer the evidence a percentile claim needs.
+const REQUIRED_ZERO_VIOLATION_N = 59
+
+// violationUpperBound returns the one-sided 95% upper bound on the true
+// violation rate given k violations in n samples. Exact for k=0; for k>0 it
+// returns the observed rate, which UNDERSTATES the bound, so the caller must
+// treat any nonzero k as a failure rather than as a bounded estimate.
+func violationUpperBound(k, n int) float64 {
+	if n <= 0 {
+		return 1.0
+	}
+	if k == 0 {
+		return 1.0 - math.Pow(0.05, 1.0/float64(n))
+	}
+	return float64(k) / float64(n)
+}
+
+// latencyUnit turns a latency sample into a verdict that states what the sample
+// can actually support. Three outcomes, and the middle one is the point:
+//
+//	FAIL  -- at least one request exceeded budget
+//	ERROR -- zero violations, but too few samples to support the claim. This
+//	         TAINTS the report rather than passing it, because "I saw no
+//	         violations in 19 tries" and "violations are below 5%" are
+//	         different statements and only one of them is the contract.
+//	PASS  -- zero violations with enough samples to bound the rate at 5%
+func latencyUnit(c *cfg, unit, question string, lats []float64, budget float64,
+	extra map[string]any) (verdict.State, string, *verdict.Score) {
+	violations := 0
+	for _, ms := range lats {
+		if ms > budget {
+			violations++
+		}
+	}
+	n := len(lats)
+	bound := violationUpperBound(violations, n)
+	st := verdict.Pass
+	meaning := "PASS: zero over-budget requests, with enough samples to bound the violation rate at 5%"
+	switch {
+	case n == 0:
+		st, meaning = verdict.Error, "ERROR: no samples taken; an empty measurement is not a pass"
+	case violations > 0:
+		st, meaning = verdict.Fail, "FAIL: at least one request exceeded the budget"
+	case n < REQUIRED_ZERO_VIOLATION_N:
+		st = verdict.Error
+		meaning = fmt.Sprintf("ERROR: zero violations in %d samples bounds the true rate only at "+
+			"%.1f%%, not the 5%% the budget claim needs; %d samples are required. "+
+			"Insufficient evidence is not a pass.", n, bound*100, REQUIRED_ZERO_VIOLATION_N)
+	}
+	payload := map[string]any{
+		"question":                question,
+		"n":                       n,
+		"violations":              violations,
+		"violation_rate_obs":      violationUpperBound(violations, max(n, 1)) * 0, // placeholder replaced below
+		"violation_rate_95_upper": bound,
+		"budget_ms":               budget,
+		"p50_ms":                  median(lats),
+		"p95_sample_ms":           p95(lats),
+		"max_ms":                  sampleMax(lats),
+		"required_n_for_claim":    REQUIRED_ZERO_VIOLATION_N,
+		"NOTE": "p95_sample_ms is a nearest-rank SAMPLE statistic. At n below " +
+			"the required size it is simply the sample maximum and must not be " +
+			"quoted as a population P95.",
+		"verdict_meaning": meaning,
+	}
+	if n > 0 {
+		payload["violation_rate_obs"] = float64(violations) / float64(n)
+	}
+	for k, v := range extra {
+		payload[k] = v
+	}
+	return st, c.ev(unit, payload), &verdict.Score{Value: p95(lats), Max: 0}
+}
+
+func sampleMax(xs []float64) float64 {
+	if len(xs) == 0 {
+		return math.NaN()
+	}
+	m := xs[0]
+	for _, v := range xs {
+		if v > m {
+			m = v
+		}
+	}
+	return m
+}
+
+
+// someLiveAtomIDs returns up to n DISTINCT live atom ids, newest first.
+//
+// L1 used to fetch ONE id in a loop, after the canary had already fetched that
+// same id, so every timed request was a warm repeat of a pre-warmed lookup. If
+// first access to an uncached atom cost 15ms and repeat access cost 0.5ms, the
+// gate excluded the 15ms request by construction and passed. Distinct ids make
+// each timed request a first access for that row.
+func someLiveAtomIDs(storePath string, n int) ([]string, error) {
+	rows, err := query(storePath, fmt.Sprintf(
+		"SELECT id FROM atoms WHERE status='live' AND kind='atom' "+
+			"ORDER BY created_at DESC LIMIT %d", n))
+	if err != nil {
+		return nil, err
+	}
+	out := make([]string, 0, len(rows))
+	for _, r := range rows {
+		if s, ok := r["id"].(string); ok && s != "" {
+			out = append(out, s)
+		}
+	}
+	if len(out) == 0 {
+		return nil, fmt.Errorf("no live atoms: L1 has nothing provably present to ask for")
+	}
+	return out, nil
 }
