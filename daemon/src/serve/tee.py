@@ -44,6 +44,9 @@ __all__ = [
     "handleTeeEmit",
     "TEE_EMIT_TOOLS",
     "checkLocalWriteRequest",
+    "checkAllowedHost",
+    "allowedHostsFromEnv",
+    "DEFAULT_ALLOWED_HOSTS",
     "checkRequestOrigin",
     "loadTeeSecret",
     "defaultTeeSecretPath",
@@ -266,6 +269,66 @@ def _isLoopbackUrl(value):
     return (parts.hostname or "").lower() in _LOOPBACK_HOSTS
 
 
+# Hostnames this daemon will answer to. Loopback ONLY by default: a daemon that
+# ships trusting a public hostname trusts it in every deployment it ever lands
+# in. A deployment that fronts this with a reverse proxy adds its own hostname
+# through PENSIVE_V3_ALLOWED_HOSTS, which EXTENDS this set rather than replacing
+# it -- replacing would let a config typo drop loopback and lock every local
+# agent out of its own memory.
+DEFAULT_ALLOWED_HOSTS = frozenset({"127.0.0.1", "localhost", "[::1]", "::1"})
+
+ALLOWED_HOSTS_ENV = "PENSIVE_V3_ALLOWED_HOSTS"
+
+
+def allowedHostsFromEnv():
+    """The configured host allowlist: the loopback defaults plus any extras."""
+    hosts = set(DEFAULT_ALLOWED_HOSTS)
+    for entry in (os.environ.get(ALLOWED_HOSTS_ENV) or "").split(","):
+        entry = entry.strip().lower()
+        if entry:
+            hosts.add(entry)
+    return hosts
+
+
+def _hostnameOf(hostHeader):
+    """Host header -> bare hostname, port removed, IPv6 brackets preserved."""
+    value = hostHeader.strip().lower()
+    if value.startswith("["):
+        end = value.find("]")
+        return value[:end + 1] if end != -1 else value
+    return value.split(":", 1)[0]
+
+
+def checkAllowedHost(headers, allowed):
+    """Host half of the guard -> ``None`` to allow, else ``(status, body)``.
+
+    Closes the DNS-rebinding path the Origin check cannot: the attacker points a
+    hostname they control at 127.0.0.1, the browser then treats the response as
+    same-origin so CORS never applies, and a GET is permitted to carry no Origin
+    at all. Host is what the browser fills in from the URL it thinks it is
+    addressing, so an unknown value there IS the attack, and unlike Origin its
+    ABSENCE is refused rather than allowed -- HTTP/1.1 requires it, so a missing
+    Host is a malformed request, not a local process being terse.
+
+    Matched on the bare hostname: the port is deployment detail, and pinning it
+    would break the moment anyone moved the daemon.
+    """
+    norm = _normalizeHeaders(headers)
+    if norm is None:
+        return 403, {"error": "request metadata unavailable",
+                     "reason": "no-request-headers"}
+    host = norm.get("host")
+    if not host:
+        return 403, {"error": "missing Host header", "reason": "no-host"}
+    name = _hostnameOf(host)
+    if name not in allowed:
+        return 403, {
+            "error": f"unrecognized Host refused: {host!r}",
+            "reason": "unknown-host",
+        }
+    return None
+
+
 def checkRequestOrigin(headers):
     """Origin/Referer half of the guard -> ``None`` to allow, else ``(status, body)``.
 
@@ -277,6 +340,13 @@ def checkRequestOrigin(headers):
 
     Absent Origin AND Referer is allowed: that is what a local process sends. The
     check is "if the browser told us where this came from, it had better be here".
+
+    LIMIT, corrected 2026-08-13: this does NOT by itself close DNS rebinding, as
+    an earlier version of this docstring claimed. A rebound same-origin GET may
+    omit Origin entirely and suppress Referer, and the permitted absence above is
+    exactly the gap it walks through. :func:`checkAllowedHost` is the half that
+    closes it, because Host is the one header the browser sets from the URL it
+    believes it is talking to and the page cannot forge away.
     """
     norm = _normalizeHeaders(headers)
     if norm is None:

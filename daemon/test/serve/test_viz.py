@@ -96,7 +96,11 @@ def _http_scope(path, query_string=b""):
         "path": path,
         "raw_path": path.encode("ascii"),
         "query_string": query_string,
-        "headers": [],
+        # HTTP/1.1 requires Host and uvicorn always supplies it, so a scope with
+        # no headers models a request this daemon can never actually receive.
+        # The Host guard (DNS-rebinding defense) reads it, and a fixture that
+        # omitted it was asserting against a shape reality does not produce.
+        "headers": [(b"host", b"127.0.0.1:5999")],
         "client": ("127.0.0.1", 50123),
         "server": ("127.0.0.1", 5999),
     }

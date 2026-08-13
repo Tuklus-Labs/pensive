@@ -45,6 +45,7 @@ if str(_SRC) not in sys.path:
 from serve.mcp import ServeContext, buildServer, SERVER_NAME  # noqa: E402
 from serve.tee import (  # noqa: E402
     Counters, handleTeeEmit, checkLocalWriteRequest, checkRequestOrigin,
+    checkAllowedHost, allowedHostsFromEnv,
     loadTeeSecret, defaultTeeSecretPath, LOCAL_WRITE_HEADER,
 )
 from serve.shadow import runShadow, defaultShadowLogPath  # noqa: E402
@@ -142,6 +143,7 @@ def buildApp(ctx):
     from mcp.server.streamable_http_manager import StreamableHTTPSessionManager
     from starlette.applications import Starlette
     from starlette.datastructures import Headers
+    from starlette.middleware import Middleware
     from starlette.responses import JSONResponse
     from starlette.routing import Mount, Route
 
@@ -264,7 +266,37 @@ def buildApp(ctx):
         async with manager.run():
             yield
 
+    # Host allowlist, applied as MIDDLEWARE rather than per route.
+    #
+    # A per-route check is a hand-maintained coverage list, and those fail in the
+    # same direction as the defect they exist to catch: whoever adds the next
+    # route is the same person who forgets to guard it. Middleware derives the
+    # coverage from the app instead, so a route cannot be added unguarded.
+    #
+    # Closes the DNS-rebinding path that the Origin check structurally cannot:
+    # a rebound same-origin GET may omit Origin and suppress Referer, and that
+    # absence is deliberately ALLOWED because every non-browser client on this
+    # box sends neither. Host is the header the page cannot forge away.
+    allowedHosts = allowedHostsFromEnv()
+    _log(f"host allowlist: {sorted(allowedHosts)}")
+
+    class HostGuard:
+        def __init__(self, app):
+            self.app = app
+
+        async def __call__(self, scope, receive, send):
+            if scope["type"] != "http":
+                await self.app(scope, receive, send)
+                return
+            rejection = checkAllowedHost(Headers(scope=scope), allowedHosts)
+            if rejection is not None:
+                status, payload = rejection
+                await JSONResponse(payload, status_code=status)(scope, receive, send)
+                return
+            await self.app(scope, receive, send)
+
     app = Starlette(
+        middleware=[Middleware(HostGuard)],
         routes=[
             Route("/tee/emit", tee_emit, methods=["POST"]),
             Route("/shadow/recall", shadow_recall, methods=["POST"]),

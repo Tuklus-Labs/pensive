@@ -567,7 +567,7 @@ def httpApp(embedder, tmp_path, monkeypatch):
     s = openStore(tmp_path / "mem.db")
     try:
         c = ServeContext(s, embedder, MODEL_ID, agent="heph")
-        with TestClient(buildApp(c)) as client:
+        with TestClient(buildApp(c), base_url="http://127.0.0.1") as client:
             yield client, s
     finally:
         s.close()
@@ -847,7 +847,7 @@ def test_missing_secret_makes_writes_fail_closed_not_open(ctx, counters, tmp_pat
         lambda *a, **k: _real_connect(*a, **{**k, "check_same_thread": False}))
     monkeypatch.setenv(_SECRET_FILE_ENV, str(tmp_path / "absent" / "tee.secret"))
 
-    with TestClient(buildApp(ctx)) as client:
+    with TestClient(buildApp(ctx), base_url="http://127.0.0.1") as client:
         r = client.post("/tee/emit", content=_emitBody(), headers=_localHeaders())
 
     assert r.status_code == 503
@@ -929,7 +929,7 @@ def test_http_surface_end_to_end_moves_counters(embedder, _rerankerWarm, tmp_pat
         _put(s, "acoustic modems trade range for data rate at the surface buoy")
         c = ServeContext(s, embedder, MODEL_ID, agent="heph")
         app = buildApp(c)
-        with TestClient(app) as client:
+        with TestClient(app, base_url="http://127.0.0.1") as client:
             assert client.get("/status").json()["counters"] == {
                 "teeReceived": 0, "teeFailed": 0, "shadowLogged": 0, "shadowFailed": 0,
                 "teeRejected": 0, "shadowRejected": 0}
