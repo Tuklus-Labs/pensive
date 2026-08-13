@@ -304,6 +304,110 @@ def _require(args, names):
             raise ValueError(f"missing required field: {name}")
 
 
+# Provenance ``source`` values that identify a SYSTEM writer, not an agent. A
+# caller that can set these disguises a hand-written atom as 283k-row bulk
+# corpus or as operator tooling output. ``person-`` is prefix-reserved because
+# ``lifecycle/supersede_detect.py`` EXCLUDES those rows from supersession
+# candidates, so forging it is a durability claim the caller has no right to
+# make. Verified 2026-08-12: the live store holds exactly these four sources.
+_RESERVED_SOURCES = frozenset({"bulk-import", "repair-tool", "edge-campaign"})
+_RESERVED_SOURCE_PREFIXES = ("person-",)
+
+# Native recall/pensive_recall bounds. Not copied from recall_records' 1..32,
+# because legitimate callers on this box use k=50; the job here is to refuse
+# nonsense, not to retune the tool. k=-1 is the dangerous one: engine.py ends
+# with ``assessed[:k]`` and Python slicing turns a negative k into "everything
+# except the last", so it does not error, it silently returns the entire fused
+# candidate set at full body length.
+_RECALL_K_MAX = 200
+_RECALL_TOKEN_BUDGET_MAX = 8000
+_RECALL_QUERY_MAX = 8192
+
+# Emit body cap, in characters. ``_truncateWords`` splits on whitespace, so a
+# single 200,000-character token is "one word" and passed straight through to
+# putAtom and then to the embedder. Generous on purpose: the largest live pin is
+# 2,165 characters. Long-form material wants its own kind, not a bigger atom.
+_EMIT_TEXT_MAX = 32_000
+
+
+def _rejectReservedSource(source):
+    """Refuse a caller-supplied provenance ``source`` reserved for the system."""
+    if not isinstance(source, str):
+        return
+    if source in _RESERVED_SOURCES or source.startswith(_RESERVED_SOURCE_PREFIXES):
+        raise ValueError(
+            f"provenance.source {source!r} is reserved for system writers and "
+            f"cannot be set by a caller"
+        )
+
+
+def _rejectEscapingSourceRef(sourceRef):
+    """Refuse a caller ``sourceRef`` whose SHAPE can leave its import root.
+
+    ``recall.enrich.locateChunk`` resolves a stored sourceRef and ``read_text()``s
+    it during ordinary recall, so this string selects a file the daemon opens.
+    ``refs.refToPath`` rejects ``..`` segments but joined an absolute remainder,
+    and ``Path('/a') / '/etc/passwd'`` is ``/etc/passwd`` -- pathlib drops the
+    left side. That is fixed in refs.py; this is the second lock, at the trust
+    boundary, because the two guards fail differently and a caller should never
+    have been able to aim the reader in the first place.
+
+    Syntactic on purpose, so it does not depend on refs.py's semantics. Verified
+    2026-08-12: zero of the store's existing source_ref values contain any of
+    these, so no legitimate write is refused.
+    """
+    if not isinstance(sourceRef, str):
+        return
+    if sourceRef.startswith("/") or "//" in sourceRef or ".." in sourceRef:
+        raise ValueError(
+            f"provenance.sourceRef {sourceRef!r} is not a repo-relative ref: "
+            f"leading slash, '//', and '..' are refused at the write boundary"
+        )
+
+
+def _boundedEmitText(text, name):
+    """Cap an emit body by CHARACTERS, which is what the store and the embedder
+    actually consume. The pre-existing 500-word cap counts whitespace-separated
+    tokens and so does not bound a single long token at all."""
+    if isinstance(text, str) and len(text) > _EMIT_TEXT_MAX:
+        raise ValueError(
+            f"{name} is {len(text)} characters, over the {_EMIT_TEXT_MAX} cap"
+        )
+    return text
+
+
+def _boundedRecallArgs(args, kName):
+    """Bound the native recall surface. Enforced in the HANDLER, not only in the
+    tool schema, because the tee edge dispatches these handlers without ever
+    passing through MCP's jsonschema validation."""
+    raw = args.get(kName)
+    if raw is not None:
+        try:
+            k = int(raw)
+        except (TypeError, ValueError):
+            raise ValueError(f"recall: {kName} must be an integer")
+        if not 1 <= k <= _RECALL_K_MAX:
+            raise ValueError(f"recall: {kName} must be in 1..{_RECALL_K_MAX}")
+    budget = args.get("tokenBudget")
+    if budget is not None:
+        try:
+            b = int(budget)
+        except (TypeError, ValueError):
+            raise ValueError("recall: tokenBudget must be an integer")
+        if not 1 <= b <= _RECALL_TOKEN_BUDGET_MAX:
+            raise ValueError(
+                f"recall: tokenBudget must be in 1..{_RECALL_TOKEN_BUDGET_MAX}"
+            )
+    query = args.get("query")
+    if isinstance(query, str) and len(query) > _RECALL_QUERY_MAX:
+        # With the aux dense signal on, this string is POSTed verbatim to a third
+        # party, so an unbounded query is an egress hole as well as a compute one.
+        raise ValueError(
+            f"recall: query is {len(query)} characters, over the "
+            f"{_RECALL_QUERY_MAX} cap"
+        )
+
+
 def _boundedText(value, name, minimum, maximum):
     if not isinstance(value, str):
         raise ValueError(f"recall_records: {name} must be a string")
@@ -446,11 +550,14 @@ def _sanitizeAgent(raw):
     (``/root/v3_publication_controller``, 8 rows as of 2026-08-12), and a
     query-string identity is a new surface, so it is validated where it enters.
 
-    Deliberately NOT applied to the caller-supplied ``agent`` argument: that path
-    promises byte-identical behavior to every existing caller, and tightening it
-    here would be an unreviewed behavior change to a live daemon. The malformed
-    values already in the store arrived that way and are reported by
-    ``aegis-pensive-who``; cleaning them is a separate, operator-gated job.
+    Applied to EVERY write path as of 2026-08-12, including the caller-supplied
+    ``agent`` argument. It previously guarded only this one, and the exemption
+    was written down four lines under "a wrong stamp is counterfeit provenance",
+    which is how a guard becomes decorative: it existed, it was correct, and the
+    main door did not call it. The malformed values already in the store arrived
+    before this and are reported by ``aegis-pensive-who``; cleaning them is a
+    separate, operator-gated job, because a wrong stamp is worse than a NULL and
+    a guess is worse than both.
     """
     if not isinstance(raw, str):
         return None
@@ -506,27 +613,37 @@ def _transportAgent():
 
 
 def _resolveAgent(ctx, args=None):
-    """Agent precedence, most specific wins:
+    """Agent precedence. The CONNECTION outranks a caller's claim:
 
-    1. the caller-supplied ``agent`` argument  (an explicit claim about one emit)
-    2. the transport's ``?agent=``             (who this connection belongs to)
+    1. the transport's ``?agent=``             (what this client actually is)
+    2. the caller-supplied ``agent`` argument  (a claim, honored only when the
+                                                connection declared nothing)
     3. the daemon-wide ``PENSIVE_V3_AGENT``    (who this whole process is)
     4. None                                    (honestly unattributed)
 
-    The order matters: a per-emit claim beats a per-connection default beats a
-    per-process default. Nothing here ever infers an identity, it only reads one
-    that was declared somewhere.
+    Inverted 2026-08-12. The argument used to win, and it was the ONLY input
+    that skipped ``_sanitizeAgent``, so a client connected as ``?agent=grok``
+    could write rows stamped ``heph``, or stamped with a filesystem path, or
+    with a reserved ``person-`` prefix that ``lifecycle/supersede_detect.py``
+    treats as an exclusion. That made this column an honesty mechanism rather
+    than a boundary, while the surrounding trust model read it as authorship.
+
+    A per-emit claim cannot outrank what the connection is, because the claim is
+    made by the same party the claim is about. The argument is still honored for
+    CLI and stdio callers, which genuinely have no transport identity, and every
+    path is sanitized now. Blast radius was measured before inverting: no caller
+    on this box passes an ``agent`` argument.
     """
-    agent = None
+    transport = _transportAgent()
+    if transport:
+        return transport
     if isinstance(args, dict):
-        candidate = args.get("agent")
-        if isinstance(candidate, str) and candidate.strip():
-            agent = candidate.strip()
-    if agent is None:
-        agent = _transportAgent()
-    if agent is None and ctx.agent:
-        agent = ctx.agent
-    return agent
+        claimed = _sanitizeAgent(args.get("agent"))
+        if claimed:
+            return claimed
+    if ctx.agent:
+        return _sanitizeAgent(ctx.agent)
+    return None
 
 
 def _emitProvenance(ctx, args=None):
@@ -610,6 +727,7 @@ def handle_emit_atom(ctx, args):
         args["shape"], args["approach"], outcome, args["reason"], principle,
         domain=args.get("domain", ""), narrative=args.get("narrative", ""),
     )
+    _boundedEmitText(text, "emit: atom body")
     atomId = putAtom(ctx.store, {
         "text": text,
         "kind": "atom",
@@ -658,7 +776,7 @@ def handle_emit_failure(ctx, args):
 
 def handle_emit_narrative(ctx, args):
     _require(args, ["project", "narrative"])
-    text = _truncateWords(args["narrative"])
+    text = _boundedEmitText(_truncateWords(args["narrative"]), "emit: narrative")
     putAtom(ctx.store, {
         "text": text,
         "kind": "narrative",
@@ -680,6 +798,7 @@ def handle_emit_snapshot(ctx, args):
         lines.append("dead ends: " + "; ".join(deadEnds))
     if nextSteps:
         lines.append("next steps: " + "; ".join(nextSteps))
+    _boundedEmitText("\n".join(lines), "emit: snapshot")
     putAtom(ctx.store, {
         "text": "\n".join(lines),
         "kind": "snapshot",
@@ -693,6 +812,7 @@ def handle_emit_snapshot(ctx, args):
 
 def handle_pensive_recall(ctx, args):
     _require(args, ["query"])
+    _boundedRecallArgs(args, "limit")
     query = args["query"]
     project = args.get("project", "") or None      # "" (legacy default) -> no filter
     limit = int(args.get("limit", 10))
@@ -758,6 +878,7 @@ def handle_pensive_analytics(ctx, args):
 def handle_recall(ctx, args):
     """v3 native recall: return the rich tiered payload (not the legacy listing)."""
     _require(args, ["query"])
+    _boundedRecallArgs(args, "k")
     query = args["query"]
     project = args.get("project") or None
     k = int(args.get("k", ctx.defaultK))
@@ -989,6 +1110,9 @@ def handle_correct(ctx, args):
         raise ValueError(f"correct: atom {oldId!r} not found")
 
     prov = args.get("provenance") or {}
+    _rejectReservedSource(prov.get("source"))
+    _rejectEscapingSourceRef(prov.get("sourceRef"))
+    _boundedEmitText(newText, "correct: newText")
     provenance = {"source": prov.get("source") or _EMIT_SOURCE}
     for key in ("agent", "sessionId", "sourceRef"):
         if prov.get(key) is not None:

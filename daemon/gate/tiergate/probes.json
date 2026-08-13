@@ -1,0 +1,26 @@
+[
+  {
+    "query": "what does context compaction do to the Heph persona",
+    "expected": ["01KZEC00QF9FEZE2Y5V2MKYBK3"]
+  },
+  {
+    "query": "chassis fans slaved to the GPU temp sensor not the CPU thermometer",
+    "expected": ["01KX0CZYKE5ZD9WHCJBBMJ87GB"]
+  },
+  {
+    "query": "how do you verify a deploy is actually live before believing a gate is green",
+    "expected": ["01KZEC1DS2PRS82B3SGDKXCJMG"]
+  },
+  {
+    "query": "an agent using a shared memory store as her own memory needs retrieve and write",
+    "expected": ["01KZW81H40JVJ9VYBDNNNB60YJ"]
+  },
+  {
+    "query": "why standing rules cannot live in an event-only memory store",
+    "expected": ["01KZW90DPDQDA097SXMMDAZGGS"]
+  },
+  {
+    "query": "zsh does not word split unquoted variables and the error surfaces somewhere misleading",
+    "expected": ["01KZVT9YBSYWMZ5ZJQEJ31QASS"]
+  }
+]

@@ -1,0 +1,4 @@
+# Build output and per-run evidence. The gate's VERDICT belongs in the repo via
+# a committed report; the raw dumps and the binary do not.
+tiergate
+.gate-evidence/

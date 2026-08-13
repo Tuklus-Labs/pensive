@@ -4,8 +4,15 @@ THE CLAIM UNDER TEST, stated so a drifted question reads as a wrong sentence:
 
     An MCP client that declares an identity in its connection URL produces
     provenance rows stamped with that identity, without any caller passing an
-    ``agent`` argument -- and a client that declares nothing produces NULL,
-    not an accidental default.
+    ``agent`` argument; a client that declares nothing produces NULL, not an
+    accidental default; and a caller-supplied ``agent`` argument CANNOT
+    override a declared connection identity.
+
+The third clause was added 2026-08-12 and reverses what P3 below used to
+assert. The argument used to win, and it was the one input that skipped
+``_sanitizeAgent``, so any client could write rows attributed to any other
+agent. The claim moved because the behavior moved; the sentence and the check
+have to stay the same artifact.
 
 Why this is an END-TO-END test against a real daemon rather than a unit test
 with a stubbed context: the whole mechanism depends on the MCP SDK populating
@@ -149,7 +156,7 @@ def test_connection_declared_agent_is_stamped_without_caller_cooperation(tmp_pat
             _emit(f"{base}?agent=probe-grok", "PROBE_DECLARED alpha")
             # P2 true negative: no declaration anywhere -> honestly unattributed
             _emit(base, "PROBE_UNDECLARED bravo")
-            # P3 precedence: an explicit per-emit arg beats the connection
+            # P3 forgery: a per-emit arg CANNOT override what the connection is
             _emit(f"{base}?agent=probe-grok", "PROBE_PRECEDENCE charlie",
                   agentArg="probe-explicit")
             # P4 the column is guarded: a path is not an identity
@@ -179,8 +186,13 @@ def test_connection_declared_agent_is_stamped_without_caller_cooperation(tmp_pat
     expect("P2 undeclared", results["undeclared"], None,
            "a client declaring nothing must stay honestly unattributed, never "
            "inherit a neighbouring connection's identity")
-    expect("P3 precedence", results["precedence"], "probe-explicit",
-           "an explicit per-emit argument outranks the per-connection default")
+    expect("P3 forgery refused", results["precedence"], "probe-grok",
+           "a per-emit argument is a CLAIM, made by the same party it is about, "
+           "so it cannot outrank what the connection actually is; before "
+           "2026-08-12 this probe wanted 'probe-explicit' and that inverted "
+           "precedence was the forgery hole (a client on ?agent=grok could "
+           "write rows stamped heph). The off-transport contract is unchanged "
+           "and still pinned by test_resolve_agent_precedence_without_a_transport")
     expect("P4 malformed", results["malformed"], None,
            "a filesystem path is not an identity and must be refused at the write "
            "boundary, not stored and cleaned up later")
