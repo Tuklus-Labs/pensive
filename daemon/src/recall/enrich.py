@@ -31,6 +31,32 @@ __all__ = ["locateChunk", "relatedMemory", "Enricher"]
 # Files over this size are not searched (binary blobs, giant logs).
 _MAX_FILE_BYTES = 5 * 1024 * 1024
 
+# An entity value carried by more than this many live atoms is a HUB and is
+# excluded from the related-memory query entirely.
+#
+# relatedMemory scores by sum(1/freq), so a hub already contributes almost
+# nothing to the ranking. It contributed nearly all of the COST, because it was
+# filtered after the join rather than before it: the value was joined, grouped
+# and summed across every atom carrying it, then down-weighted to irrelevance.
+# Measured on the live store 2026-08-13, per chunk:
+#
+#     getAtom (+ all provenance)      0.01 ms
+#     _sourceRef                      0.01 ms
+#     _edgeRelations                  0.08 ms
+#     relatedMemory                1182.23 ms   <- the whole enrichment cost
+#
+# Only 2,810 `relates` edges exist across ~283k live chunks, so nearly every
+# chunk takes this fallback, and L3-with-enrichment measured 2,323 ms p50
+# against a 125 ms budget.
+#
+# 100 against ~675k entity facets over ~212k distinct values (mean 3.2 per
+# value): a value at the ceiling contributes 0.01 to a score where a singleton
+# contributes 1.0, so nothing that could plausibly decide a ranking is dropped.
+# Identical in shape to the lexical DF prune in recall/signals.py, and worth
+# recognizing on sight: a term whose score weight is near zero dominating the
+# work because the filter sits downstream of the join.
+HUB_ENTITY_MAX_FREQ = 100
+
 # Collapse all whitespace runs to single spaces for matching; the stored chunk
 # and the on-disk file may disagree about blank lines and indentation width.
 _WS_RE = re.compile(r"\s+")
@@ -111,15 +137,31 @@ def relatedMemory(store, atomId, limit=3):
         "  WHERE f.key = 'entity' AND a.status = 'live'"
         "  AND f.value IN (SELECT value FROM mine)"
         "  GROUP BY f.value"
+        # The ceiling belongs HERE, upstream of the outer join, so a hub value
+        # never reaches it. Putting it in the score instead is what made this
+        # query cost a second per chunk.
+        "  HAVING n <= ?"
         ") "
         "SELECT f.atom_id, SUM(1.0 / freq.n) AS score "
         "FROM facets f "
         "JOIN freq ON freq.value = f.value "
         "JOIN atoms a ON a.id = f.atom_id "
-        f"WHERE f.key = 'entity' AND a.status = 'live' AND a.kind IN ({kindMarks}) "
+        # The value predicate has to be repeated HERE, not left to the join.
+        # Without it SQLite drives the outer query from `f` with
+        # `idx_facets_kv (key=?)` alone -- scanning every entity facet in the
+        # store (~676k), joining each to atoms, and probing the freq co-routine
+        # per row. EXPLAIN QUERY PLAN says so in one line; five rounds of
+        # reasoning about it did not. Restricting on `freq` rather than `mine`
+        # applies the hub ceiling to the scan as well as to the score.
+        #
+        #   1182 ms  original
+        #     46 ms  + value predicate (index becomes key AND value)
+        #     24 ms  + restricted to the ceiling-filtered values
+        f"WHERE f.key = 'entity' AND f.value IN (SELECT value FROM freq) "
+        f"AND a.status = 'live' AND a.kind IN ({kindMarks}) "
         "AND f.atom_id != ? "
         "GROUP BY f.atom_id ORDER BY score DESC, f.atom_id LIMIT ?",
-        (atomId, *_MEMORY_KINDS, atomId, limit),
+        (atomId, HUB_ENTITY_MAX_FREQ, *_MEMORY_KINDS, atomId, limit),
     ).fetchall()
     out = []
     for memId, _score in rows:

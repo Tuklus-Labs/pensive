@@ -367,9 +367,18 @@ def test_hnsw_is_a_vector_index():
 # --------------------------------------------------------------------------- #
 
 
-def test_hnsw_threshold_default_is_200k():
-    """The plan's default, pinned as a named constant so a drift is loud."""
-    assert HNSW_THRESHOLD == 200_000
+def test_hnsw_threshold_is_set_by_cache_footprint_not_search_latency():
+    """Pinned as a named constant so a drift is loud.
+
+    Changed from 200,000 to 5,000 on 2026-08-13. The claim moved with the number:
+    the old threshold said "below this, an exact scan is free", which is true of
+    the scan itself (4.22ms over 16,657 vectors) and false of its effect on the
+    NEXT stage. A flat scan streams 24.5 MiB through cache and evicts the
+    embedding model, so the following encode refills from RAM: 60.48ms after a
+    flat search versus 6.82ms after an HNSW one. Request N searches and request
+    N+1 encodes, so that interleave is the serving pattern, not an edge case.
+    """
+    assert HNSW_THRESHOLD == 5_000
 
 
 def test_select_index_picks_flat_below_threshold(embedder, store):

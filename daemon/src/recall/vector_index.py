@@ -28,7 +28,31 @@ __all__ = ["VectorIndex", "FlatIndex", "selectIndex", "buildClassIndexes",
 # The plan's default; a named constant so a change is loud and tests can pin it.
 # Serving today is far below it (shadow scale), so the switch is a scale path, not
 # a behavior change now.
-HNSW_THRESHOLD = 200_000
+# Lowered from 200,000 on 2026-08-13, on a measurement the original number could
+# not have accounted for.
+#
+# The old rationale was that below the threshold an exact flat scan is FREE, and
+# on its own terms that is still true: flat search over the 16,657-vector memory
+# class costs 4.22ms, which is not slow. The cost it misses is what a flat scan
+# does to the stage that runs NEXT. A flat search streams the whole 24.5 MiB
+# float32 matrix through CPU cache and evicts the embedding model's weights, so
+# the following query's encode has to refill from RAM:
+#
+#     memory index    search      encode-after-search
+#     FLAT            4.22 ms     60.48 ms
+#     HNSW            0.30 ms      6.82 ms
+#
+# That alternation IS the serving pattern -- request N searches, request N+1
+# encodes -- so the pathological interleave is the normal case, and the flat
+# index was costing 8.9x on a stage that does not appear in its own measurement.
+# An HNSW walk touches a small fraction of the same data and leaves the model
+# resident.
+#
+# 5,000 rather than 0: for a genuinely tiny population the graph build is not
+# worth its own overhead, and an exact scan over a few thousand vectors has a
+# cache footprint small enough not to evict anything. The deciding factor is
+# FOOTPRINT, not search latency, which is the correction this constant encodes.
+HNSW_THRESHOLD = 5_000
 
 
 class VectorIndex(abc.ABC):
@@ -133,7 +157,9 @@ def selectIndex(store, modelId, kinds=None):
     """Build and return the right ``VectorIndex`` for this population's size.
 
     Below :data:`HNSW_THRESHOLD` embedded live atoms (of ``kinds``, if given), an
-    exact ``FlatIndex``; at or above it, the approximate ``HnswIndex``. Returns the
+    exact ``FlatIndex``; at or above it, the approximate ``HnswIndex``. The
+    threshold is set by CACHE FOOTPRINT rather than by search latency -- see the
+    constant, where the measurement is recorded. Returns the
     index already BUILT. ``kinds`` scopes the index to one kind-class so a caller
     can hold one index per population; ``kinds=None`` preserves the original
     single-index contract (every live embedded atom). The count is taken over the
