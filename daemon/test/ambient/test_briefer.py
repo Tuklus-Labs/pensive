@@ -67,6 +67,7 @@ from ambient.briefer import (
     LOOSE_TAG_KEY,
     PINS_EXCEED_BUDGET,
     EMPTY_BRIEF,
+    _pinnedIds,
 )
 from recall.payload import estimateTokens, HANDLE_SCHEME
 from recall.fusion import importanceFactor, timeFactor
@@ -516,3 +517,50 @@ def test_hook_script_flag_on_but_daemon_down_fails_open():
         text=True, env=env, timeout=15)
     assert proc.returncode == 0
     assert proc.stdout.strip() == ""
+
+
+# --------------------------------------------------------------------------- #
+# Pin ORDER: the standing-principles tier must not be sorted by a dead field   #
+# --------------------------------------------------------------------------- #
+
+
+def test_pin_order_does_not_depend_on_importance(store):
+    """THE CLAIM: pin order is a statement about standing, not about accrued
+    importance, and must not be decided by a column that production never writes.
+
+    Measured on the live store 2026-08-12: ten live pins, nine at importance 0.0
+    and one at 1.0, sorted `ORDER BY importance DESC`. The sort key was a
+    constant across nine of ten rows, so the single nonzero row won permanently.
+    That row is a Charon poison-purge quarantine specimen whose own first line
+    reads "CITATION (museum specimen, not a session memory)", and it opened every
+    brief this daemon served. Nothing could displace it, because the accrual job
+    that would raise another pin's importance has never run.
+    """
+    old_but_important = _put(store, "MUSEUM SPECIMEN body", importance=1.0,
+                             occurredAt=1_700_000_000)
+    newer_ordinary = _put(store, "CURRENT PRINCIPLE body", importance=0.0,
+                          occurredAt=1_800_000_000)
+    _pin(store, old_but_important)
+    _pin(store, newer_ordinary)
+
+    order = _pinnedIds(store)
+    assert order.index(newer_ordinary) < order.index(old_but_important), (
+        "a high-importance OLD pin outranked a newer one: the sort is still "
+        "keyed on importance"
+    )
+
+
+def test_pin_rank_in_the_facet_value_wins_when_present(store):
+    """Forward compatibility: the pin facet currently carries a placeholder
+    ('true' in production, '1' in these tests), so recency is the only real
+    signal today. When an explicit rank IS written, it must decide, so that
+    pinning something deliberately first does not require back-dating it."""
+    newer = _put(store, "newer but rank 2", occurredAt=1_800_000_000)
+    older = _put(store, "older but rank 9", occurredAt=1_700_000_000)
+    addFacet(store, newer, PIN_FACET_KEY, "2")
+    addFacet(store, older, PIN_FACET_KEY, "9")
+
+    order = _pinnedIds(store)
+    assert order.index(older) < order.index(newer), (
+        "an explicit pin rank did not outrank recency"
+    )

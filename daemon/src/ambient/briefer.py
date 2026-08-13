@@ -137,15 +137,37 @@ def _result(atomId):
 
 
 def _pinnedIds(store):
-    """Live pinned atom ids, standing-principles order: importance desc, then most
-    recent effective time, then id. The ``IN (SELECT ...)`` avoids the row
-    multiplication a JOIN would cause when an atom carries several pin facets."""
+    """Live pinned atom ids, standing-principles order: explicit pin rank desc,
+    then most recent effective time, then id.
+
+    NOT importance, as of 2026-08-12. Pins are the tier that is supposed to
+    OUTRANK importance, and sorting them by it was worse than redundant: emit
+    hard-writes ``importance`` 0.0 and the retrieval-accrual job that would ever
+    raise it has never run in production, so the key was a CONSTANT across nine
+    of the store's ten live pins. The single row with a nonzero value therefore
+    won permanently, and that row was a Charon poison-purge quarantine specimen
+    whose own first line reads "CITATION (museum specimen, not a session
+    memory)". It opened every brief this daemon served, and nothing could
+    displace it. A sort key that production never varies is not an ordering.
+
+    The rank is read from the pin facet's VALUE when it is numeric, so a
+    deliberate ordering can be expressed without back-dating an atom. Today's
+    pins carry a placeholder ("true"), which reads as rank 0 and leaves recency
+    deciding, which is the honest default when nobody has stated a preference.
+
+    Both the rank lookup and the membership test are correlated subqueries
+    rather than a JOIN, which avoids the row multiplication an atom carrying
+    several pin facets would otherwise cause."""
     rows = store._conn.execute(
         "SELECT id FROM atoms "
         "WHERE status = 'live' "
         "AND id IN (SELECT atom_id FROM facets WHERE key = ?) "
-        "ORDER BY importance DESC, COALESCE(occurred_at, created_at) DESC, id",
-        (PIN_FACET_KEY,),
+        "ORDER BY ("
+        "  SELECT MAX(CASE WHEN value GLOB '[0-9]*' THEN CAST(value AS INTEGER)"
+        "              ELSE 0 END) "
+        "  FROM facets WHERE atom_id = atoms.id AND key = ?"
+        ") DESC, COALESCE(occurred_at, created_at) DESC, id",
+        (PIN_FACET_KEY, PIN_FACET_KEY),
     ).fetchall()
     return [r[0] for r in rows]
 
