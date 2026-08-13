@@ -3,10 +3,31 @@
 Recall's output is read by a model in a system prompt, so the payload is plain
 text with NO markdown furniture: no headers, no bullet lists, no bold/italic, no
 emoji. The only structure is a fixed three-tier line grammar the reader learns
-once. Bodies render VERBATIM (a stored atom whose text happens to contain
+once. Body CONTENT renders verbatim (a stored atom whose text happens to contain
 markdown is data, not formatting -- we neither strip nor "fix" it); the furniture
-WE add is what must stay markdown-free, and every furniture line is prefixed so
-adversarial body characters can only ever appear mid-line, never at a line start.
+WE add is what must stay markdown-free.
+
+Column 0 belongs to the furniture, and that is a security boundary rather than a
+layout choice. In this grammar the ONLY thing separating "the daemon says this
+atom is p3://X at confidence 0.99" from "some atom's body contains that sentence"
+is which column the text starts at, and atom bodies are written by any connected
+agent. A body is free to contain a line shaped exactly like a handle or a
+provenance line, so rendered flush left it would be indistinguishable from this
+module's own framing, and retrieved memory would become a prompt-injection
+channel into every agent that recalls. Two guards make the boundary structural:
+
+- Every body line is prefixed with :data:`BODY_INDENT` (:func:`_indentBody`), so
+  stored text cannot reach column 0 no matter what it contains.
+- Every furniture line is collapsed to one physical line (:func:`_oneLine`),
+  because furniture interpolates store-controlled fields too -- the Tier-0 gist,
+  the provenance source and agent -- and a line break in one of those would split
+  a furniture line in two and hand the tail column 0.
+
+Both use ``str.splitlines``, which knows the whole Unicode line-boundary set
+(``\\r``, ``\\x85``, ``\\u2028``, ...) rather than just ``\\n``, so a consumer
+that splits differently than we joined cannot be shown a different payload than
+we rendered. The cost is that a body's line SEPARATORS are normalized to ``\\n``;
+its characters are otherwise untouched, and nothing is ever dropped.
 
 Three tiers:
 
@@ -21,7 +42,7 @@ Three tiers:
   line even when the body is multi-paragraph.
 
 - **Tier 1 -- handle + body + provenance.** The handle line, then the full stored
-  text verbatim, then one provenance line::
+  text with every line indented by :data:`BODY_INDENT`, then one provenance line::
 
       source <source>, <agent or session or 'unknown'>, recorded <YYYY-MM-DD>
 
@@ -64,6 +85,7 @@ __all__ = [
     "GIST_CHARS",
     "MAX_LOW_CONF_HANDLES",
     "HANDLE_SCHEME",
+    "BODY_INDENT",
 ]
 
 # --- named constants (one place each) -------------------------------------- #
@@ -83,6 +105,12 @@ MAX_LOW_CONF_HANDLES = 3
 # The handle URI scheme. Every furniture line that names an atom uses it, so the
 # reader (and a downstream parser) has one stable token to anchor on.
 HANDLE_SCHEME = "p3://"
+
+# Every rendered body line starts with this, which is what keeps column 0 for the
+# furniture (see the module docstring). Exported so a parser can strip it back off
+# instead of guessing. Two spaces: enough to read as nested, and short of the four
+# that would make a body look like an indented markdown code block.
+BODY_INDENT = "  "
 
 # Sentinels, verbatim per the spec.
 SENTINEL_LOW_CONFIDENCE = "low confidence: no trusted match"
@@ -127,6 +155,33 @@ def _gist(text):
     return " ".join(text.split())[:GIST_CHARS]
 
 
+def _oneLine(line):
+    """A furniture line, guaranteed to be ONE physical line.
+
+    Applied to the whole assembled line rather than per field, so a future field
+    cannot be added and forgotten. Furniture interpolates store data an emitting
+    agent controls end to end (the gist, the provenance source/agent/session, an
+    edge type): a line break in any of those splits one furniture line in two and
+    lands the tail at column 0, forging a handle or a provenance line without ever
+    touching a body. Line breaks become spaces because furniture is a single
+    sentence per line -- the field it came from was never meant to be multi-line."""
+    return " ".join(line.splitlines())
+
+
+def _indentBody(text):
+    """Stored body text with every line prefixed by :data:`BODY_INDENT`.
+
+    This is what makes the column-0 boundary structural instead of aspirational.
+    A body containing a literal ``p3://... | ...`` or ``source ...`` line renders
+    indented, so it reads as data rather than as the framing this module emits.
+    Nothing is stripped or rewritten: each line's characters survive verbatim and
+    only the indent is added. An empty body still renders as one indented line, so
+    an EMPTY line in the payload always means an entry boundary and never a body,
+    which keeps the entry grammar parseable by splitting on a blank line."""
+    lines = text.splitlines() or [""]
+    return _LINE_SEPARATOR.join(BODY_INDENT + line for line in lines)
+
+
 def _effectiveTime(atom):
     """``COALESCE(occurred_at, created_at)`` for a getAtom() dict."""
     return atom["occurredAt"] if atom["occurredAt"] is not None else atom["createdAt"]
@@ -135,7 +190,7 @@ def _effectiveTime(atom):
 def _handleLine(atom, confidence):
     """Tier-0 handle line for a getAtom() dict at the given confidence."""
     date = _fmtDate(_effectiveTime(atom))
-    return (
+    return _oneLine(
         f"{HANDLE_SCHEME}{atom['id']} | {date} | "
         f"{confidence:.2f} | {_gist(atom['text'])}"
     )
@@ -159,14 +214,17 @@ def _provenanceLine(atom, supersededBy=None):
     line = f"source {source}, {who}, recorded {recorded}"
     if supersededBy:
         line += f", superseded by {HANDLE_SCHEME}{supersededBy}"
-    return line
+    return _oneLine(line)
 
 
 def _tier1Entry(atom, confidence, supersededBy=None):
-    """Handle line + verbatim body + provenance line, joined by single newlines."""
+    """Handle line + indented body + provenance line, joined by single newlines.
+
+    The body goes through :func:`_indentBody` rather than in raw: the furniture
+    owns column 0, a body never does."""
     return (
         f"{_handleLine(atom, confidence)}\n"
-        f"{atom['text']}\n"
+        f"{_indentBody(atom['text'])}\n"
         f"{_provenanceLine(atom, supersededBy)}"
     )
 
@@ -212,9 +270,9 @@ def assembleTier2(store, atomId, confidence=0.0, supersededBy=None):
         dst = getAtom(store, edge["dstAtom"])
         if dst is None or dst["status"] != "live":
             continue
-        edgeLines.append(
+        edgeLines.append(_oneLine(
             f"{edge['type']} -> {HANDLE_SCHEME}{edge['dstAtom']} {_gist(dst['text'])}"
-        )
+        ))
     if edgeLines:
         return entry + _LINE_SEPARATOR + _LINE_SEPARATOR.join(edgeLines)
     return entry

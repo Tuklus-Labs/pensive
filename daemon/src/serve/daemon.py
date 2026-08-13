@@ -43,7 +43,10 @@ if str(_SRC) not in sys.path:
     sys.path.insert(0, str(_SRC))
 
 from serve.mcp import ServeContext, buildServer, SERVER_NAME  # noqa: E402
-from serve.tee import Counters, handleTeeEmit  # noqa: E402
+from serve.tee import (  # noqa: E402
+    Counters, handleTeeEmit, checkLocalWriteRequest, checkRequestOrigin,
+    loadTeeSecret, defaultTeeSecretPath,
+)
 from serve.shadow import runShadow, defaultShadowLogPath  # noqa: E402
 from serve import viz  # noqa: E402
 from ambient.briefer import brief, DEFAULT_BUDGET  # noqa: E402
@@ -117,16 +120,27 @@ def buildApp(ctx):
     driven by the app lifespan so it is active for the life of the server.
 
     Alongside the ``/mcp`` mount the app carries the Phase 3 double-write surface,
-    all localhost-only (no auth, same bind): ``POST /tee/emit`` replays a tee'd
-    emit into the v3 store, ``POST /shadow/recall`` logs a v3 answer beside the old
-    one, and ``GET /status`` exposes the four tee/shadow counters for the gate
-    check. The tee/shadow boundary handlers are synchronous and run inline on the
+    all localhost-only (same bind): ``POST /tee/emit`` replays a tee'd emit into
+    the v3 store, ``POST /shadow/recall`` logs a v3 answer beside the old one, and
+    ``GET /status`` exposes the tee/shadow counters for the gate check.
+
+    Both POST routes sit behind :func:`serve.tee.checkLocalWriteRequest`, and the
+    ``/mcp`` mount behind its origin half. Loopback binding keeps the daemon off
+    the network but is NOT a defense against a browser the operator is already
+    running: a page can POST cross-origin to 127.0.0.1 with no preflight, and CORS
+    only stops it from reading the reply. See the guard's own comments in
+    ``serve/tee.py`` for the full model. The read routes (``/status``, ``/brief``,
+    ``/viz*``) are deliberately ungated -- they change nothing, and gating ``/brief``
+    would break the SessionStart hook that curls it for no security gain.
+
+    The tee/shadow boundary handlers are synchronous and run inline on the
     event-loop thread -- the SAME thread that created the sqlite store (and the
     same path the MCP ``call_tool`` handler already takes) -- so the store's
     thread affinity is preserved; they do not go through a threadpool.
     """
     from mcp.server.streamable_http_manager import StreamableHTTPSessionManager
     from starlette.applications import Starlette
+    from starlette.datastructures import Headers
     from starlette.responses import JSONResponse
     from starlette.routing import Mount, Route
 
@@ -138,15 +152,48 @@ def buildApp(ctx):
     counters = Counters()
     shadowLogPath = defaultShadowLogPath()
 
+    # The loopback write secret, loaded ONCE at app build. Re-reading it per
+    # request would put a filesystem call on the hot path and, worse, would make
+    # the daemon silently adopt a rotated secret mid-flight while its callers still
+    # held the old one. A None here is not fatal to startup: the guard fails closed
+    # on it, so /mcp and the read routes keep serving while the write routes refuse.
+    teeSecret = loadTeeSecret()
+    if teeSecret is None:
+        _log(f"WARNING: no loopback write secret ({defaultTeeSecretPath()}); "
+             "POST /tee/emit and POST /shadow/recall will refuse every request")
+
     async def handle_mcp(scope, receive, send):
+        # /mcp dispatches the SAME emit tools as the tee, so it is a write surface
+        # too. It is already hard to forge from a page (the SDK requires
+        # application/json, which a no-preflight request cannot set), but that
+        # leaves DNS rebinding, where the browser thinks it is same-origin and the
+        # content-type barrier stops applying. An Origin check is the documented
+        # MCP defense and is invisible to every live agent here: non-browser
+        # clients send no Origin. Deliberately origin-ONLY -- requiring the tee
+        # secret would break every wired agent on this box.
+        rejection = checkRequestOrigin(Headers(scope=scope))
+        if rejection is not None:
+            status, payload = rejection
+            await JSONResponse(payload, status_code=status)(scope, receive, send)
+            return
         await manager.handle_request(scope, receive, send)
 
     async def tee_emit(request):
         body = await request.body()
-        status, payload = handleTeeEmit(ctx, counters, body)
+        status, payload = handleTeeEmit(
+            ctx, counters, body, request.headers, teeSecret)
         return JSONResponse(payload, status_code=status)
 
     async def shadow_recall(request):
+        # runShadow lives in shadow.py and takes no request metadata, so unlike the
+        # tee its guard has to sit here at the route. Same three checks, same
+        # reasons: /shadow/recall writes the A/B corpus the cutover decision is read
+        # off, and a forged line there is evidence tampering.
+        rejection = checkLocalWriteRequest(request.headers, teeSecret)
+        if rejection is not None:
+            counters._inc("shadowRejected")
+            status, payload = rejection
+            return JSONResponse(payload, status_code=status)
         body = await request.body()
         status, payload = runShadow(ctx, counters, body, shadowLogPath)
         return JSONResponse(payload, status_code=status)

@@ -11,7 +11,9 @@ Risk model (what could silently break, and the test that catches it):
   into the lines WE emit; a body cut mid-sentence to fit budget; a Tier-0 gist
   keeping newlines and breaking the one-line handle grammar. Caught by the
   clean-corpus furniture check, the adversarial verbatim/gist check, and the
-  atomic-drop budget check.
+  atomic-drop budget check. The adjacent SECURITY property -- that stored text
+  can never reach column 0 and impersonate that furniture -- lives in
+  test_payload_forgery.py; the checks here pin the format it depends on.
 - **Budget arithmetic.** Off-by-one letting the payload exceed budget, or the
   degrade path (handle-only, then sentinel) not firing. Caught by the tiny-budget
   and top-entry-too-big tests, asserting the module's own heuristic.
@@ -43,6 +45,7 @@ from recall.payload import (
     estimateTokens,
     SENTINEL_LOW_CONFIDENCE,
     SENTINEL_BUDGET_TOO_SMALL,
+    BODY_INDENT,
     GIST_CHARS,
 )
 from recall.embedder import Embedder, embedMissing
@@ -560,7 +563,9 @@ def test_tier1_entry_is_handle_body_provenance(store):
     entry = tier1Entry(store, _result(aid, 0.60, True))
     lines = entry.split("\n")
     assert lines[0].startswith(f"p3://{aid} | ")
-    assert lines[1] == "the full stored body text"     # body verbatim, its own line
+    # Body content verbatim on its own line, indented: column 0 is reserved for the
+    # furniture so stored text can never impersonate it.
+    assert lines[1] == BODY_INDENT + "the full stored body text"
     assert lines[2].startswith("source ")
 
 
@@ -685,7 +690,11 @@ def test_adversarial_body_renders_verbatim_and_gist_is_newline_sanitized(store):
     r = _result(aid, 0.9, True)
 
     entry = tier1Entry(store, r)
-    assert _ADVERSARIAL in entry                # body verbatim: markdown/emoji intact
+    # Body content verbatim line by line, each line indented off column 0. Spelled
+    # out here rather than reusing payload's own helper, so this pins the FORMAT
+    # and would still catch that helper going wrong.
+    indented = "\n".join(BODY_INDENT + ln for ln in _ADVERSARIAL.split("\n"))
+    assert indented in entry                    # markdown/emoji intact, just demoted
     assert "**bold**" in entry
     assert _EMOJI_RE.search(entry)              # the emoji survives in the body
 
