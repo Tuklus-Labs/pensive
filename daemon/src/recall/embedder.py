@@ -43,6 +43,53 @@ def blobToVec(blob):
     return np.frombuffer(blob, dtype=_BLOB_DTYPE)
 
 
+# Torch thread count for the SERVE path.
+#
+# House rule (Gary, 2026-08-13): batch encodes on the GPU, stream encodes on the
+# CPU. A stream encode is ONE short sequence, and torch defaults to every core it
+# can see -- 12 on this box -- which spends more on thread synchronization than
+# the work itself. Measured, single-query p50 / p95:
+#
+#     threads=1   10.41 / 11.64 ms
+#     threads=2    8.74 / 10.62 ms
+#     threads=4    5.77 /  6.09 ms   <- chosen
+#     threads=8    6.60 /  7.71 ms
+#     threads=12   7.79 /  8.68 ms   (the default)
+#
+# Four is both the fastest and the tightest, and it leaves the remaining cores
+# for the rest of the pipeline: an earlier interleaved measurement of the same
+# encode read 66 ms because torch and numpy were fighting over all 12.
+#
+# Env-overridable because the right number is a property of the HOST, not of this
+# code, and a box with a different core count will want a different one.
+_SERVE_THREADS_ENV = "PENSIVE_V3_TORCH_THREADS"
+_DEFAULT_SERVE_THREADS = 4
+
+
+def _applyServeThreadCap():
+    """Cap torch's intra-op threads for the latency-sensitive serve path.
+
+    Returns the applied value, or None when no cap was applied. Setting the env
+    var to 0 disables the cap entirely: a BATCH job wanting every core says so
+    explicitly rather than fighting a default tuned for single-sequence latency.
+    """
+    import os
+    try:
+        want = int(os.environ.get(_SERVE_THREADS_ENV, _DEFAULT_SERVE_THREADS))
+    except ValueError:
+        want = _DEFAULT_SERVE_THREADS
+    if want <= 0:
+        return None
+    try:
+        import torch
+        torch.set_num_threads(want)
+        return want
+    except Exception:
+        # A thread cap that cannot be applied is a missed optimization, never a
+        # reason to fail an embed.
+        return None
+
+
 class Embedder:
     """Loads one sentence-transformers model and embeds text to unit vectors.
 
@@ -54,6 +101,7 @@ class Embedder:
     """
 
     def __init__(self, modelId):
+        _applyServeThreadCap()
         # Force offline resolution from the HF cache. setdefault (not assignment)
         # so an explicit caller/CI override still wins.
         os.environ.setdefault("HF_HUB_OFFLINE", "1")
