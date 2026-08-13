@@ -83,6 +83,7 @@ type cfg struct {
 	plant         string
 	epoch         string
 	evidenceDir   string
+	baseline      string
 	evErrs        []string
 }
 
@@ -104,6 +105,7 @@ func main() {
 	flag.IntVar(&c.minCurated, "min-curated", 5, "floor: curated probes required")
 	flag.StringVar(&c.plant, "plant", "none", "planted failure: none|latency|empty")
 	flag.StringVar(&c.epoch, "epoch", "primary", "epoch label: primary|known-good|planted-bad|mutated")
+	flag.StringVar(&c.baseline, "against", "", "path to a previous report.json: fail on any unit that REGRESSED, ignore units that were already failing")
 	flag.StringVar(&c.evidenceDir, "evidence-dir", ".gate-evidence", "where raw output is written")
 	flag.Parse()
 
@@ -116,6 +118,31 @@ func main() {
 		os.Exit(3)
 	}
 	emit(&c, rep)
+
+	// Regression mode. The full contract is not met yet -- L2 and L3 legitimately
+	// FAIL because those tiers are unbuilt -- so gating a deploy on ACCEPT would
+	// block the memory daemon from starting and would be un-runnable until the
+	// campaign finishes. A gate nobody can afford to run is the same as a gate
+	// nobody runs. So against a recorded baseline this asks the question a deploy
+	// actually needs answered: did anything that WAS working stop working?
+	if c.baseline != "" {
+		regressions, err := compareToBaseline(c.baseline, rep)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "tiergate: baseline unreadable (%v): refusing to "+
+				"report no-regression against a baseline it could not load\n", err)
+			os.Exit(3)
+		}
+		if len(regressions) > 0 {
+			fmt.Printf("\nREGRESSIONS vs %s:\n", c.baseline)
+			for _, r := range regressions {
+				fmt.Println("  " + r)
+			}
+			os.Exit(1)
+		}
+		fmt.Printf("\nno regression vs %s\n", c.baseline)
+		os.Exit(0)
+	}
+
 	switch rep.Outcome() {
 	case "ACCEPT":
 		os.Exit(0)

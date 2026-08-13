@@ -310,7 +310,14 @@ def _require(args, names):
 # ``lifecycle/supersede_detect.py`` EXCLUDES those rows from supersession
 # candidates, so forging it is a durability claim the caller has no right to
 # make. Verified 2026-08-12: the live store holds exactly these four sources.
-_RESERVED_SOURCES = frozenset({"bulk-import", "repair-tool", "edge-campaign"})
+# Passive-capture sources are reserved too: `claude-code` and `codex` mean "the
+# distiller OBSERVED this", which is a different and stronger claim than "an
+# agent asserted this". A caller able to set them disguises a hand-written atom
+# as something the system watched happen. Added after a blue-team review found
+# the first reserved set covered only the bulk/tooling sources.
+_RESERVED_SOURCES = frozenset({
+    "bulk-import", "repair-tool", "edge-campaign", "claude-code", "codex",
+})
 _RESERVED_SOURCE_PREFIXES = ("person-",)
 
 # Native recall/pensive_recall bounds. Not copied from recall_records' 1..32,
@@ -1136,16 +1143,22 @@ def handle_correct(ctx, args):
     _rejectEscapingSourceRef(prov.get("sourceRef"))
     _boundedEmitText(newText, "correct: newText")
     provenance = {"source": prov.get("source") or _EMIT_SOURCE}
-    for key in ("agent", "sessionId", "sourceRef"):
+    for key in ("sessionId", "sourceRef"):
         if prov.get(key) is not None:
             provenance[key] = prov[key]
-    if "agent" not in provenance:
-        # Same precedence as an emit: the connection's declared identity fills in
-        # when the caller's provenance block omits one, before the process-wide
-        # default. A correction is authored by somebody too.
-        resolved = _resolveAgent(ctx, None)
-        if resolved:
-            provenance["agent"] = resolved
+    # ONE provenance boundary, and correct is inside it.
+    #
+    # This used to copy provenance.agent straight across and call _resolveAgent
+    # only when that nested field was ABSENT, so a client connected as
+    # ?agent=grok could still stamp heph by nesting the claim one level deeper,
+    # and the value skipped _sanitizeAgent on the way in. The argument path was
+    # already fixed; this door was not, which is the same two-entry-points shape
+    # that let the original defect survive its own guard. Passing the nested
+    # value THROUGH _resolveAgent means transport identity outranks it and the
+    # sanitizer runs, with no second rule to keep in step.
+    resolved = _resolveAgent(ctx, {"agent": prov.get("agent")})
+    if resolved:
+        provenance["agent"] = resolved
 
     newId = putAtom(ctx.store, {
         "text": newText,

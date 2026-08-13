@@ -241,3 +241,73 @@ def test_emit_still_accepts_an_ordinary_body(ctx):
         "project": "gatecheck", "narrative": "an ordinary narrative fragment.",
     })
     assert "emitted" in out
+
+
+# --------------------------------------------------------------------------- #
+# `correct` was the hole the first fix missed                                   #
+# --------------------------------------------------------------------------- #
+
+
+def test_correct_cannot_forge_an_agent_through_the_provenance_block(transportIsGrok, ctx):
+    """THE CLAIM: there is ONE provenance boundary, and `correct` is inside it.
+
+    The first pass inverted `_resolveAgent` so the connection outranks a caller's
+    `agent` ARGUMENT, and this file asserted that. `handle_correct` takes a
+    different door: it copies `provenance.agent` straight through, and only calls
+    `_resolveAgent` when that nested field is ABSENT. So a client connected as
+    grok could still write rows stamped heph by nesting the claim one level
+    deeper, and the value skipped `_sanitizeAgent` on the way.
+
+    Found by a blue-team review (gpt-daybreak) after I had already committed the
+    first fix under the message "provenance is a boundary, not a suggestion". It
+    was not, through this path. Two entry points to one column is exactly the
+    shape that made the ORIGINAL defect survive its own guard.
+    """
+    _seedAtom(ctx)
+    oldId = ctx.store._conn.execute(
+        "SELECT id FROM atoms ORDER BY created_at DESC LIMIT 1").fetchone()[0]
+    M.handle_correct(ctx, {
+        "oldAtomId": oldId, "newText": "a correction",
+        "provenance": {"agent": "heph"},
+    })
+    newId = ctx.store._conn.execute(
+        "SELECT id FROM atoms ORDER BY created_at DESC LIMIT 1").fetchone()[0]
+    stamped = ctx.store._conn.execute(
+        "SELECT agent FROM provenance WHERE atom_id = ?", (newId,)).fetchone()[0]
+    assert stamped == "grok", (
+        f"correct stamped {stamped!r}: a nested provenance.agent outranked the "
+        f"connection identity"
+    )
+
+
+def test_correct_sanitizes_a_nested_agent_when_there_is_no_transport(noTransport, ctx):
+    """The nested field skipped `_sanitizeAgent` entirely, so a filesystem path
+    could reach the column through `correct` even after the argument path was
+    guarded."""
+    _seedAtom(ctx)
+    oldId = ctx.store._conn.execute(
+        "SELECT id FROM atoms ORDER BY created_at DESC LIMIT 1").fetchone()[0]
+    M.handle_correct(ctx, {
+        "oldAtomId": oldId, "newText": "a correction",
+        "provenance": {"agent": "/root/not_an_identity"},
+    })
+    newId = ctx.store._conn.execute(
+        "SELECT id FROM atoms ORDER BY created_at DESC LIMIT 1").fetchone()[0]
+    stamped = ctx.store._conn.execute(
+        "SELECT agent FROM provenance WHERE atom_id = ?", (newId,)).fetchone()[0]
+    assert stamped != "/root/not_an_identity", "a path reached the agent column"
+
+
+@pytest.mark.parametrize("reserved", ["claude-code", "codex"])
+def test_correct_refuses_passive_capture_sources_too(ctx, reserved):
+    """The reserved set covered bulk-import/repair-tool/edge-campaign but not the
+    documented PASSIVE-CAPTURE sources, so a caller could still disguise a
+    hand-written atom as something the distiller had observed."""
+    _seedAtom(ctx)
+    oldId = ctx.store._conn.execute(
+        "SELECT id FROM atoms ORDER BY created_at DESC LIMIT 1").fetchone()[0]
+    with pytest.raises(ValueError):
+        M.handle_correct(ctx, {
+            "oldAtomId": oldId, "newText": "x",
+            "provenance": {"source": reserved},
+        })

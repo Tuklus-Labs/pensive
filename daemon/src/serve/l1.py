@@ -35,10 +35,9 @@ served came from that one mistake.
 
 Stdlib plus the store's public accessors only.
 """
-from store.store import getAtom
 
 __all__ = ["handleGet", "handleLookup", "MAX_ID_LEN", "MAX_LOOKUP_LIMIT",
-           "DEFAULT_LOOKUP_LIMIT", "MAX_FACET_LEN"]
+           "DEFAULT_LOOKUP_LIMIT", "MAX_FACET_LEN", "MAX_PROVENANCE_ROWS"]
 
 # A ULID is 26 characters. The cap is generous rather than exact so a future id
 # scheme does not silently start 400ing, but it is still a cap: an unbounded id
@@ -54,6 +53,11 @@ MAX_FACET_LEN = 512
 DEFAULT_LOOKUP_LIMIT = 100
 MAX_LOOKUP_LIMIT = 1000
 
+# Provenance rows returned under ?full=1. One atom in the live store carries 674
+# of them (a duplicated memory re-captured by the distiller), so an uncapped list
+# turns a single read into an unbounded response.
+MAX_PROVENANCE_ROWS = 64
+
 
 def _bad(message):
     return 400, {"error": message}
@@ -68,33 +72,55 @@ def handleGet(store, atomId, withProvenance=False):
     would put two mechanisms on one question, which is how one of them quietly
     stops being load-bearing.
 
-    ``withProvenance`` is off by default because provenance is a second query
-    and most L1 callers want the row. The budget is 1ms; a caller that wants the
-    provenance can pay for it explicitly.
+    ``withProvenance`` is off by default, and the default path genuinely does not
+    read the provenance table. An earlier version called ``getAtom``, which
+    ALWAYS fetches every provenance row, so the docstring's claim that a caller
+    "pays explicitly" for provenance was false: every caller paid, and an atom
+    with many provenance rows made an unauthenticated read arbitrarily expensive.
+    Caught by a blue-team review. The lean path is now one indexed row read.
+
+    ``full=1`` returns provenance capped at :data:`MAX_PROVENANCE_ROWS`. One atom
+    in this store carries 674 provenance rows, so an uncapped list is an
+    unbounded response on a public read route; truncation is REPORTED rather than
+    silent, because a short list that looks complete is its own kind of lie.
     """
     if not isinstance(atomId, str) or not atomId.strip():
         return _bad("id is required")
     if len(atomId) > MAX_ID_LEN:
         return _bad(f"id exceeds {MAX_ID_LEN} characters")
 
-    atom = getAtom(store, atomId)
-    if atom is None:
+    row = store._conn.execute(
+        "SELECT id, text, kind, project, created_at, occurred_at, status "
+        "FROM atoms WHERE id = ?",
+        (atomId,),
+    ).fetchone()
+    if row is None:
         # An explicit found:false rather than a bare 404 body, so a caller that
         # only reads the body can still tell absence from a transport failure.
         return 404, {"id": atomId, "found": False}
 
     payload = {
-        "id": atom["id"],
-        "text": atom["text"],
-        "kind": atom["kind"],
-        "project": atom["project"],
-        "createdAt": atom["createdAt"],
-        "occurredAt": atom["occurredAt"],
-        "status": atom["status"],
+        "id": row[0],
+        "text": row[1],
+        "kind": row[2],
+        "project": row[3],
+        "createdAt": row[4],
+        "occurredAt": row[5],
+        "status": row[6],
         "found": True,
     }
     if withProvenance:
-        payload["provenance"] = atom["provenance"]
+        prov = store._conn.execute(
+            "SELECT id, source, session_id, agent, source_ref, recorded_at "
+            "FROM provenance WHERE atom_id = ? ORDER BY id LIMIT ?",
+            (atomId, MAX_PROVENANCE_ROWS + 1),
+        ).fetchall()
+        payload["provenance"] = [
+            {"id": p[0], "source": p[1], "sessionId": p[2], "agent": p[3],
+             "sourceRef": p[4], "recordedAt": p[5]}
+            for p in prov[:MAX_PROVENANCE_ROWS]
+        ]
+        payload["provenanceTruncated"] = len(prov) > MAX_PROVENANCE_ROWS
     return 200, payload
 
 

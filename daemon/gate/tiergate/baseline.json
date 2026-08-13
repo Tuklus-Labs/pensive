@@ -1,0 +1,101 @@
+{
+  "identity": {
+    "artifact_path": "/home/aegis/Projects/pensive/daemon/src",
+    "artifact_sha256": "fa1da15b1b47d8bb820a4b3de51a1c3f15b59257",
+    "gate_name": "pensive-tiergate",
+    "gate_version": "1"
+  },
+  "canary": "canary.known-id-roundtrips",
+  "components": [
+    {
+      "check": "staleness",
+      "unit": "staleness.daemon-matches-source",
+      "state": "PASS",
+      "evidence": "/home/aegis/Projects/pensive/daemon/gate/tiergate/.gate-evidence/baseline/staleness.json"
+    },
+    {
+      "check": "contamination",
+      "unit": "contamination.background-traffic",
+      "state": "PASS",
+      "evidence": "/home/aegis/Projects/pensive/daemon/gate/tiergate/.gate-evidence/baseline/contamination.json"
+    },
+    {
+      "check": "canary",
+      "unit": "canary.known-id-roundtrips",
+      "state": "PASS",
+      "evidence": "/home/aegis/Projects/pensive/daemon/gate/tiergate/.gate-evidence/baseline/canary-known.json"
+    },
+    {
+      "check": "canary",
+      "unit": "canary.impossible-id-empty",
+      "state": "PASS",
+      "evidence": "/home/aegis/Projects/pensive/daemon/gate/tiergate/.gate-evidence/baseline/canary-impossible.json"
+    },
+    {
+      "check": "latency",
+      "unit": "l1.latency.p95",
+      "state": "PASS",
+      "evidence": "/home/aegis/Projects/pensive/daemon/gate/tiergate/.gate-evidence/baseline/l1-latency.json",
+      "score": {
+        "value": 0.234,
+        "max": 0
+      }
+    },
+    {
+      "check": "correctness",
+      "unit": "l1.correctness.exact",
+      "state": "PASS",
+      "evidence": "/home/aegis/Projects/pensive/daemon/gate/tiergate/.gate-evidence/baseline/l1-correctness.json"
+    },
+    {
+      "check": "coverage",
+      "unit": "coverage.probe-count",
+      "state": "PASS",
+      "evidence": "/home/aegis/Projects/pensive/daemon/gate/tiergate/.gate-evidence/baseline/coverage.json"
+    },
+    {
+      "check": "tier",
+      "unit": "l2.tier.implemented",
+      "state": "FAIL",
+      "evidence": "/home/aegis/Projects/pensive/daemon/gate/tiergate/.gate-evidence/baseline/l2-latency.json"
+    },
+    {
+      "check": "latency",
+      "unit": "l3.latency.p95",
+      "state": "FAIL",
+      "evidence": "/home/aegis/Projects/pensive/daemon/gate/tiergate/.gate-evidence/baseline/l3-latency.json",
+      "score": {
+        "value": 6597.886,
+        "max": 0
+      }
+    },
+    {
+      "check": "quality",
+      "unit": "l3.quality.r_at_10",
+      "state": "PASS",
+      "evidence": "/home/aegis/Projects/pensive/daemon/gate/tiergate/.gate-evidence/baseline/l3-quality-r10.json",
+      "score": {
+        "value": 0.8947368421052632,
+        "max": 1
+      }
+    },
+    {
+      "check": "quality",
+      "unit": "l3.quality.mrr_at_10",
+      "state": "PASS",
+      "evidence": "/home/aegis/Projects/pensive/daemon/gate/tiergate/.gate-evidence/baseline/l3-quality-mrr.json",
+      "score": {
+        "value": 0.8947368421052632,
+        "max": 1
+      }
+    }
+  ],
+  "accounting": {
+    "total": 11,
+    "pass": 9,
+    "fail": 2,
+    "timeout": 0,
+    "error": 0,
+    "skip": 0
+  }
+}

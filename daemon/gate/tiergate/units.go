@@ -7,6 +7,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -625,5 +626,84 @@ func someLiveAtomIDs(storePath string, n int) ([]string, error) {
 	if len(out) == 0 {
 		return nil, fmt.Errorf("no live atoms: L1 has nothing provably present to ask for")
 	}
+	return out, nil
+}
+
+// compareToBaseline reports units that got WORSE than a recorded run.
+//
+// Exists because of the finding that hurt most in a cross-vendor review: nothing
+// invoked this gate, which makes it a benchmark rather than a gate (STYLE.md,
+// "a gate nothing invokes is a measurement"). The obvious wiring -- block deploy
+// unless ACCEPT -- is unusable while the contract is half-built, and a gate
+// people cannot afford to run gets disabled, which is the same outcome with
+// extra steps.
+//
+// So the deploy question is narrower and answerable today: did anything that was
+// working stop working? A unit already FAILing stays failing without blocking;
+// a unit that was PASS and is now anything else is a regression. ERROR counts as
+// a regression from PASS because it means the instrument could no longer answer,
+// which is not permission to proceed.
+//
+// Reads both sides through gatekit's public JSON wire form rather than reaching
+// into the Report: the baseline on disk IS that wire form, and adding an
+// accessor to a shared library for one consumer's convenience is how a library
+// stops being able to enforce anything.
+func unitStates(raw []byte) (map[string]string, error) {
+	var wire struct {
+		Components []struct {
+			Unit  string `json:"unit"`
+			State string `json:"state"`
+		} `json:"components"`
+	}
+	if err := json.Unmarshal(raw, &wire); err != nil {
+		return nil, err
+	}
+	if len(wire.Components) == 0 {
+		return nil, fmt.Errorf("no components in report: an empty baseline would " +
+			"make every future run trivially pass")
+	}
+	out := map[string]string{}
+	for _, c := range wire.Components {
+		out[c.Unit] = c.State
+	}
+	return out, nil
+}
+
+func compareToBaseline(path string, rep *verdict.Report) ([]string, error) {
+	prevRaw, err := os.ReadFile(path)
+	if err != nil {
+		return nil, err
+	}
+	// Load through gatekit first so a tampered or self-inconsistent baseline is
+	// rejected by the library rather than trusted by us.
+	if _, err := verdict.Load(prevRaw); err != nil {
+		return nil, fmt.Errorf("baseline rejected by gatekit: %w", err)
+	}
+	was, err := unitStates(prevRaw)
+	if err != nil {
+		return nil, err
+	}
+	nowRaw, err := json.Marshal(rep)
+	if err != nil {
+		return nil, err
+	}
+	now, err := unitStates(nowRaw)
+	if err != nil {
+		return nil, err
+	}
+
+	var out []string
+	for unit, before := range was {
+		after, present := now[unit]
+		switch {
+		case !present && before == "PASS":
+			// Coverage shrinkage is a regression: a check that no longer runs
+			// cannot fail, and its absence reads identically to its success.
+			out = append(out, fmt.Sprintf("%s: PASS -> ABSENT (unit disappeared)", unit))
+		case present && before == "PASS" && after != "PASS":
+			out = append(out, fmt.Sprintf("%s: %s -> %s", unit, before, after))
+		}
+	}
+	sort.Strings(out)
 	return out, nil
 }
