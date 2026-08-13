@@ -69,6 +69,7 @@ mid-sentence. If not even the top entry fits, its Tier-0 handle alone is emitted
 Stdlib only; ``store`` reads go through the store's public accessors.
 """
 import math
+import re
 from datetime import datetime, timezone
 
 from store.store import getAtom, edgesFrom
@@ -83,6 +84,7 @@ __all__ = [
     "SENTINEL_BUDGET_TOO_SMALL",
     "CHARS_PER_TOKEN",
     "GIST_CHARS",
+    "gistOf",
     "MAX_LOW_CONF_HANDLES",
     "HANDLE_SCHEME",
     "BODY_INDENT",
@@ -142,17 +144,87 @@ def _fmtDate(epochSeconds):
     return datetime.fromtimestamp(epochSeconds, timezone.utc).strftime("%Y-%m-%d")
 
 
-def _gist(text):
-    """First ``GIST_CHARS`` chars of ``text`` with all whitespace collapsed.
+# Emit-template scaffolding. A body opening with these is the composed-atom
+# shape: `_composeAtomText` writes shape / approach: / outcome: / principle: as
+# separate lines, so position 0 is a field label rather than a claim.
+_SCAFFOLD_PREFIXES = ("approach:", "outcome:", "domain:", "dead ends:", "next steps:")
 
-    ``str.split()`` + ``" ".join`` collapses every run of whitespace -- crucially
-    newlines -- to a single space, so the gist is always ONE line regardless of
-    the body. Adversarial body text (markdown, control chars) passes through as
-    literal characters; only the newlines are removed, because a newline would
-    break the single-line handle grammar. Truncation is a plain slice: the gist is
-    a preview, not the body, so a mid-word cut is fine here (unlike a Tier-1 body,
-    which is never cut)."""
+# The transferable claim. When a body has one, it is the single most useful
+# sentence in it, which is exactly what an 80-character preview should spend
+# itself on.
+_PRINCIPLE_PREFIX = "principle:"
+
+# Shape values the one-argument emit shorthands used to synthesize. They are
+# labels, never content. Kept as literals rather than a pattern because a real
+# author-supplied shape IS content and must not be skipped.
+_SYNTHETIC_SHAPES = ("discovery", "failed approach")
+
+# A line carrying only markup: bullet markers, rules, fence and quote
+# characters. A chunk cut mid-document routinely opens on one of these.
+_MARKUP_ONLY_RE = re.compile(r"^[\s\-\*\+#>|`_=~.:]+$")
+
+
+def gistOf(text):
+    """The most informative ~``GIST_CHARS`` of a body, as ONE physical line.
+
+    Selection, not position. The previous rule was ``" ".join(text.split())[:80]``
+    and for the three body shapes that dominate this store that is close to the
+    worst available window: emit-template atoms open with up to 53 characters of
+    scaffolding, distiller atoms open with a question, and document_chunks open
+    wherever the chunker happened to cut. Working retrieval was therefore being
+    read as broken ranking -- measured 2026-08-12, where four of five real probes
+    looked like misses from the rendered line and three of those four had hit.
+
+    Order, best signal first:
+
+    1. a ``principle:`` line, which is the body's transferable claim
+    2. else the first line that is not scaffolding, not a bare synthesized shape,
+       not a question, and not markup-only
+    3. else the old leading-slice rule, because an empty gist is a dead sensor
+       and a preview of something beats a preview of nothing
+
+    This is a RENDER decision and touches no score: ranking must be unaffected,
+    so the two can be evaluated apart. Adversarial characters still pass through
+    as literals; the forgery guard lives in the body-indent path and duplicating
+    it here would leave two mechanisms answering one question, which is how one
+    of them quietly stops being load-bearing.
+    """
+    if not text:
+        return ""
+    lines = [" ".join(line.split()) for line in text.splitlines()]
+    lines = [line for line in lines if line]
+    if not lines:
+        return ""
+
+    for line in lines:
+        if line.lower().startswith(_PRINCIPLE_PREFIX):
+            claim = line[len(_PRINCIPLE_PREFIX):].strip()
+            if claim:
+                return claim[:GIST_CHARS]
+
+    for i, line in enumerate(lines):
+        low = line.lower()
+        if low.startswith(_SCAFFOLD_PREFIXES):
+            continue
+        if low in _SYNTHETIC_SHAPES:
+            continue
+        if line.endswith("?"):
+            continue
+        if _MARKUP_ONLY_RE.match(line):
+            continue
+        # Skip TO the first line worth reading, then keep filling from there.
+        # Returning that line alone would be a regression for chunks: a body
+        # opening on a short markdown heading would spend 14 of 80 characters
+        # and waste the rest, where the old flatten-and-slice at least filled
+        # the window. Selection decides where to START, not how much to show.
+        return " ".join(lines[i:])[:GIST_CHARS]
+
     return " ".join(text.split())[:GIST_CHARS]
+
+
+def _gist(text):
+    """Module-internal alias for :func:`gistOf`; see it for the selection rule."""
+    return gistOf(text)
 
 
 def _oneLine(line):

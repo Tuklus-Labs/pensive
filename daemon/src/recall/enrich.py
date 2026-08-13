@@ -22,7 +22,7 @@ report, not in serve-time noise.
 """
 import re
 
-from recall.payload import GIST_CHARS as _GIST_CHARS
+from recall.payload import GIST_CHARS as _GIST_CHARS, gistOf as _gistOf
 from recall.refs import refToPath
 from store.store import getAtom
 
@@ -44,8 +44,12 @@ def _norm(text):
 
 
 def _gist(text):
-    flat = _norm(text)
-    return flat[:_GIST_CHARS]
+    """Shares payload's gist SELECTION, not merely its width.
+
+    A shared GIST_CHARS was never enough: what a reader sees is which line was
+    picked, so a divergence here would render the same atom two different ways
+    depending on which surface returned it."""
+    return _gistOf(text)
 
 
 def locateChunk(chunkText, path):
