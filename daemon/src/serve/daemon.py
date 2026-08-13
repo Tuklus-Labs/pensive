@@ -48,6 +48,7 @@ from serve.tee import (  # noqa: E402
     loadTeeSecret, defaultTeeSecretPath, LOCAL_WRITE_HEADER,
 )
 from serve.shadow import runShadow, defaultShadowLogPath  # noqa: E402
+from serve.l1 import handleGet, handleLookup  # noqa: E402
 from serve import viz  # noqa: E402
 from ambient.briefer import brief, DEFAULT_BUDGET  # noqa: E402
 from store.store import openStore  # noqa: E402
@@ -178,6 +179,43 @@ def buildApp(ctx):
             return
         await manager.handle_request(scope, receive, send)
 
+    async def l1_get(request):
+        # L1: identity retrieval, budget P95 <= 1ms. Deliberately NOT an MCP
+        # tool -- the tools/call envelope alone measured 2.486ms P95 for a
+        # 142-byte error touching no store, so the transport choice IS the
+        # design, not an optimization detail.
+        #
+        # Origin-checked but not secret-guarded: this is a READ, and the read
+        # routes (/brief, /status) already work this way. The origin check is
+        # the same DNS-rebinding defense /mcp applies and is invisible to every
+        # non-browser client, which sends no Origin at all.
+        rejection = checkRequestOrigin(request.headers)
+        if rejection is not None:
+            status, payload = rejection
+            return JSONResponse(payload, status_code=status)
+        status, payload = handleGet(
+            ctx.store,
+            request.query_params.get("id", ""),
+            withProvenance=request.query_params.get("full") == "1",
+        )
+        return JSONResponse(payload, status_code=status)
+
+    async def l1_lookup(request):
+        # The operation Charon needed and did not have: exact set membership by
+        # facet. A similarity engine cannot report absence, so it returned the
+        # nearest thing instead, which was its own source code.
+        rejection = checkRequestOrigin(request.headers)
+        if rejection is not None:
+            status, payload = rejection
+            return JSONResponse(payload, status_code=status)
+        status, payload = handleLookup(
+            ctx.store,
+            request.query_params.get("key", ""),
+            request.query_params.get("value", ""),
+            request.query_params.get("limit", 100),
+        )
+        return JSONResponse(payload, status_code=status)
+
     async def tee_emit(request):
         body = await request.body()
         status, payload = handleTeeEmit(
@@ -230,6 +268,8 @@ def buildApp(ctx):
         routes=[
             Route("/tee/emit", tee_emit, methods=["POST"]),
             Route("/shadow/recall", shadow_recall, methods=["POST"]),
+            Route("/get", l1_get, methods=["GET"]),
+            Route("/lookup", l1_lookup, methods=["GET"]),
             Route("/status", status, methods=["GET"]),
             Route("/brief", brief_endpoint, methods=["GET"]),
             Route("/viz", viz.staticPage, methods=["GET"]),
