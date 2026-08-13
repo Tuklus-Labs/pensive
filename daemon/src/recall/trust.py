@@ -47,6 +47,10 @@ __all__ = [
     "assessTrust",
     "TRUST_FLOOR",
     "SUPERSEDED_CONF_CAP",
+    "UNCORROBORATED_CORPUS_CONF_CAP",
+    "CORPUS_KINDS",
+    "IMPORT_SOURCES",
+    "CORROBORATING_SIGNALS",
     "W_AGREE",
     "W_GAP",
     "W_TIME",
@@ -119,6 +123,30 @@ TRUST_FLOOR = 0.6         # shouldTrust = confidence >= TRUST_FLOOR
 # A superseded atom that survives (its chain ends live) is historical: its
 # confidence is capped strictly below TRUST_FLOOR so shouldTrust is always False.
 SUPERSEDED_CONF_CAP = 0.4
+
+# A bulk-imported corpus row corroborated by ONE lexical signal is a grep hit on
+# a file, not a memory. Capped strictly below TRUST_FLOOR so `shouldTrust` and
+# `confidence` cannot disagree, mirroring the supersession cap rather than
+# inventing a second mechanism.
+#
+# Measured 2026-08-12: 93% of the live store is bulk-imported `document_chunk`,
+# and a keyword-only chunk ranked top with a decisive gap scores 0.749 against a
+# 0.6 floor. The blend cannot see this by itself -- it reads signal agreement,
+# the top1-top2 gap and recency, and a top-ranked recent chunk scores well on all
+# three while resting on exactly one signal. So the trust bit was carrying almost
+# no information across the majority of the store.
+UNCORROBORATED_CORPUS_CONF_CAP = 0.4
+
+# Kinds that are IMPORTED MATERIAL rather than authored memory.
+CORPUS_KINDS = frozenset({"document_chunk"})
+
+# Provenance sources that mean "this row came from an import, not an agent".
+IMPORT_SOURCES = frozenset({"bulk-import"})
+
+# Signals that corroborate a lexical hit. A chunk found by bm25 AND one of these
+# has real evidence behind it and keeps its trust: the corpus is useful, and some
+# answers exist ONLY in chunk form. This is a signal rule, never a kind ban.
+CORROBORATING_SIGNALS = frozenset({"dense", "facet"})
 
 
 def _agreementScore(signals):
@@ -273,6 +301,30 @@ def _liveEnd(atomId, successorMap, forkedOldIds):
     return cur, forked
 
 
+def _isUncorroboratedCorpus(kind, sources, signals):
+    """True when a row is imported material found by lexical match alone.
+
+    All three must hold, and each is doing work:
+
+    * ``kind`` is corpus -- an authored atom is a memory whatever found it.
+    * EVERY provenance source is an import -- a row an agent also wrote through
+      the emit path is not the 283k-row bulk load, and "one source is an import"
+      would condemn those.
+    * no corroborating signal -- dense or facet agreement is real evidence, so
+      this withholds trust from single-signal hits rather than from a kind.
+
+    A row with NO provenance at all is not treated as corpus: absent provenance
+    is unknown, and unknown is not a licence to downgrade something an agent may
+    have written. That fails toward trusting too much, which is the direction the
+    supersession invariant already guards.
+    """
+    if kind not in CORPUS_KINDS:
+        return False
+    if not sources or not sources <= IMPORT_SOURCES:
+        return False
+    return not (signals & CORROBORATING_SIGNALS)
+
+
 def assessTrust(reranked, signalHits, Store, now):
     """Annotate reranked results with confidence, shouldTrust, why, supersession.
 
@@ -314,11 +366,22 @@ def assessTrust(reranked, signalHits, Store, now):
     allIds = list(set(rerankedIds) | chainIds)
     placeholders = ",".join("?" for _ in allIds)
     rows = Store._conn.execute(
-        f"SELECT id, status, COALESCE(occurred_at, created_at) "
+        f"SELECT id, status, COALESCE(occurred_at, created_at), kind "
         f"FROM atoms WHERE id IN ({placeholders})",
         tuple(allIds),
     ).fetchall()
-    statusInfo = {r[0]: (r[1], r[2]) for r in rows}
+    statusInfo = {r[0]: (r[1], r[2], r[3]) for r in rows}
+
+    # One SELECT for provenance sources over the same ids. An atom can carry
+    # several provenance rows, so this is a SET per atom: "every source is an
+    # import" is a different claim from "one source is an import", and only the
+    # first justifies withholding trust.
+    sourcesById = {}
+    for atomId, source in Store._conn.execute(
+        f"SELECT atom_id, source FROM provenance WHERE atom_id IN ({placeholders})",
+        tuple(allIds),
+    ).fetchall():
+        sourcesById.setdefault(atomId, set()).add(source)
 
     # The top-1's lead over the runner-up drives disambiguation for the top atom.
     topGap = None
@@ -334,7 +397,7 @@ def assessTrust(reranked, signalHits, Store, now):
                 f"trust candidate {atomId!r} is absent from the store "
                 "(index/store desync)"
             )
-        status, effectiveTime = statusInfo[atomId]
+        status, effectiveTime, kind = statusInfo[atomId]
         isTop = index == 0
 
         signals = signalHits.get(atomId, set())
@@ -346,6 +409,9 @@ def assessTrust(reranked, signalHits, Store, now):
 
         if status == "live":
             why = _buildWhy(signals, gapScore, temporalScore, isTop)
+            if _isUncorroboratedCorpus(kind, sourcesById.get(atomId, set()), signals):
+                confidence = min(confidence, UNCORROBORATED_CORPUS_CONF_CAP)
+                why = "imported corpus, lexical match only, uncorroborated"
             out.append({
                 "atomId": atomId,
                 "score": score,
@@ -358,7 +424,7 @@ def assessTrust(reranked, signalHits, Store, now):
             continue
         elif status == "superseded":
             end, forked = _liveEnd(atomId, successorMap, forkedOldIds)
-            endStatus = statusInfo.get(end, (None, None))[0]
+            endStatus = statusInfo.get(end, (None, None, None))[0]
             if endStatus != "live":
                 # Chain ends in a tombstone, a missing atom, or (corruption) a
                 # superseded terminal with no successor edge: never surface a

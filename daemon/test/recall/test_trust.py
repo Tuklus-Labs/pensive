@@ -452,3 +452,80 @@ def test_superseded_confidence_never_reaches_the_trust_floor(store):
     row = _by_id(out)[old]
     assert row["confidence"] <= SUPERSEDED_CONF_CAP
     assert row["shouldTrust"] is False
+
+
+# --------------------------------------------------------------------------- #
+# Corpus chunks: a keyword hit on an imported file is not a trusted memory      #
+# --------------------------------------------------------------------------- #
+
+
+def _putChunk(store, text="chunk text", source="bulk-import", occurredAt=NOW):
+    """A document_chunk as the corpus import wrote them: 283k live rows, 93% of
+    the store, none of them written by an agent as a memory."""
+    return putAtom(store, {
+        "text": text, "kind": "document_chunk", "project": "corpus",
+        "importance": 0.0, "provenance": {"source": source},
+        "occurredAt": occurredAt,
+    })
+
+
+def test_keyword_only_bulk_chunk_is_not_trusted(store):
+    """THE CLAIM: `shouldTrust` is a statement about EVIDENCE, and a lexical
+    match on a bulk-imported file is not evidence that a memory is reliable.
+
+    Observed on the live store 2026-08-12 (Grok's v3.1 filing): recall_records
+    returned bulk-import chunks with shouldTrust=true whose own `why` was
+    keyword-only, at confidence 0.630 against a TRUST_FLOOR of 0.6. A grep hit
+    on a README cleared the floor. 93% of this store is that kind of row, so
+    the trust bit was carrying almost no information where it mattered most.
+
+    The confidence blend cannot see this on its own: it reads signal agreement,
+    the top1-top2 gap and recency, and a top-ranked recent chunk scores well on
+    all three while being corroborated by exactly one signal.
+    """
+    chunk = _putChunk(store)
+    runnerUp = _put(store)
+    # Top result, decisive lead, recent: the shape that reached 0.630 live.
+    reranked = [(chunk, 9.0), (runnerUp, 1.0)]
+    out = assessTrust(reranked, {chunk: {"bm25"}, runnerUp: {"bm25"}}, store, NOW)
+    top = _by_id(out)[chunk]
+    assert top["shouldTrust"] is False, (
+        f"a keyword-only bulk-import chunk was trusted at confidence "
+        f"{top['confidence']:.3f} (floor {TRUST_FLOOR})"
+    )
+
+
+def test_a_corroborated_chunk_keeps_its_trust(store):
+    """Regression guard, and the reason this is a signal rule rather than a
+    kind ban: a chunk hit by TWO independent signals has real evidence behind
+    it, and the corpus is genuinely useful. Some answers exist only in chunk
+    form."""
+    chunk = _putChunk(store)
+    runnerUp = _put(store)
+    reranked = [(chunk, 9.0), (runnerUp, 1.0)]
+    out = assessTrust(reranked, {chunk: {"bm25", "dense"}, runnerUp: {"bm25"}},
+                      store, NOW)
+    top = _by_id(out)[chunk]
+    assert top["shouldTrust"] is True, (
+        f"a dual-signal chunk lost its trust (confidence {top['confidence']:.3f})"
+    )
+
+
+def test_an_agent_written_atom_is_unaffected_by_the_corpus_rule(store):
+    """The rule is about IMPORTED CORPUS, not about keyword-only per se. An atom
+    an agent deliberately emitted is a memory whatever signal found it."""
+    atom = _put(store)
+    runnerUp = _put(store)
+    reranked = [(atom, 9.0), (runnerUp, 1.0)]
+    out = assessTrust(reranked, {atom: {"bm25"}, runnerUp: {"bm25"}}, store, NOW)
+    assert _by_id(out)[atom]["shouldTrust"] is True
+
+
+def test_a_chunk_from_a_non_import_source_is_unaffected(store):
+    """Kind alone does not condemn a row: a chunk written by an agent through
+    the emit path is not the 283k-row bulk import."""
+    chunk = _putChunk(store, source="explicit-emit")
+    runnerUp = _put(store)
+    reranked = [(chunk, 9.0), (runnerUp, 1.0)]
+    out = assessTrust(reranked, {chunk: {"bm25"}, runnerUp: {"bm25"}}, store, NOW)
+    assert _by_id(out)[chunk]["shouldTrust"] is True
