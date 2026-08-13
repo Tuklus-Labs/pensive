@@ -435,7 +435,7 @@ def test_brief_endpoint_returns_working_set(embedder, tmp_path, monkeypatch):
         addFacet(s, p, PIN_FACET_KEY, "1")
         ctx = ServeContext(s, embedder, MODEL_ID, agent="heph")
         app = buildApp(ctx)
-        with TestClient(app) as client:
+        with TestClient(app, base_url="http://127.0.0.1") as client:
             r = client.get("/brief", params={"agent": "heph", "budget": 1500})
             assert r.status_code == 200
             payload = r.json()
@@ -468,7 +468,7 @@ def test_brief_endpoint_rejects_bad_budget(embedder, tmp_path, monkeypatch):
     try:
         ctx = ServeContext(s, embedder, MODEL_ID, agent="heph")
         app = buildApp(ctx)
-        with TestClient(app) as client:
+        with TestClient(app, base_url="http://127.0.0.1") as client:
             for bad in ("notanint", "1.5", "0", "-5"):
                 r = client.get("/brief", params={"agent": "heph", "budget": bad})
                 assert r.status_code == 400, f"budget={bad!r} should be 400"
