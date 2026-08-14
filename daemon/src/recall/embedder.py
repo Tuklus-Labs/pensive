@@ -277,6 +277,44 @@ def makeEmbedder(modelId):
         return Embedder(modelId)
 
 
+def embedOne(store, embedder, atomId):
+    """Embed exactly ``atomId`` if it is live and not already embedded.
+
+    Returns 1 if a row was written, 0 if there was nothing to do.
+
+    WHY THIS EXISTS ALONGSIDE ``embedMissing``. The emit path knows precisely
+    which atom it just wrote, and used to call ``embedMissing``, which scans
+    every live atom with a correlated NOT EXISTS to rediscover it. Measured on
+    this store that scan costs 90ms and returns ZERO rows in the steady state,
+    on the event-loop thread, on every emit. Asking "which atoms lack an
+    embedding" when the answer is "the one I am holding" is the defect.
+
+    ``embedMissing`` remains correct and stays the right call for startup and
+    for any caller that cannot name what changed; this is the scoped form.
+    """
+    row = store._conn.execute(
+        "SELECT a.text FROM atoms a WHERE a.id = ? AND a.status = 'live' "
+        "AND NOT EXISTS (SELECT 1 FROM embeddings e "
+        "  WHERE e.atom_id = a.id AND e.model_id = ?)",
+        (atomId, embedder.modelId),
+    ).fetchone()
+    if row is None:
+        return 0
+    vec = embedder.embed([row[0]])[0]
+    now = int(time.time())
+    try:
+        store._conn.execute(
+            "INSERT INTO embeddings(atom_id, model_id, vector, embedded_at) "
+            "VALUES (?, ?, ?, ?)",
+            (atomId, embedder.modelId, vecToBlob(vec), now),
+        )
+        store._conn.commit()
+    except Exception:
+        store._conn.rollback()
+        raise
+    return 1
+
+
 def embedMissing(store, embedder):
     """Embed every LIVE atom lacking an ``embeddings`` row for ``embedder.modelId``.
 

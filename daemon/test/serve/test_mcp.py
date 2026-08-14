@@ -579,22 +579,53 @@ def test_the_agent_property_is_scoped_to_the_emit_tools():
         "hypothesis": "the burn is the code-class HNSW rebuild, not the embed",
     }),
 ])
-def test_emit_rebuilds_memory_index_but_not_code_index(ctx, tool, args):
+def test_emit_indexes_the_new_atom_in_memory_and_leaves_code_alone(ctx, tool, args):
     # Every emit writes a memory-class atom (atom/narrative/snapshot); the code
     # class (the bulk document_chunk corpus, past the HNSW threshold in
-    # production) has no in-daemon write path besides `correct`. Rebuilding its
-    # index per emit is therefore pure waste at full-graph-build cost, so an
-    # emit must rebuild ONLY the memory-class index.
+    # production) has no in-daemon write path besides `correct`. Touching its
+    # index per emit is pure waste at full-graph-build cost.
+    #
+    # ASSERTION CHANGED 2026-08-13, and deliberately STRENGTHENED. This used to
+    # assert `ctx.indexes["memory"] is not memoryBefore`, i.e. that a NEW index
+    # object had been constructed, which pinned the full rebuild as the
+    # mechanism. Emits now maintain the index incrementally (one add, 0.115ms,
+    # against a 272ms rebuild that blocked the event loop), so the object is
+    # mutated in place and identity is preserved. Identity was never the
+    # property that mattered: what matters is that the atom became recallable in
+    # its own class and that the other class was not disturbed. That is what is
+    # asserted now, and it would catch a no-op implementation that the old
+    # identity check could not.
     _put(ctx.store, "def spread(): return activation", kind="document_chunk")
     ctx.reindex()
     codeBefore = ctx.indexes["code"]
-    memoryBefore = ctx.indexes["memory"]
+    codeIdsBefore = list(ctx.indexes["code"]._atomIds)
+    memoryIdsBefore = set(ctx.indexes["memory"]._atomIds)
 
     _, isError = dispatch(ctx, tool, args)
 
     assert isError is False
+    # the code class is untouched, by object AND by contents
     assert ctx.indexes["code"] is codeBefore
-    assert ctx.indexes["memory"] is not memoryBefore
+    assert ctx.indexes["code"]._atomIds == codeIdsBefore
+    # the memory class gained exactly the atom just written
+    memoryIdsAfter = set(ctx.indexes["memory"]._atomIds)
+    gained = memoryIdsAfter - memoryIdsBefore
+    assert len(gained) == 1, f"expected exactly one new memory atom, got {gained}"
+    newId = gained.pop()
+    assert getAtom(ctx.store, newId)["status"] == "live"
+
+
+def _retiredIds(index):
+    """Atom ids the index has retired, whichever way it tracks them.
+
+    FlatIndex masks row POSITIONS in `_retired`; HnswIndex drops the key from
+    the usearch graph and keeps the slot in `_atomIds`. This normalizes both to
+    ids so a test can ask the question once.
+    """
+    retired = getattr(index, "_retired", None)
+    if not retired:
+        return set()
+    return {index._atomIds[pos] for pos in retired}
 
 
 def test_correct_rebuilds_only_the_corrected_atoms_class(ctx):
@@ -612,16 +643,30 @@ def test_correct_rebuilds_only_the_corrected_atoms_class(ctx):
         "newText": "the chassis fans follow the GPU temp sensor, not the CPU",
     })
     assert err is False
+    # ASSERTION CHANGED 2026-08-13: identity-of-index-object pinned the rebuild
+    # mechanism, which incremental maintenance deliberately replaced. What is
+    # asserted instead is the property that mattered: the corrected atom drops
+    # out of its class's index, its replacement appears, and the OTHER class is
+    # untouched in both object and contents.
     assert ctx.indexes["code"] is codeBefore
+    assert note in _retiredIds(ctx.indexes["memory"]), (
+        "the corrected note is still live in the memory index, so it can "
+        "surface beside its own correction")
 
+    codeIdsBefore = list(ctx.indexes["code"]._atomIds)
     memoryBefore = ctx.indexes["memory"]
+    memoryIdsBefore = list(memoryBefore._atomIds)
     _, err = dispatch(ctx, "correct", {
         "oldAtomId": chunk,
         "newText": "class HnswIndex: pass",
     })
     assert err is False
-    assert ctx.indexes["code"] is not codeBefore
+    # the code class gained the replacement chunk
+    assert set(ctx.indexes["code"]._atomIds) - set(codeIdsBefore), \
+        "the corrected chunk's replacement never entered the code index"
+    # the memory class was not disturbed by a code-class correction
     assert ctx.indexes["memory"] is memoryBefore
+    assert ctx.indexes["memory"]._atomIds == memoryIdsBefore
 
 
 def test_reindex_default_still_rebuilds_every_class(ctx):

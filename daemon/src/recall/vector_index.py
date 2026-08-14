@@ -76,6 +76,47 @@ class VectorIndex(abc.ABC):
     def search(self, vec, k):
         """Return up to ``k`` ``(atomId, score)`` pairs, best score first."""
 
+    @abc.abstractmethod
+    def add(self, atomId, vec):
+        """Add ONE already-embedded atom without rebuilding; return ``self``.
+
+        WHY THIS EXISTS. ``build`` is how the index learns who is recallable, and
+        it costs 272ms for the memory class and 18.6s for the code class on this
+        store. Every emit used to pay that, synchronously, on the event-loop
+        thread, which is what set L2's P95 tail (measured maxima of 2,961ms and
+        6,286ms against a 20ms budget). One ``add`` costs 0.115ms.
+
+        ``add`` IS NOT SUFFICIENT ON ITS OWN. It pairs with ``remove``. An
+        earlier version of this seam shipped ``add`` alone, arguing that
+        ``recall.trust.assessTrust`` already resolves status per query and would
+        keep retracted atoms out of results. That argument was wrong in a
+        specific way worth recording: ``assessTrust`` resolves status but does
+        not DROP a superseded atom, it annotates it with ``supersededBy`` at a
+        capped confidence, so the retired claim still reaches the payload beside
+        the current one. The full rebuild used to prevent that implicitly by
+        loading live atoms only.
+
+        ``vec`` must be unit-normalized, as ``build`` requires, because search
+        treats stored rows as unit length.
+        """
+
+    @abc.abstractmethod
+    def remove(self, atomId):
+        """Stop returning ``atomId``; return True if it was present.
+
+        WHY THIS IS REQUIRED AND NOT OPTIONAL. An earlier version of this seam
+        shipped ``add`` alone, on the reasoning that ``recall.trust.assessTrust``
+        already resolves status per query and would keep retracted atoms out of
+        results. It does resolve status, and it does NOT drop them: a superseded
+        atom surfaces ANNOTATED with ``supersededBy`` at a capped confidence.
+        `test_correct_supersedes_and_recall_shows_current_truth` caught it, by
+        asking a question whose retired answer ("100 meters") reappeared beside
+        the current one ("40 meters").
+
+        The full rebuild used to enforce this implicitly by loading only live
+        atoms. Incremental maintenance has to do it explicitly.
+        """
+
 
 class FlatIndex(VectorIndex):
     """Brute-force cosine index: an in-memory matrix scanned per query.
@@ -89,6 +130,9 @@ class FlatIndex(VectorIndex):
         self._atomIds = []
         # (n, dim) float32 of unit-normalized rows; empty until build().
         self._matrix = np.empty((0, 0), dtype=np.float32)
+        # Row positions retired since the last build. A rebuild loads live atoms
+        # only, so it starts empty again.
+        self._retired = set()
 
     def build(self, store, modelId, kinds=None):
         kindClause, kindParams = kindInClause(kinds, alias="a")
@@ -100,6 +144,7 @@ class FlatIndex(VectorIndex):
             (modelId, *kindParams),
         ).fetchall()
         self._atomIds = [r[0] for r in rows]
+        self._retired = set()
         if rows:
             # np.stack copies the read-only frombuffer views into one owned,
             # writable (n, dim) array.
@@ -108,6 +153,29 @@ class FlatIndex(VectorIndex):
             )
         else:
             self._matrix = np.empty((0, 0), dtype=np.float32)
+        return self
+
+    def remove(self, atomId):
+        # Masked, not deleted. A row's POSITION is its identity here (_atomIds[i]
+        # names _matrix[i]), so deleting a row would renumber every atom after it
+        # and hand back wrong ids for correct vectors. The mask costs one bool
+        # per row and is applied in search.
+        try:
+            pos = self._atomIds.index(atomId)
+        except ValueError:
+            return False
+        self._retired.add(pos)
+        return True
+
+    def add(self, atomId, vec):
+        row = np.asarray(vec, dtype=np.float32).reshape(1, -1)
+        if self._matrix.shape[0] == 0:
+            # A never-built or empty index carries shape (0, 0), so vstack would
+            # raise on the dimension mismatch. The first row defines the width.
+            self._matrix = row.copy()
+        else:
+            self._matrix = np.vstack([self._matrix, row])
+        self._atomIds.append(atomId)
         return self
 
     def search(self, vec, k):
@@ -121,17 +189,32 @@ class FlatIndex(VectorIndex):
         # product a true cosine for any caller-supplied vector.
         query = query / norm
         scores = self._matrix @ query
-        n = scores.shape[0]
+        # Retired rows are EXCLUDED, not merely scored low. Scoring them -inf was
+        # the first attempt and it does not work: when k >= n this method returns
+        # every row sorted by score, so a retired atom still comes back, just
+        # ranked last. That is exactly the failure
+        # `test_correct_supersedes_and_recall_shows_current_truth` reports, since
+        # a corrected fact reappearing at the bottom of the payload is still the
+        # corrected fact reappearing.
+        candidates = np.arange(scores.shape[0])
+        if self._retired:
+            keep = np.ones(scores.shape[0], dtype=bool)
+            keep[list(self._retired)] = False
+            candidates = candidates[keep]
+            if candidates.size == 0:
+                return []
+        sub = scores[candidates]
+        n = sub.shape[0]
         k = min(k, n)
         if k >= n:
-            order = np.argsort(-scores, kind="stable")
+            order = candidates[np.argsort(-sub, kind="stable")]
         else:
             # argpartition finds the top-k unordered in O(n), then we sort only
             # those k by descending score. Deterministic for a given input, but
             # (unlike the k >= n branch) the selected subset is not in atom-id
             # order, so tie order among equal scores here is unspecified.
-            part = np.argpartition(-scores, k - 1)[:k]
-            order = part[np.argsort(-scores[part], kind="stable")]
+            part = np.argpartition(-sub, k - 1)[:k]
+            order = candidates[part[np.argsort(-sub[part], kind="stable")]]
         return [(self._atomIds[i], float(scores[i])) for i in order]
 
 

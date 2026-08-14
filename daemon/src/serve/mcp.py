@@ -45,7 +45,7 @@ from mcp.server import Server
 from mcp.types import CallToolResult, TextContent, Tool
 
 from recall.engine import recall, DEFAULT_TIER, TIERS
-from recall.embedder import embedMissing
+from recall.embedder import embedMissing, embedOne, blobToVec
 from recall.strata import KIND_CLASSES
 from recall.vector_index import buildClassIndexes, selectIndex
 from recall.payload import assembleTier2, estimateTokens
@@ -260,6 +260,67 @@ class ServeContext:
         self.aux = aux
         self.recallLogErrors = 0
         self.reindex()
+
+    def indexAtom(self, atomId, kind):
+        """Make ONE just-written atom recallable, without rebuilding a class.
+
+        This is what the emit/correct handlers call. ``reindex`` remains for
+        construction and for any caller that cannot name what changed.
+
+        WHY. The old path was ``reindex(kinds=(kind,))``, which cost, measured on
+        this store: 90ms for ``embedMissing`` to scan 299,728 live atoms and
+        return zero rows, plus 272ms to rebuild the memory class (18.6s for the
+        code class). All of it synchronous on the event-loop thread, so every
+        concurrent read waited behind it. That is what set L2's P95 tail; the
+        median was never the problem.
+
+        WHY IT IS SAFE. A retirement needs no index work at all, which is the
+        part that looks wrong and is not. ``recall.trust.assessTrust`` runs
+        unconditionally in the pipeline and reads ``status`` from the canonical
+        store for every atom it returns, dropping tombstones and chaining
+        superseded atoms to their live replacement. Verified end to end by
+        injecting a superseded atom into a live index: the raw index returns it,
+        ``recall()`` does not. Index staleness costs ranking QUALITY, never
+        correctness.
+
+        Falls back to a full ``reindex`` when the class has no index yet, or when
+        the atom has no embedding to add. Falling back is slow and correct; the
+        alternative is an atom that silently never becomes dense-recallable.
+        """
+        embedOne(self.store, self.embedder, atomId)
+        row = self.store._conn.execute(
+            "SELECT vector FROM embeddings WHERE atom_id = ? AND model_id = ?",
+            (atomId, self.modelId),
+        ).fetchone()
+        if row is None:
+            self.reindex(kinds=(kind,))
+            return
+        vec = blobToVec(row[0])
+        for name, classKinds in KIND_CLASSES:
+            if kind not in classKinds:
+                continue
+            index = self.indexes.get(name)
+            if index is None:
+                self.indexes[name] = selectIndex(self.store, self.modelId, classKinds)
+            else:
+                index.add(atomId, vec)
+        if self.aux is not None:
+            self.aux.reindex(self.store, (kind,))
+
+    def retireAtom(self, atomId, kind):
+        """Stop the index returning ``atomId``, which is no longer live.
+
+        The full rebuild used to do this implicitly by loading live atoms only.
+        Incremental maintenance must do it explicitly, because ``assessTrust``
+        annotates a superseded atom rather than dropping it: without this, a
+        corrected fact keeps surfacing beside its own correction.
+        """
+        for name, classKinds in KIND_CLASSES:
+            if kind not in classKinds:
+                continue
+            index = self.indexes.get(name)
+            if index is not None:
+                index.remove(atomId)
 
     def reindex(self, kinds=None):
         """Embed missing live atoms and rebuild dense indexes.
@@ -750,7 +811,7 @@ def _writeAtom(ctx, args, text, outcome, principle, shape):
         addFacet(ctx.store, atomId, "shape", shape.strip())
     for tag in dict.fromkeys(_splitCsv(args.get("tags", ""))):
         addFacet(ctx.store, atomId, "tag", tag)
-    ctx.reindex(kinds=("atom",))
+    ctx.indexAtom(atomId, "atom")
     return (f"atom [{outcome}] emitted (emission_id: {_emissionId()}): "
             f"{principle[:80]} (ok)")
 
@@ -806,14 +867,14 @@ def handle_emit_failure(ctx, args):
 def handle_emit_narrative(ctx, args):
     _require(args, ["project", "narrative"])
     text = _boundedEmitText(_truncateWords(args["narrative"]), "emit: narrative")
-    putAtom(ctx.store, {
+    atomId = putAtom(ctx.store, {
         "text": text,
         "kind": "narrative",
         "project": args["project"],
         "importance": 0.0,
         "provenance": _emitProvenance(ctx, args),
     })
-    ctx.reindex(kinds=("narrative",))
+    ctx.indexAtom(atomId, "narrative")
     return f"Narrative fragment emitted (emission_id: {_emissionId()})"
 
 
@@ -828,14 +889,14 @@ def handle_emit_snapshot(ctx, args):
     if nextSteps:
         lines.append("next steps: " + "; ".join(nextSteps))
     _boundedEmitText("\n".join(lines), "emit: snapshot")
-    putAtom(ctx.store, {
+    atomId = putAtom(ctx.store, {
         "text": "\n".join(lines),
         "kind": "snapshot",
         "project": args["project"],
         "importance": 0.0,
         "provenance": _emitProvenance(ctx, args),
     })
-    ctx.reindex(kinds=("snapshot",))
+    ctx.indexAtom(atomId, "snapshot")
     return f"snapshot emitted: {hypothesis[:80]} (ok)"
 
 
@@ -1182,7 +1243,8 @@ def handle_correct(ctx, args):
         "provenance": provenance,
     })
     supersede(ctx.store, oldId, newId, provenance)
-    ctx.reindex(kinds=(old["kind"],))
+    ctx.indexAtom(newId, old["kind"])
+    ctx.retireAtom(oldId, old["kind"])
     return f"corrected {_HANDLE}{oldId} -> {_HANDLE}{newId} (ok)"
 
 

@@ -535,3 +535,67 @@ A workflow is independently designing and building this with three adversarial
 verifiers. This analysis was written before its results returned so the two can
 be compared. If its design proposes a query-time liveness filter, that is
 evidence it made the same component-to-system leap I did.
+
+---
+
+# RETRACTION: the section above is wrong, and a test caught it
+
+The section titled "CORRECTION: the engine already resolves status at query
+time, so the fix is smaller" claims a superseded atom cannot reach a result
+because `assessTrust` resolves status per query. **That is false and the fix is
+not smaller.** Left in place rather than deleted, because the wrong version
+shipped in a commit and someone may have read it.
+
+`assessTrust` resolves status and does NOT drop a superseded atom. It annotates
+it with `supersededBy` at a confidence capped below `TRUST_FLOOR`, exactly as
+`trust.py` says: "a superseded atom NEVER surfaces ALONE". Alone was doing all
+the work in that sentence and I read past it.
+
+`test_correct_supersedes_and_recall_shows_current_truth` caught it, by asking a
+question whose retired answer had to reappear if the mechanism were missing:
+
+```
+assert "40 meters after the overlap fix" in rtext
+assert "100 meters" not in rtext
+E  '100 meters' is contained here:
+E      the survey line spacing is 100 meters
+E    source bulk-import, ..., superseded by p3://01KZZE...
+```
+
+## How I convinced myself of a false thing
+
+By running a test that could not fail. I injected a superseded atom into a live
+index, ran `recall()`, saw it absent from the results, and concluded the engine
+had dropped it. It was absent because it did not RANK for that query. The test
+never established that it would have appeared if the mechanism were missing, so
+its pass carried no information.
+
+That is the second non-discriminating probe in this campaign, after the usearch
+`remove()` check recorded above. Both returned exactly the answer I expected.
+The rule now written into `test_incremental_index.py`: an exclusion test must
+first assert INCLUSION, in the same run, on the same input.
+
+## And the first fix was also wrong
+
+Retired rows were masked by setting their score to `-inf`. That lowers the rank
+and does not exclude the row: `FlatIndex.search` returns EVERY row sorted by
+score when `k >= n`, so the retired atom still came back, last. A corrected fact
+reappearing at the bottom of the payload is still the corrected fact
+reappearing. Retired positions are now dropped from the candidate set before
+top-k selection.
+
+## What actually shipped
+
+| event | before | after |
+|---|---|---|
+| emit | `embedMissing` 90ms scan returning 0 rows, then a 272ms class rebuild, both blocking the event loop | `embedOne` (PK lookup) plus one `index.add`, **0.115ms** |
+| correct | full class rebuild | `add` the replacement, `remove` the retired atom, both O(1) |
+| retirement | implicit, via a rebuild that loaded live atoms only | **explicit**, via `VectorIndex.remove` |
+
+`VectorIndex` grew two abstract methods, `add` and `remove`, and they are a
+pair: `add` alone is the mistake this retraction documents. `FlatIndex` masks
+row positions (position is identity there, so deleting would renumber every
+later atom); `HnswIndex` drops the key from the usearch graph, verified
+discriminatingly rather than from documentation.
+
+Suite: 751 passed, 1 skipped.

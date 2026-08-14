@@ -85,6 +85,36 @@ class HnswIndex(VectorIndex):
         self._index = index
         return self
 
+    def remove(self, atomId):
+        if self._index is None:
+            return False
+        try:
+            key = self._atomIds.index(atomId)
+        except ValueError:
+            return False
+        # usearch drops the key from the graph, so search stops returning it.
+        # Verified discriminatingly rather than by documentation: an atom queried
+        # with its OWN vector ranks first, and is absent from the top-3 after
+        # remove. _atomIds keeps its slot so every later key still maps correctly.
+        self._index.remove(key)
+        return True
+
+    def add(self, atomId, vec):
+        row = np.asarray(vec, dtype=np.float32).reshape(-1)
+        if self._index is None:
+            # build() leaves _index None on an empty store because usearch needs
+            # a positive ndim to construct. The first added vector supplies it.
+            self._index = Index(ndim=row.shape[0], metric="cos", dtype="f32")
+        key = len(self._atomIds)
+        # The key must equal the position this atom takes in _atomIds, because
+        # search maps a usearch key straight back through _atomIds[key]. Appending
+        # keeps that correspondence, and ULIDs are monotonic so a newly written
+        # atom also sorts last under build()'s ORDER BY atom_id: the append lands
+        # where a rebuild would have put it.
+        self._index.add(key, row)
+        self._atomIds.append(atomId)
+        return self
+
     def search(self, vec, k):
         if self._index is None or k <= 0:
             return []
