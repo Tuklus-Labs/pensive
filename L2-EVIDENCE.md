@@ -314,3 +314,43 @@ whoever picks this up: rebuild off the event loop, make it incremental rather
 than a full class rebuild, or decouple write-visibility from index freshness.
 Each trades something real (staleness, complexity, or memory) and none of them
 should be chosen from a benchmark number alone.
+
+## The obvious fix is not safe, checked before proposing it
+
+The tempting fix is incremental append: a memory emit adds ONE vector, so
+appending it to the flat index should cost microseconds instead of 272ms
+rebuilding 16,763 rows. `FlatIndex` holds `_atomIds` and an `(n, dim)` matrix,
+and `search` is `_matrix @ query`, so an append is mechanically trivial.
+
+It is still wrong, for two reasons found by reading rather than by trying it:
+
+1. **Append handles inserts and not retirements.** A `correct` supersedes an
+   atom, and a superseded atom must stop being recallable. The full rebuild gets
+   that for free through `WHERE a.status = 'live'`. An append-only path would
+   leave retired atoms searchable, which is a correctness failure in a memory
+   system, not a performance one. Any incremental scheme needs a removal path,
+   and removal from a packed matrix is the expensive direction.
+2. **There is an ordering invariant shared with the other index.**
+   `hnsw_index.py` documents both indexes agreeing on rows "ordered by
+   `atom_id`". Appending at the tail breaks that agreement, and the consequences
+   live in code this measurement did not read.
+
+So the fix is a design decision with correctness stakes, and the options each
+give something up:
+
+| approach | gives up |
+|---|---|
+| rebuild off the event loop | the store's documented single-thread affinity |
+| incremental insert plus a removal path | complexity, and the ordering invariant needs re-establishing |
+| decouple write-visibility from index freshness | read-your-writes, which is why `reindex` exists |
+
+None of these should be chosen from a latency number. Recorded and handed off
+deliberately rather than implemented at the end of a long session against a
+store holding material that cannot be regenerated.
+
+**The cheap operational mitigation, available now and not implemented either:**
+the 18.6s figure belongs to the `document_chunk` class, which is written only by
+bulk import. Nothing writes chunks during normal serving, so that path is
+dormant in practice. The live cost is the 272ms memory rebuild, which fires on
+every agent emit. An agent that emits during its own benchmark measures its own
+writes.
