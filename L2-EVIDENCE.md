@@ -439,3 +439,33 @@ Not implemented here. A workflow is designing and building this in an isolated
 worktree with three adversarial verifiers whose explicit job is to make a
 superseded atom recallable. This section is the independent analysis their
 result gets judged against, written before seeing it.
+
+## What the incremental path actually costs, measured
+
+usearch 2.25.3. Both kind classes exceed `HNSW_THRESHOLD = 5000` (memory is
+16,763, code is 282,985), so both use the usearch HNSW index, not the flat one.
+
+| operation | cost | against |
+|---|---:|---|
+| `usearch.add` one vector | **0.115 ms** | 272 ms rebuild (2,365x) |
+| usearch build 16,763 | 212 ms | reproduces the measured 272ms selectIndex |
+| flat vstack append @16,763 | 0.918 ms | (flat is not used at this size) |
+| flat vstack append @282,985 | 33.758 ms | 18,645 ms rebuild (552x) |
+
+So the write path becomes a 0.115ms index add plus the atom write, instead of a
+272ms or 18,645ms full rebuild of the class.
+
+**A caveat on my own probe, recorded because it is the shape of test this
+campaign keeps catching.** I checked `usearch.remove(key)` by asking whether the
+key appeared in the top-5 before and after removal. It read False before and
+False after, which proves nothing: the key was never in the result set, so the
+removal had nothing to demonstrate. A non-discriminating check that returns the
+expected answer is worse than no check, because it reads as evidence. Retirement
+semantics under usearch remain UNVERIFIED here and are assigned to the
+adversarial verifiers, whose explicit task is to make a superseded atom
+recallable.
+
+This does not weaken the design, because the correctness argument rests on
+query-time liveness filtering rather than on removal. If `remove` turns out to
+be unreliable, the index simply keeps the row and the query-time filter drops
+it, which is the same outcome by a different route.
