@@ -354,3 +354,88 @@ bulk import. Nothing writes chunks during normal serving, so that path is
 dormant in practice. The live cost is the 272ms memory rebuild, which fires on
 every agent emit. An agent that emits during its own benchmark measures its own
 writes.
+
+---
+
+# THE UNBLOCK: why the write must rebuild at all, and why it need not
+
+Measured 2026-08-13 after the tail root cause landed. This is the enabling
+analysis, run in parallel with a multi-agent design pass so the two can be
+compared rather than one rubber-stamping the other.
+
+## The two signals do not follow the same rule, and that asymmetry IS the blocker
+
+`recall/signals.py` documents the lexical contract:
+
+> "`bm25` joins the FTS rowid back to `atoms` and filters `status='live'` AT
+> QUERY TIME -- an atom superseded after it was indexed is excluded even though
+> its text is still in the FTS index."
+
+The dense signal does the opposite (`signals.py:259`):
+
+> "live-only candidate universe are the index's responsibility"
+
+So lexical tolerates a stale index by construction, and dense does not. That is
+the entire reason a write must rebuild the dense index synchronously: liveness
+is enforced at BUILD time, so the build must chase every write.
+
+Make dense filter liveness at query time, exactly as bm25 already does, and
+index staleness stops being a correctness problem.
+
+## What that filter costs, and the 564x trap on the way to measuring it
+
+First measurement said 43ms, which would have killed the idea. It was measuring
+a query planner failure, not a filter:
+
+```
+WHERE id IN (200 ids) AND status='live'
+  -> SEARCH atoms USING INDEX idx_atoms_status (status=?)          43.020 ms
+WHERE id IN (200 ids)
+  -> SEARCH atoms USING COVERING INDEX sqlite_autoindex_atoms_1     0.078 ms
+```
+
+SQLite chooses `idx_atoms_status`, an index matching 299,728 rows, over 200
+primary-key seeks. Production carries no `sqlite_stat1`, so the planner assumes
+an index implies selectivity; `status` has about three distinct values and that
+index is worthless for filtering. Same defect class as the `enrich.py` hub query
+fixed earlier in this campaign (1182ms to 24ms).
+
+| formulation | p50 |
+|---|---:|
+| naive `id IN (...) AND status='live'` | 43.020 ms |
+| PK forced with `INDEXED BY` | **0.106 ms** |
+| fetch `id, status` and filter in Python | **0.116 ms** |
+| the rebuild this replaces | 272 ms |
+
+**0.116ms of read cost to remove a 272ms write-path block.** That is 0.6% of the
+L2 budget against something 13x larger than the whole budget.
+
+Worth recording separately: the hot path today (`strata.py:122`,
+`engine.py:357`) uses `SELECT id, kind FROM atoms WHERE id IN (...)` with NO
+status predicate, so it already gets the covering index and is not affected. The
+trap is not in production code; it is waiting for whoever adds a liveness filter
+without checking the plan.
+
+## The shape of the fix
+
+1. **Query-time liveness filter on the dense signal**, written to use the
+   primary key. Retirement is handled downstream, so a superseded atom is
+   unrecallable regardless of index freshness. This is the correctness half and
+   it makes dense symmetric with lexical.
+2. **Incremental append on insert**, so a newly written atom is dense-recallable
+   immediately and read-your-writes survives in full. ULID monotonicity means an
+   append preserves the `ORDER BY atom_id` the two index types are built under.
+3. **No full rebuild on the write path.** The 272ms block disappears rather than
+   moving somewhere else.
+4. Optional background compaction to reclaim rows that liveness filtering is
+   masking, purely a memory concern, never a correctness one.
+
+The correctness argument rests on step 1 alone: even if step 2 were omitted
+entirely, no superseded atom can be returned. Step 2 buys freshness, not safety.
+
+## Status
+
+Not implemented here. A workflow is designing and building this in an isolated
+worktree with three adversarial verifiers whose explicit job is to make a
+superseded atom recallable. This section is the independent analysis their
+result gets judged against, written before seeing it.
