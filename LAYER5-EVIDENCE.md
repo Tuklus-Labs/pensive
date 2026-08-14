@@ -121,3 +121,72 @@ retrievals, so a source filter is necessary but not sufficient.
 Nothing wired. This is the evidence a design has to survive, not the design.
 Every number here is from the live store, read-only, and reproducible with the
 queries in this session.
+
+---
+
+## Design returned 2026-08-13, and it found something worse than the filing
+
+Two claims verified against source rather than taken on report.
+
+### The job cannot run, not merely "has not run"
+
+`lifecycle/importance.py:62` stamps the drained rows with:
+
+```python
+f"UPDATE recall_log SET processed_at = ? WHERE id IN ({placeholders})"
+```
+
+One placeholder per row. Measured against the live store:
+
+```
+  SQLITE_LIMIT_VARIABLE_NUMBER  250,000
+  unprocessed backlog           345,996
+  -> the job CANNOT RUN on production data
+```
+
+It raises `too many SQL variables` after roughly 2 seconds, having already
+executed ~10,494 atom UPDATEs inside the open transaction which then roll back.
+Wire it to a timer without touching it and you get a job that burns CPU forever,
+drains nothing, and does so silently if the runner swallows the exception, which
+is the normal shape for a background job.
+
+This sharpens the finding at the top of this document. I wrote that read-time
+accrual "has never run in production". The stronger and more useful statement is
+that it has only ever met fixture-sized inputs, and would have failed the first
+time it met real ones. A function whose tests pass and whose production input
+exceeds an engine limit is not untested, it is tested against the wrong universe.
+
+The fix is not a bigger chunk size. The stamp becomes a range predicate over a
+frontier rowid snapshotted at job start: two bound values regardless of backlog
+size, measured at 345,964 rows stamped in 676ms in one statement.
+
+### Accrual must not write to `atoms.importance`, and the reason is a trigger
+
+`store/schema.sql:104`:
+
+```sql
+CREATE TRIGGER IF NOT EXISTS atoms_au AFTER UPDATE ON atoms BEGIN
+  INSERT INTO fts(fts, rowid, text) VALUES ('delete', old.rowid, old.text);
+  INSERT INTO fts(rowid, text) VALUES (new.rowid, new.text);
+END;
+```
+
+No column guard. Any update to any column re-indexes the row's full text.
+Interleaved A/B, same connection, 10,000 accruals, three rounds:
+
+| approach | wall | WAL growth |
+|---|---:|---:|
+| `UPDATE atoms SET importance=...` (fires the trigger) | 424 / 471 / 319 ms | 9.3 / 17.7 / 10.4 MB |
+| upsert into a side table | 11.1 / 9.0 / 5.9 ms | 0.9 / 0.5 / 0.5 MB |
+
+36 to 53x wall and 10 to 20x WAL for identical accounting.
+
+So read-time usage belongs in its own table, which also honours the correction
+at the top of this document: write-time reinforcement and read-time accrual are
+different mechanisms on different scales and must not share a column. It buys
+reversibility too, since accrual never mutates a canonical row and there is no
+record of pre-accrual importance values to restore.
+
+**A live consequence, filed here because it is not hypothetical.** The WIRED
+distiller reinforcement pays this FTS re-index tax today, on every near-duplicate
+emit. That is a current cost on the write path, not a future cost of this layer.
