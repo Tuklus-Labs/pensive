@@ -472,6 +472,11 @@ it, which is the same outcome by a different route.
 
 ## CORRECTION: the engine already resolves status at query time, so the fix is smaller
 
+> **THIS SECTION IS WRONG. See the RETRACTION near the end of this file.**
+> `assessTrust` resolves status but does NOT drop a superseded atom, it
+> annotates it, so retirement DOES need explicit index work. Kept because
+> the wrong version shipped; marked here so it cannot be read in isolation.
+
 Two sections above I wrote that the dense signal has no query-time liveness
 filter and that adding one is the precondition for deferring the rebuild. The
 first half is true of the SIGNAL and false of the ENGINE, and the difference is

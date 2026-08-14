@@ -13,14 +13,24 @@ synchronous on the event-loop thread, so every concurrent read waited behind it.
 That is what set L2's P95 tail: measured maxima of 2,961ms and 6,286ms against a
 20ms budget, while the median sat at 26-32ms. The median was never the problem.
 
-THE PART THAT LOOKS WRONG AND IS NOT. Retirement does no index work at all.
-``recall.trust.assessTrust`` runs unconditionally in the pipeline and issues one
-SELECT for ``status`` over every reranked atom, dropping tombstones and chaining
-superseded atoms to their live replacement. So the index is NOT what keeps a
-retracted atom out of a result, and a stale index costs ranking QUALITY (a dead
-row occupying a candidate slot) rather than correctness. That claim is not taken
-on faith here: ``test_a_superseded_atom_left_in_the_index_is_not_recallable``
-injects one and drives the real engine.
+RETIREMENT NEEDS EXPLICIT INDEX WORK, and this file header once said the
+opposite. The claim was that ``recall.trust.assessTrust`` resolves ``status``
+per query and would therefore keep a retracted atom out of results by itself.
+It does resolve status, and it does not DROP a superseded atom: it annotates it
+with ``supersededBy`` at a capped confidence, so the retired claim still reaches
+the payload beside the current one. A rebuild used to prevent that implicitly by
+loading live atoms only, so incremental maintenance has to do it explicitly,
+which is why ``add`` and ``remove`` are a pair.
+
+That paragraph also cited
+``test_a_superseded_atom_left_in_the_index_is_not_recallable`` as its evidence.
+No such test was ever written. A docstring citing a test that does not exist is
+worse than one citing nothing, because it reads as verification. The real
+evidence is ``test_correct_supersedes_and_recall_shows_current_truth`` in
+test/serve/test_mcp.py, which is what actually caught the error.
+
+Corrected in place rather than rewritten silently, because the wrong version
+shipped in a commit.
 """
 import numpy as np
 import pytest
@@ -69,9 +79,15 @@ def test_add_keeps_key_and_atomid_in_correspondence(cls):
     vecs = [unit(100 + i) for i in range(6)]
     for atomId, vec in zip(ids, vecs):
         index.add(atomId, vec)
-    assert index._atomIds == ids
+    assert index._atomIds == ids, (
+        "key-to-atomId correspondence broken: search maps a usearch key "
+        "through _atomIds[key], so a mismatch returns the WRONG ATOM for a "
+        "correct vector, which is a wrong answer and not an error. "
+        f"expected {ids} got {index._atomIds}")
     for atomId, vec in zip(ids, vecs):
-        assert index.search(vec, 1)[0][0] == atomId
+        assert index.search(vec, 1)[0][0] == atomId, (
+            "key-to-atomId correspondence broken: an atom queried with its "
+            f"OWN vector returned {index.search(vec, 1)[0][0]!r}, not {atomId!r}")
 
 
 @pytest.mark.parametrize("cls", [FlatIndex, HnswIndex])
@@ -118,9 +134,14 @@ def test_remove_stops_an_atom_being_returned(cls):
     victim, victimVec = "r2", vecs["r2"]
     # INCLUSION FIRST: queried with its own vector it must rank first, or this
     # test has no power and its later assertion proves nothing.
-    assert index.search(victimVec, 5)[0][0] == victim
+    assert index.search(victimVec, 5)[0][0] == victim, (
+        "THIS TEST HAS NO POWER: the victim must rank first BEFORE removal, "
+        "or the absence assertion below cannot fail and proves nothing. "
+        f"top-5 was {[a for a, _ in index.search(victimVec, 5)]}")
 
-    assert index.remove(victim) is True
+    assert index.remove(victim) is True, (
+        "remove() contract violated: it must report True when the atom was "
+        f"present, and {victim!r} was just asserted to rank first")
     got = [a for a, _ in index.search(victimVec, 5)]
     assert victim not in got, f"{victim} survived removal: {got}"
     # and the survivors are untouched
@@ -131,7 +152,9 @@ def test_remove_stops_an_atom_being_returned(cls):
 def test_remove_is_honest_about_an_unknown_atom(cls):
     index = cls()
     index.add("present", unit(500))
-    assert index.remove("never-added") is False
+    assert index.remove("never-added") is False, (
+        "remove() contract violated: an unknown atom must report False "
+        "rather than raising or silently reporting success")
     assert index.search(unit(500), 1)[0][0] == "present"
 
 
@@ -154,7 +177,9 @@ def test_remove_then_add_keeps_later_atoms_addressable(cls):
     for atomId, vec in zip(ids, vecs):
         if atomId == "s1":
             continue
-        assert index.search(vec, 1)[0][0] == atomId
+        assert index.search(vec, 1)[0][0] == atomId, (
+            "key-to-atomId correspondence broken: an atom queried with its "
+            f"OWN vector returned {index.search(vec, 1)[0][0]!r}, not {atomId!r}")
 
 
 @pytest.mark.parametrize("cls", [FlatIndex, HnswIndex])
@@ -162,9 +187,13 @@ def test_removing_every_atom_leaves_an_empty_result_not_a_crash(cls):
     index = cls()
     v = unit(800)
     index.add("only", v)
-    assert index.search(v, 3)[0][0] == "only"
+    assert index.search(v, 3)[0][0] == "only", (
+        "THIS TEST HAS NO POWER: the atom must be returned before removal, "
+        "or the empty-result assertion below cannot fail")
     index.remove("only")
-    assert index.search(v, 3) == []
+    assert index.search(v, 3) == [], (
+        "an index whose every atom is retired must return no results; "
+        f"got {index.search(v, 3)}")
 
 
 def test_flat_add_preserves_unit_norm_rows():

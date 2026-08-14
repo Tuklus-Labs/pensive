@@ -64,14 +64,20 @@ def test_the_model_id_is_unchanged(onnxEmb):
     """Embeddings are keyed (atom_id, model_id). A different id here strands
     every stored vector and re-embeds the store on next startup. The id names
     the embedding SPACE, not the inference library."""
-    assert onnxEmb.modelId == MODEL
+    assert onnxEmb.modelId == MODEL, (
+        "model id changed: embeddings are keyed (atom_id, model_id), so a "
+        "different id strands all 340,722 stored vectors and silently "
+        f"re-embeds the store on next startup. got {onnxEmb.modelId!r}")
 
 
 @onnxOnly
 def test_the_dimension_matches_the_stored_blobs(onnxEmb):
     """schema.sql fixes 384 float32 for this model; a mismatch would write
     blobs the flat index cannot stack."""
-    assert onnxEmb.dim == 384
+    assert onnxEmb.dim == 384, (
+        "embedding dimension is not 384: schema.sql fixes a 1536-byte "
+        "float32 blob for this model, so any other width writes rows the "
+        f"flat index cannot stack. got {onnxEmb.dim}")
 
 
 # --------------------------------------------------------------------------- #
@@ -167,7 +173,10 @@ def test_the_dim_probe_cannot_report_a_token_count(onnxEmb):
     """`dim` is derived from a forward pass, which is only safe if that pass
     yields a vector. On the unpooled graph the same probe reported 4, the token
     count of the probe string, and every downstream size check inherited it."""
-    assert onnxEmb.dim == 384
+    assert onnxEmb.dim == 384, (
+        "embedding dimension is not 384: schema.sql fixes a 1536-byte "
+        "float32 blob for this model, so any other width writes rows the "
+        f"flat index cannot stack. got {onnxEmb.dim}")
 
 
 @onnxOnly
@@ -252,7 +261,9 @@ def test_the_daemon_actually_builds_its_embedder_through_the_factory():
 
 def test_no_env_var_means_the_torch_path(monkeypatch):
     monkeypatch.delenv("PENSIVE_V3_ONNX_MODEL", raising=False)
-    assert type(makeEmbedder(MODEL)).__name__ == "Embedder"
+    assert type(makeEmbedder(MODEL)).__name__ == "Embedder", (
+        "with no env var set the factory must return the torch path; "
+        "returning anything else means the feature is on by default")
 
 
 def test_a_bad_path_falls_back_rather_than_killing_the_daemon(monkeypatch, capfd):
@@ -261,6 +272,8 @@ def test_a_bad_path_falls_back_rather_than_killing_the_daemon(monkeypatch, capfd
     set it deserves to know it did not take."""
     monkeypatch.setenv("PENSIVE_V3_ONNX_MODEL", "/nonexistent/graph.onnx")
     emb = makeEmbedder(MODEL)
-    assert type(emb).__name__ == "Embedder"
+    assert type(emb).__name__ == "Embedder", (
+        "a bad ONNX path must degrade to the torch encoder rather than "
+        f"killing recall; got {type(emb).__name__}")
     out = capfd.readouterr().out
     assert "ONNX embedder unavailable" in out, "fell back SILENTLY"
