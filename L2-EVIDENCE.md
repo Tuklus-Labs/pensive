@@ -469,3 +469,69 @@ This does not weaken the design, because the correctness argument rests on
 query-time liveness filtering rather than on removal. If `remove` turns out to
 be unreliable, the index simply keeps the row and the query-time filter drops
 it, which is the same outcome by a different route.
+
+## CORRECTION: the engine already resolves status at query time, so the fix is smaller
+
+Two sections above I wrote that the dense signal has no query-time liveness
+filter and that adding one is the precondition for deferring the rebuild. The
+first half is true of the SIGNAL and false of the ENGINE, and the difference is
+the whole design.
+
+I tested `idx.search()` directly, saw a superseded atom come back, and called it
+a vulnerability. Running the same case through `recall()` end to end:
+
+```
+superseded atom injected into a stale index:  present in _atomIds
+ENGINE END-TO-END, superseded atom in results:  False
+```
+
+The engine drops it. The mechanism is `recall/trust.py::assessTrust`, which runs
+unconditionally in the pipeline and issues ONE SELECT over every reranked atom
+(`trust.py:369`):
+
+```sql
+SELECT id, status, COALESCE(occurred_at, created_at), kind FROM atoms WHERE id IN (...)
+```
+
+then branches: `live` passes, `tombstone` is dropped as retracted, `superseded`
+is chased to the live end of its chain and annotated with `supersededBy` at a
+confidence capped below `TRUST_FLOOR`. That query carries no status predicate,
+so it uses the covering primary-key index and does not hit the 564x planner trap
+documented above.
+
+So the system ALREADY does query-time status resolution. I proposed adding a
+second one.
+
+**This was a component test generalised to a system claim**, which is the exact
+reflex my own resident scar rule exists to catch. The index layer really does
+return stale rows; the pipeline that consumes it really does filter them; only
+the second fact governs what a caller sees.
+
+## What the fix actually is
+
+**Replace the full rebuild on write with an incremental add. Nothing else.**
+
+| event | today | proposed |
+|---|---|---|
+| atom written | full class rebuild, 272ms (memory) / 18,645ms (code), blocking | `index.add(key, vec)`, **0.115ms** |
+| atom superseded | full class rebuild | nothing; `assessTrust` already resolves status per query |
+| index accumulates dead rows | never happens (rebuilt constantly) | background compaction, a MEMORY concern, never correctness |
+
+Correctness argument, stated so a hole would be visible: no output row can be a
+retracted atom, because `assessTrust` reads `status` from the canonical store
+for every atom it returns, on every call, and that read does not consult the
+index. Index staleness can therefore cost RANKING QUALITY (a dead row occupying
+a candidate slot that a live atom deserved) but cannot cost CORRECTNESS. Quality
+decay is bounded by how often compaction runs, and is measurable by R@10.
+
+The earlier proposal in this document (add a query-time liveness filter to the
+dense signal) is hereby withdrawn as redundant. It would have duplicated
+`assessTrust`'s SELECT and, written naively, would have introduced a 43ms query
+into the hot path.
+
+## Status
+
+A workflow is independently designing and building this with three adversarial
+verifiers. This analysis was written before its results returned so the two can
+be compared. If its design proposes a query-time liveness filter, that is
+evidence it made the same component-to-system leap I did.
