@@ -52,6 +52,10 @@ __all__ = [
     "defaultTeeSecretPath",
     "LOCAL_WRITE_HEADER",
     "TEE_SECRET_FILE_ENV",
+    "MAX_TEE_BODY_BYTES",
+    "checkDeclaredBodyLength",
+    "readBoundedBody",
+    "bodyTooLarge",
 ]
 
 # The legacy emit tool names the tee accepts. These map 1:1 to the v3 compat emit
@@ -410,6 +414,107 @@ def checkLocalWriteRequest(headers, secret):
             "reason": "bad-local-secret",
         }
     return None
+
+
+# --------------------------------------------------------------------------- #
+# The body bound                                                               #
+# --------------------------------------------------------------------------- #
+#
+# The guard above decides whether a request is ALLOWED. This decides how much of
+# it we are willing to hold in memory, and the two are separate defenses because
+# they fail to different attackers.
+#
+# The route used to read the whole body and only then run the guard, which meant
+# the refusal was correct and late: Starlette's Request.body() concatenates every
+# chunk with no cap, so an unauthenticated POST chose how much memory this
+# process spent before anything checked whether it was allowed to speak at all.
+# Ordering fixes that case. The cap fixes the other one -- a caller that DID
+# clear the guard still must not hand this daemon an arbitrarily large string,
+# because handleTeeEmit runs inline on the single event-loop thread that serves
+# /mcp and every read route.
+
+# Largest tee body this daemon will buffer, in BYTES.
+#
+# Sized from what a legitimate emit can actually be rather than picked round.
+# The emit handlers cap a composed atom body at ``serve.mcp._EMIT_TEXT_MAX`` =
+# 32,000 CHARACTERS, and the tee envelope wraps that in a tool name, tags, a
+# project and provenance. 32,000 characters is at most 128,000 bytes of UTF-8,
+# or ~192,000 if every one of them is a control character JSON has to escape as
+# \uXXXX -- so 1 MiB leaves roughly 5x headroom over the largest body a
+# legitimate caller can construct, while still being a small allocation. It is
+# also exactly ``serve.mcp.MAX_RECALL_RECORDS_CALL_RESULT_BYTES``, the bound this
+# daemon already puts on a single MCP message in the other direction; one number
+# for "the most this daemon moves in one message" is easier to keep true than
+# two.
+#
+# This is a CROSS-REPO contract: the Engram-side forward POSTs here, so lowering
+# it starts 413ing real emits.
+MAX_TEE_BODY_BYTES = 1 << 20
+
+
+def bodyTooLarge(cap=MAX_TEE_BODY_BYTES):
+    """The 413 both halves of the bound return, so they cannot drift apart."""
+    return 413, {
+        "error": f"request body exceeds the {cap}-byte cap",
+        "reason": "body-too-large",
+    }
+
+
+def checkDeclaredBodyLength(headers, cap=MAX_TEE_BODY_BYTES):
+    """Content-Length half of the bound -> ``None`` to allow, else ``(status, body)``.
+
+    The cheapest possible refusal: one integer compare against a header, with
+    nothing read off the wire at all.
+
+    A missing or unparseable Content-Length is NOT a rejection. Chunked transfer
+    legitimately omits it, and a hostile client can lie in either direction
+    anyway, so this header can only ever be an optimization -- believing a client
+    that declares itself too large costs nothing and saves the read.
+    :func:`readBoundedBody` is the half that actually holds the line.
+    """
+    raw = _normalizeHeaders(headers)
+    if raw is None:
+        return None
+    declared = raw.get("content-length")
+    if declared is None:
+        return None
+    try:
+        length = int(str(declared).strip())
+    except (TypeError, ValueError):
+        # Malformed length: say nothing here and let the streaming cap decide.
+        # Refusing on it would turn a header-parsing quirk into a write outage.
+        return None
+    if length > cap:
+        return bodyTooLarge(cap)
+    return None
+
+
+async def readBoundedBody(stream, cap=MAX_TEE_BODY_BYTES):
+    """Drain an async byte stream up to ``cap`` -> ``(body, overflowed)``.
+
+    Stops PULLING at the cap instead of reading to the end and measuring
+    afterwards, and that is the entire difference between this and
+    ``Request.body()``: measuring afterwards refuses the request correctly and
+    has already spent the memory.
+
+    ``overflowed`` True means the caller sent more than ``cap`` and the returned
+    bytes are a PREFIX. It must be refused and never parsed -- a truncated JSON
+    document is not the document that was sent, and a partial emit that happened
+    to parse would be a fabricated memory.
+
+    Takes the stream rather than a request object so this module stays free of
+    the web framework, like every other guard here.
+    """
+    chunks = []
+    total = 0
+    async for chunk in stream:
+        if not chunk:
+            continue
+        total += len(chunk)
+        if total > cap:
+            return b"".join(chunks), True
+        chunks.append(chunk)
+    return b"".join(chunks), False
 
 
 def handleTeeEmit(ctx, counters, rawBody, headers, secret):

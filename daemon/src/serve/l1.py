@@ -151,8 +151,19 @@ def handleLookup(store, key, value, limit=DEFAULT_LOOKUP_LIMIT):
         return _bad("limit must be >= 1")
     limit = min(limit, MAX_LOOKUP_LIMIT)
 
-    # One indexed read. idx_facets_kv covers (key, value); the status filter is
-    # a join back to atoms rather than a second round trip.
+    # One indexed read, and the index has to satisfy the ORDER BY as well as the
+    # filter. idx_facets_kv_atom is (key, value, atom_id): the first two columns
+    # answer the WHERE and the third means the rows arrive already in atom_id
+    # order, so the LIMIT stops the scan early.
+    #
+    # The (key, value) index alone did NOT do this. It cannot produce the
+    # ordering, so SQLite sorted every matching row in a temp B-tree before the
+    # LIMIT applied -- bounding the response while leaving the work unbounded,
+    # on a route that is unauthenticated and runs inline on the event-loop
+    # thread. Facet values are guessable, so the caller chose the cost. The
+    # ORDER BY stays because a truncated lookup that returns arbitrary members
+    # of the set is not a lookup; it is the index that changed, not the contract.
+    # The status filter is a join back to atoms rather than a second round trip.
     rows = store._conn.execute(
         "SELECT f.atom_id FROM facets f JOIN atoms a ON a.id = f.atom_id "
         "WHERE f.key = ? AND f.value = ? AND a.status = 'live' "

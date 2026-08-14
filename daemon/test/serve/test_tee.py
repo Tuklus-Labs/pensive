@@ -855,6 +855,307 @@ def test_missing_secret_makes_writes_fail_closed_not_open(ctx, counters, tmp_pat
     assert _atomRows(ctx.store) == []
 
 
+# --------------------------------------------------------------------------- #
+# RESOURCE EXHAUSTION: the guard runs BEFORE the body, and the body is bounded  #
+# --------------------------------------------------------------------------- #
+#
+# Risk model for this section. The route used to `await request.body()` and only
+# THEN call handleTeeEmit, which is where the guard above lives. Starlette's
+# Request.body() concatenates every chunk it receives with no size cap, so the
+# order meant an UNAUTHENTICATED POST -- one destined to be refused for its
+# Origin, its Content-Type, or a missing secret -- got to allocate whatever it
+# cared to send first. The guard was armed and correct, and the attack had
+# already run by the time it answered. Every CSRF test above passes on that
+# version of the code, because they assert on the reply and the store, and both
+# are right; what is wrong is the memory spent before the reply.
+#
+# Two properties, separately tested because they fail separately:
+#
+#   1. Nothing unauthenticated is buffered AT ALL. The guard answers from
+#      headers alone, so a forged POST costs the header parse and not one byte
+#      of body.
+#   2. An AUTHENTICATED body is still capped. handleTeeEmit runs inline on the
+#      event-loop thread -- the same thread serving /mcp and every read route --
+#      so a caller holding the secret must not be able to hand that thread an
+#      arbitrarily large string either.
+#
+# THE INSTRUMENT, and why it is not TestClient. TestClient's receive() calls
+# httpx's request.read() and hands the app the WHOLE body in a single
+# http.request message (verified against starlette 0.52.1), so through it the
+# body is already in memory before the app runs: it cannot show whether the app
+# pulled anything, and it cannot model a chunked upload the app might decline to
+# keep reading. A TestClient version of these tests would pass against the
+# vulnerable code. So they drive the real ASGI app directly with a receive()
+# that counts the bytes the app actually takes -- which is the quantity the
+# finding is about.
+
+# The body cap, pinned as a LITERAL for the same reason as the header name
+# above: it is a cross-repo contract. The Engram-side forward POSTs to this
+# route, and importing the constant would let a change here drag the test along
+# and stay green while a real caller started getting 413s.
+_TEE_BODY_CAP = 1 << 20
+
+# Comfortably over the cap, and sent in chunks so "how much did the app pull"
+# has a meaningful answer.
+_OVERSIZE_CHUNK = b"x" * 65536
+_OVERSIZE_CHUNKS = [_OVERSIZE_CHUNK] * 64            # 4 MiB
+
+
+@pytest.fixture
+def rawApp(embedder, tmp_path, monkeypatch):
+    """The real ASGI app, callable directly, over a scratch store and secret.
+
+    Same two redirections as httpApp -- scratch secret file, scratch store, so
+    nothing here can touch the live daemon's credential or data. No TestClient:
+    these tests need to own the receive channel (see the section note above).
+    The app is driven with asyncio.run on the calling thread, so the store is
+    created and used on one thread and needs no check_same_thread relaxation.
+    """
+    from serve.daemon import buildApp
+
+    secretFile = tmp_path / "tee.secret"
+    secretFile.write_text(_TEE_SECRET)
+    monkeypatch.setenv(_SECRET_FILE_ENV, str(secretFile))
+    monkeypatch.setenv("PENSIVE_V3_SHADOW_LOG", str(tmp_path / "shadow.jsonl"))
+
+    s = openStore(tmp_path / "mem.db")
+    try:
+        yield buildApp(ServeContext(s, embedder, MODEL_ID, agent="heph")), s
+    finally:
+        s.close()
+
+
+def _postPulling(app, path, headers, chunks):
+    """POST to the ASGI app with a body it has to PULL -> (status, json, pulled).
+
+    ``pulled`` is the byte count the app actually took off the receive channel.
+    That number IS the finding: a request refused on its headers must leave it
+    at zero, and a request refused for size must leave it near the cap rather
+    than at the full body length.
+    """
+    import asyncio
+
+    raw = [(k.lower().encode("latin-1"), str(v).encode("latin-1"))
+           for k, v in headers.items()]
+    scope = {
+        "type": "http", "asgi": {"version": "3.0", "spec_version": "2.3"},
+        "http_version": "1.1", "method": "POST", "scheme": "http",
+        "path": path, "raw_path": path.encode(), "query_string": b"",
+        "root_path": "", "headers": raw,
+        "client": ("127.0.0.1", 54321), "server": ("127.0.0.1", 5999),
+    }
+
+    state = {"index": 0, "pulled": 0}
+
+    async def receive():
+        i = state["index"]
+        state["index"] += 1
+        if i < len(chunks):
+            state["pulled"] += len(chunks[i])
+            return {"type": "http.request", "body": chunks[i],
+                    "more_body": i + 1 < len(chunks)}
+        # The app asked for more than was sent: model a client that has gone.
+        return {"type": "http.disconnect"}
+
+    sent = []
+
+    async def send(message):
+        sent.append(message)
+
+    asyncio.run(app(scope, receive, send))
+
+    status = next(m["status"] for m in sent if m["type"] == "http.response.start")
+    body = b"".join(m.get("body", b"") for m in sent
+                    if m["type"] == "http.response.body")
+    return status, json.loads(body or b"{}"), state["pulled"]
+
+
+def _withHost(headers, **extra):
+    """A raw ASGI request has no client filling in Host; the HostGuard needs it."""
+    h = {"host": "127.0.0.1:5999"}
+    h.update(headers)
+    h.update(extra)
+    return h
+
+
+def test_a_forged_post_is_refused_without_its_body_ever_being_read(rawApp):
+    # THE headline case for this finding. A hostile page's POST carries a body
+    # of the attacker's choosing; the guard can answer it from headers alone, so
+    # nothing should ever be pulled. Asserting the reply and the empty store (as
+    # the CSRF tests above do) is not enough -- both are already correct on the
+    # vulnerable code. The byte count is the assertion that isn't.
+    app, store = rawApp
+
+    status, payload, pulled = _postPulling(
+        app, "/tee/emit", _withHost(_BROWSER_SIMPLE_POST), _OVERSIZE_CHUNKS)
+
+    assert 400 <= status < 500, f"forged POST was accepted: {status} {payload}"
+    assert pulled == 0, (
+        f"the daemon buffered {pulled} bytes from a request it then refused: "
+        "the body is read before the guard runs, so an unauthenticated caller "
+        "chooses how much memory this process spends")
+    assert _atomRows(store) == []
+
+
+@pytest.mark.parametrize("headers, reason", [
+    (_localHeaders(secret=None), "missing-local-secret"),
+    (_localHeaders(secret="not-the-secret"), "bad-local-secret"),
+    (_localHeaders(contentType="text/plain;charset=UTF-8"), "bad-content-type"),
+    (_localHeaders(origin="https://evil.example"), "cross-origin"),
+])
+def test_no_guard_rejection_costs_a_single_body_byte(rawApp, headers, reason):
+    # Each guard separately: whichever one fires, it fires FIRST. A fix that
+    # moved only the secret check ahead of the read would leave the other three
+    # reachable only after the allocation, which is the same defect wearing a
+    # different reason string.
+    app, store = rawApp
+
+    status, payload, pulled = _postPulling(
+        app, "/tee/emit", _withHost(headers), _OVERSIZE_CHUNKS)
+
+    assert payload.get("reason") == reason, (
+        f"expected the {reason} guard to answer, got {status} {payload}")
+    assert pulled == 0, (
+        f"the {reason} guard runs AFTER the body is buffered: {pulled} bytes "
+        "were read from a request that was always going to be refused")
+    assert _atomRows(store) == []
+
+
+def test_an_oversized_declared_length_is_refused_without_reading_it(rawApp):
+    # A caller that declares its size gets refused on the declaration alone:
+    # one integer compare, nothing read. Content-Length is not trustworthy in
+    # general -- a hostile client can lie -- but a client that declares an
+    # oversize body is telling the truth about being refused, and honoring it
+    # is free.
+    #
+    # 413 specifically, not merely 4xx: this body is a VALID emit envelope that
+    # is simply too big, so a 400 here would mean the daemon read all 4 MiB and
+    # only then found the payload wanting.
+    app, store = rawApp
+    body = json.dumps({"tool": "engram_emit_atom", "args": {
+        "project": "p", "shape": "s", "approach": "a", "outcome": "succeeded",
+        "reason": "r", "principle": "x" * (4 << 20)}}).encode("utf-8")
+    chunks = [body[i:i + 65536] for i in range(0, len(body), 65536)]
+
+    status, payload, pulled = _postPulling(
+        app, "/tee/emit",
+        _withHost(_localHeaders(), **{"content-length": str(len(body))}),
+        chunks)
+
+    assert status == 413, f"oversized body was not refused for size: {payload}"
+    assert payload.get("reason") == "body-too-large"
+    assert pulled == 0, (
+        f"{pulled} bytes were read from a body whose declared Content-Length "
+        f"({len(body)}) already exceeded the {_TEE_BODY_CAP}-byte cap")
+    assert _atomRows(store) == []
+
+
+def test_a_chunked_body_is_abandoned_once_it_passes_the_cap(rawApp):
+    # The case Content-Length cannot cover: chunked transfer declares no length,
+    # so the cap has to be enforced while reading. The daemon must stop PULLING
+    # at the cap -- reading to the end and measuring afterwards would refuse the
+    # request correctly and still have spent the memory, which is the bug.
+    app, store = rawApp
+
+    status, payload, pulled = _postPulling(
+        app, "/tee/emit", _withHost(_localHeaders()), _OVERSIZE_CHUNKS)
+
+    assert status == 413, f"unbounded chunked body was not refused: {payload}"
+    assert payload.get("reason") == "body-too-large"
+    total = sum(len(c) for c in _OVERSIZE_CHUNKS)
+    assert pulled <= _TEE_BODY_CAP + len(_OVERSIZE_CHUNK), (
+        f"the daemon read {pulled} of {total} bytes before refusing: it drains "
+        f"the whole body and measures afterwards, so the {_TEE_BODY_CAP}-byte "
+        "cap bounds the error message rather than the allocation")
+    assert _atomRows(store) == []
+
+
+def _counters(app):
+    """GET /status through the same ASGI driver -> the counters dict."""
+    import asyncio
+
+    scope = {
+        "type": "http", "asgi": {"version": "3.0", "spec_version": "2.3"},
+        "http_version": "1.1", "method": "GET", "scheme": "http",
+        "path": "/status", "raw_path": b"/status", "query_string": b"",
+        "root_path": "", "headers": [(b"host", b"127.0.0.1:5999")],
+        "client": ("127.0.0.1", 54321), "server": ("127.0.0.1", 5999),
+    }
+
+    async def receive():
+        return {"type": "http.request", "body": b"", "more_body": False}
+
+    sent = []
+
+    async def send(message):
+        sent.append(message)
+
+    asyncio.run(app(scope, receive, send))
+    body = b"".join(m.get("body", b"") for m in sent
+                    if m["type"] == "http.response.body")
+    return json.loads(body)["counters"]
+
+
+def test_an_oversized_body_is_counted_against_the_right_instrument(rawApp):
+    # Counter attribution, and it is not cosmetic. teeReceived/teeFailed answer
+    # the Phase 3 gate's question -- "did every old-path emit land in v3?" -- so
+    # an emit that CLEARED the guard (it read the 0600 secret file, so it is the
+    # real forwarder) and was then refused for size is a genuine gap and has to
+    # show up THERE. teeRejected is for traffic that never proved it was local
+    # at all: folding a real dropped emit into it hides the gap, and folding
+    # forged traffic into the gate lets an outsider move the cutover number.
+    app, _store = rawApp
+
+    _postPulling(app, "/tee/emit", _withHost(_localHeaders()), _OVERSIZE_CHUNKS)
+    _postPulling(app, "/tee/emit", _withHost(_BROWSER_SIMPLE_POST),
+                 _OVERSIZE_CHUNKS)
+
+    counts = _counters(app)
+    assert counts["teeReceived"] == 1 and counts["teeFailed"] == 1, (
+        "an authenticated emit refused for size did not reach the gate "
+        f"counters, so the Phase 3 gate cannot see the dropped emit: {counts}")
+    assert counts["teeRejected"] == 1, (
+        f"the forged oversized POST was not counted as a rejection: {counts}")
+
+
+def test_a_legitimate_emit_still_lands_when_pulled_in_chunks(rawApp):
+    # REGRESSION GUARD, and the one that keeps "refuse everything" from passing
+    # every test above. A real tee body, delivered the way a real client
+    # delivers it (in pieces), still writes -- so the bounded read reassembles
+    # the body rather than truncating it.
+    app, store = rawApp
+    body = _emitBody()
+    chunks = [body[i:i + 7] for i in range(0, len(body), 7)]
+
+    status, payload, pulled = _postPulling(
+        app, "/tee/emit", _withHost(_localHeaders()), chunks)
+
+    assert status == 200, f"a legitimate chunked tee was rejected: {payload}"
+    assert payload["ok"] is True
+    assert pulled == len(body)
+    rows = _atomRows(store)
+    assert len(rows) == 1 and rows[0][2] == "pensive"
+
+
+def test_a_body_exactly_at_the_cap_is_not_refused(rawApp):
+    # The boundary. An off-by-one here is a silent 413 for the largest
+    # legitimate emit, which reads as "the tee is flaky" rather than as a cap.
+    app, _store = rawApp
+    filler = "y" * (_TEE_BODY_CAP - len(_emitBody(principle="")) - 2)
+    body = _emitBody(principle=filler)
+    assert len(body) <= _TEE_BODY_CAP
+
+    status, payload, _ = _postPulling(
+        app, "/tee/emit", _withHost(_localHeaders()), [body])
+
+    # The emit handler's own 32,000-character body cap refuses this as a 400.
+    # That is the RIGHT layer to refuse it at, and it is the point: the size
+    # guard passed it through to be judged on its content.
+    assert status != 413, (
+        f"a {len(body)}-byte body was refused by a {_TEE_BODY_CAP}-byte cap")
+    assert payload.get("reason") != "body-too-large"
+
+
 def test_read_only_routes_are_not_gated(httpApp):
     # The guards belong on WRITES. /status and /brief change nothing, and gating
     # them would break the SessionStart hook that curls /brief for no security

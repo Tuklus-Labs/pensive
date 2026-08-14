@@ -46,6 +46,7 @@ from serve.mcp import ServeContext, buildServer, SERVER_NAME  # noqa: E402
 from serve.tee import (  # noqa: E402
     Counters, handleTeeEmit, checkLocalWriteRequest, checkRequestOrigin,
     checkAllowedHost, allowedHostsFromEnv,
+    checkDeclaredBodyLength, readBoundedBody, bodyTooLarge,
     loadTeeSecret, defaultTeeSecretPath, LOCAL_WRITE_HEADER,
 )
 from serve.shadow import runShadow, defaultShadowLogPath  # noqa: E402
@@ -126,8 +127,10 @@ def buildApp(ctx):
     the v3 store, ``POST /shadow/recall`` logs a v3 answer beside the old one, and
     ``GET /status`` exposes the tee/shadow counters for the gate check.
 
-    Both POST routes sit behind :func:`serve.tee.checkLocalWriteRequest`, and the
-    ``/mcp`` mount behind its origin half. Loopback binding keeps the daemon off
+    Both POST routes sit behind :func:`serve.tee.checkLocalWriteRequest`, which
+    runs BEFORE their body is read, and ``/tee/emit`` additionally bounds that
+    body at :data:`serve.tee.MAX_TEE_BODY_BYTES`. The ``/mcp`` mount sits behind
+    the guard's origin half. Loopback binding keeps the daemon off
     the network but is NOT a defense against a browser the operator is already
     running: a page can POST cross-origin to 127.0.0.1 with no preflight, and CORS
     only stops it from reading the reply. See the guard's own comments in
@@ -219,7 +222,47 @@ def buildApp(ctx):
         return JSONResponse(payload, status_code=status)
 
     async def tee_emit(request):
-        body = await request.body()
+        # ORDER IS THE FIX. This used to `await request.body()` first and call
+        # handleTeeEmit (where the guard lives) second, so an unauthenticated
+        # POST -- one already destined to be refused for its Origin, its
+        # Content-Type or a missing secret -- got to allocate whatever it cared
+        # to send BEFORE anything checked it: Request.body() concatenates every
+        # chunk with no cap. The guard was armed and the attack had already run.
+        # /shadow/recall below has always had this order; the tee had not.
+        #
+        # handleTeeEmit still runs the same guard itself. That is deliberate
+        # defense in depth, not a leftover: it keeps a future route that also
+        # replays emits from reintroducing the hole by forgetting to guard. The
+        # rejection COUNTER stays here at the route, because a request refused
+        # here never reaches the handler and must be counted exactly once.
+        rejection = checkLocalWriteRequest(request.headers, teeSecret)
+        if rejection is not None:
+            counters._inc("teeRejected")
+            status, payload = rejection
+            return JSONResponse(payload, status_code=status)
+
+        # Past the guard the caller is authenticated -- it read a 0600 file --
+        # but authenticated is not unlimited. This handler runs INLINE on the
+        # event-loop thread that also serves /mcp and every read route, so an
+        # oversized body is a stall for every other caller on this box.
+        rejection = checkDeclaredBodyLength(request.headers)
+        body = None
+        if rejection is None:
+            body, overflowed = await readBoundedBody(request.stream())
+            if overflowed:
+                rejection = bodyTooLarge()
+        if rejection is not None:
+            # teeReceived/teeFailed ARE the Phase 3 gate ("did every old-path
+            # emit land in v3?"). This request cleared the guard, so it came
+            # from the real forwarder and is a genuine emit that did not land:
+            # the gate has to see it. teeRejected is reserved for traffic that
+            # never proved it was local, and putting a real dropped emit there
+            # would hide the gap the gate exists to find.
+            counters._inc("teeReceived")
+            counters._inc("teeFailed")
+            status, payload = rejection
+            return JSONResponse(payload, status_code=status)
+
         status, payload = handleTeeEmit(
             ctx, counters, body, request.headers, teeSecret)
         return JSONResponse(payload, status_code=status)

@@ -51,6 +51,12 @@ CREATE TABLE IF NOT EXISTS facets (
   PRIMARY KEY (atom_id, key, value)
 );
 CREATE INDEX IF NOT EXISTS idx_facets_kv ON facets(key, value);
+-- L1 lookup reads (key, value) and returns atom_ids ORDER BY atom_id. The
+-- (key, value) index cannot produce that order, so SQLite sorted every matching
+-- row in a temp B-tree before applying the LIMIT: the response was bounded, the
+-- work was not, and the caller picked the value. Carrying atom_id as a third
+-- column makes the index covering AND already ordered, so the sort disappears.
+CREATE INDEX IF NOT EXISTS idx_facets_kv_atom ON facets(key, value, atom_id);
 
 CREATE TABLE IF NOT EXISTS embeddings (
   atom_id    TEXT NOT NULL REFERENCES atoms(id),

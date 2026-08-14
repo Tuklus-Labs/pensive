@@ -20,15 +20,25 @@ must answer even when the filesystem has moved on. Enrichment failures are
 invisible by design; the dry corpus-health numbers live in the repair tool's
 report, not in serve-time noise.
 """
+import os
 import re
 
 from recall.payload import GIST_CHARS as _GIST_CHARS, gistOf as _gistOf
-from recall.refs import refToPath
+from recall.refs import openRef
 from store.store import getAtom
 
 __all__ = ["locateChunk", "relatedMemory", "Enricher"]
 
-# Files over this size are not searched (binary blobs, giant logs).
+# Files over this size are not searched (binary blobs, giant logs). Spent on
+# the BYTES READ, not on a size measured beforehand: a stat describes a name
+# at one instant, and a file can grow between the stat and the read. Measured
+# on the pre-fix code, a stat reporting 6 bytes was followed by a read that
+# returned 6 MiB, because a writer got in between the two lookups.
+#
+# Also passed to openRef, which refuses an oversized file from its fstat
+# before a byte is read. Two locks that fail differently, the same shape as
+# mcp._rejectEscapingSourceRef sitting on top of refs.py: the fstat is an
+# early out on one number, the bounded read is what actually holds.
 _MAX_FILE_BYTES = 5 * 1024 * 1024
 
 # An entity value carried by more than this many live atoms is a HUB and is
@@ -78,18 +88,37 @@ def _gist(text):
     return _gistOf(text)
 
 
-def locateChunk(chunkText, path):
-    """1-indexed inclusive (start, end) line span of chunkText in path, or None.
+def locateChunk(chunkText, fh):
+    """1-indexed inclusive (start, end) line span of chunkText in fh, or None.
+
+    ``fh`` is an ALREADY OPEN binary handle, normally from ``refs.openRef``.
+    Taking a handle rather than a path is the fix, not a convenience: a reader
+    handed a name goes back to the filesystem for a lookup of its own, and
+    whatever that lookup finds is a different question from the one the ref
+    was validated against. There is nothing to re-open here, so there is no
+    window to race.
 
     Match is on whitespace-normalized text. The span is found by scanning
     normalized prefixes: walk the file's lines accumulating a normalized
     window, and slide the window start forward when it can no longer prefix
     the target. O(lines * window) worst case, fine for source files.
     """
+    if isinstance(fh, (str, bytes, os.PathLike)):
+        # Loud, because a quiet None would let a later refactor go back to
+        # reading by name and still see a green suite.
+        raise TypeError(
+            "locateChunk reads an open binary handle, not a path; open the "
+            "ref with recall.refs.openRef and pass the handle"
+        )
     try:
-        if not path.is_file() or path.stat().st_size > _MAX_FILE_BYTES:
+        raw = fh.read(_MAX_FILE_BYTES + 1)
+        if len(raw) > _MAX_FILE_BYTES:
             return None
-        lines = path.read_text(errors="strict").splitlines()
+        # Decoding moves here with the handle. read_text() used the locale's
+        # preferred encoding; utf-8 is what the corpus is, and pinning it
+        # keeps a security-relevant read from depending on the daemon's
+        # environment. A binary blob still raises and still yields no line.
+        lines = raw.decode("utf-8", errors="strict").splitlines()
     except (OSError, UnicodeDecodeError, ValueError):
         return None
     target = _norm(chunkText)
@@ -216,9 +245,13 @@ class Enricher:
         out = []
         ref = self._sourceRef(result["atomId"])
         if ref:
-            path = refToPath(ref, home=self._home)
-            if path is not None:
-                span = locateChunk(atom["text"], path)
+            # A sourceRef is store data, so this string selects a file the
+            # daemon opens during ordinary recall. openRef returns a
+            # descriptor or nothing; the name is never handed onward.
+            fh = openRef(ref, home=self._home, maxBytes=_MAX_FILE_BYTES)
+            if fh is not None:
+                with fh:
+                    span = locateChunk(atom["text"], fh)
                 if span is not None:
                     base = ref.split("#", 1)[0]
                     out.append(f"at {base}#L{span[0]}-{span[1]}")
