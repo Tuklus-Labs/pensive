@@ -412,9 +412,12 @@ def assemblePayload(store, results, tokenBudget, enricher=None):
         if estimateTokens(trial) <= tokenBudget:
             entries.append(entry)
         else:
-            # Atomic drop: the first entry that does not fit takes the whole tail
-            # with it. Trying to squeeze a smaller later entry in would reorder the
-            # payload away from best-first and is not the contract.
+            # The first entry that does not fit ends the Tier-1 run. Squeezing a
+            # smaller later entry in here would reorder the payload away from
+            # best-first, which is not the contract -- so the tail degrades to
+            # handles below instead, preserving order.
+            cut = results[len(entries):]
+            entries.extend(_handleTail(store, entries, cut, tokenBudget))
             break
 
     if entries:
@@ -426,6 +429,39 @@ def assemblePayload(store, results, tokenBudget, enricher=None):
         payload = handle if estimateTokens(handle) <= tokenBudget else SENTINEL_BUDGET_TOO_SMALL
 
     return payload, estimateTokens(payload), False
+
+
+def _handleTail(store, fitted, remaining, tokenBudget):
+    """Tier-0 handles for ranked results whose bodies did not fit -> [str].
+
+    The tail used to be DROPPED, and dropping is the wrong degradation because
+    the two outcomes are indistinguishable downstream: an absent handle reads
+    exactly like "no such memory", which is the answer that sends an agent off
+    to re-derive something the store already holds. Measured 2026-08-13 over 19
+    probes, comparing what the ranker returned against what survived into the
+    payload at the default 1500-token budget:
+
+        tier  ranked  delivered
+        L2     0.789      0.579
+        L3     0.789      0.684
+
+    Four of fifteen ranked answers never reached the caller. Retrieval was fine;
+    delivery was lossy, and the ranker took the blame for a presentation
+    decision -- the same render-versus-rank defect as the gist, one layer down.
+
+    A handle costs ~80 characters and says "this exists, here is its id". Since
+    the L1 identity route landed, that id is directly fetchable, so a named
+    result is a complete answer rather than a tease. Best-first order is
+    preserved: handles follow the bodies, in rank order, and stop at the budget.
+    """
+    out = []
+    for result in remaining:
+        handle = tier0Handle(store, result)
+        trial = _ENTRY_SEPARATOR.join(fitted + out + [handle])
+        if estimateTokens(trial) > tokenBudget:
+            break
+        out.append(handle)
+    return out
 
 
 def _lowConfidencePayload(store, results, tokenBudget):

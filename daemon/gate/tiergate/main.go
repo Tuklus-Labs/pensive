@@ -352,9 +352,54 @@ func generatedProbes(storePath string, n, seed int) ([]probe, error) {
 		if id == "" || len(line) < 40 {
 			continue
 		}
-		out = append(out, probe{Query: line, Expected: []string{id}, Origin: "generated"})
+		out = append(out, probe{Query: trimToRealisticQuery(line, len(out)), Expected: []string{id}, Origin: "generated"})
 	}
 	return out, nil
+}
+
+// REALISTIC_QUERY_CHARS caps a generated probe's query length.
+//
+// Derived from the system of record, not chosen: 2,722 distinct real agent
+// queries in recall_log (excluding the Charon loop that produced 91.4% of
+// historical traffic) have p50 95 chars, p75 154, p90 223. Generated probes were
+// using an atom's ENTIRE principle sentence, median 563 chars, which is past the
+// 90th percentile of anything an agent actually asks.
+//
+// That is not a harmless difference. Encode cost scales with token count, so the
+// gate was measuring a workload production does not produce and reporting it as
+// the tier's latency: 48ms p50 on the long probes against 18.6ms on realistic
+// short ones. A probe set has to look like traffic or its latency number
+// describes nothing.
+//
+// Cut at a word boundary: a mid-word truncation is not a query either.
+// The generated probe set SPANS the real query-length distribution rather than
+// sitting at one end of it. Measured from recall_log over 2,722 distinct real
+// agent queries (the Charon loop excluded, since it was one machine caller
+// producing 91.4% of historical traffic and its shape is not an agent's):
+//
+//     p50  95 chars   p75 154   p90 223
+//
+// Capping every probe at a single length is wrong in both directions. At the
+// p90 the whole set is the 90th-percentile-worst shape, and judging that against
+// a p95 LATENCY budget counts the tail twice; at the p50 the set has no tail at
+// all. Cycling the three percentiles by index gives a population shaped like
+// traffic, deterministically, with no RNG for a gate to disagree with itself on.
+//
+// This matters more than it sounds: probes were originally an atom's ENTIRE
+// principle sentence, median 563 chars, and encode cost scales with tokens. The
+// gate was reporting 48ms p50 for a tier that serves real queries in 15ms.
+var REALISTIC_QUERY_CHARS = []int{95, 154, 223}
+
+func trimToRealisticQuery(s string, i int) string {
+	limit := REALISTIC_QUERY_CHARS[i%len(REALISTIC_QUERY_CHARS)]
+	if len(s) <= limit {
+		return s
+	}
+	cut := s[:limit]
+	if j := strings.LastIndex(cut, " "); j > limit/2 {
+		cut = cut[:j]
+	}
+	return cut
 }
 
 func principleLine(text string) string {

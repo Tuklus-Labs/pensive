@@ -274,32 +274,23 @@ func run(c *cfg) (*verdict.Report, error) {
 			"verdict_meaning": "FAIL means a probe family fell below its floor, so the quality verdict covers less than it appears to",
 		}), nil)
 
-	// --- L2 tier ------------------------------------------------------------
-	// The L2 route does not exist yet. Absent is FAIL, never SKIP: an absent
-	// check and a passing check are indistinguishable in a tally.
-	{
-		// Named for what it ASSERTS. It was called l2.latency.p95 and reported no
-		// latency at all, only an existence boolean: a unit whose name promises a
-		// measurement it never took is the drifted-question failure in miniature.
-		q := fmt.Sprintf("QUESTION: does an L2 tier (lexical+facet+local-dense, no cross-encoder, no remote) EXIST to measure against its %.3gms budget?", c.l2Budget)
-		_, _, code, err := m.get("__tier_probe__")
-		l2Exists := false // no L2 route implemented yet; asserted, not assumed
-		add("tier", "l2.tier.implemented", state(l2Exists),
-			c.ev("l2-latency", map[string]any{
-				"question": q, "budget_ms": c.l2Budget, "route_implemented": l2Exists,
-				"probe_http_status": code, "probe_error": errStr(err),
-				"verdict_meaning": "FAIL because no L2 tier exists in the v3 daemon: there is one monolithic recall path and every caller pays for all of it",
-			}), nil)
-	}
-
-	// --- L3 tier: the current monolithic recall path -------------------------
-	{
-		q := fmt.Sprintf("QUESTION: is client-observed P95 for full semantic retrieval <= %.3gms, WITHOUT quality falling below the BM25 floor?", c.l3Budget)
+	// --- L2 and L3: measured through the transport a caller actually uses -----
+	//
+	// Both tiers used to be un-measurable here: L2 was a hardcoded existence
+	// boolean and L3 called recall with no tier at all, which -- once L2 became
+	// the DEFAULT -- would have silently measured L2 and reported it as L3. A
+	// unit that measures a different thing than its name says is the drifted
+	// question failure, so each tier is now named explicitly in the request.
+	measureTier := func(tier string, budget float64) {
+		q := fmt.Sprintf("QUESTION: is client-observed P95 for tier %s <= %.3gms, "+
+			"WITHOUT its retrieval quality falling below the floor?", tier, budget)
+		all := append(append([]probe{}, gen...), cur...)
 		var lats []float64
 		var hits []int
-		all := append(append([]probe{}, gen...), cur...)
 		for _, p := range all {
-			payload, d, err := m.call("recall", map[string]any{"query": p.Query, "k": 10, "tokenBudget": 1500})
+			payload, d, err := m.call("recall", map[string]any{
+				"query": p.Query, "k": 10, "tokenBudget": 1500, "tier": tier,
+			})
 			ms := plantLatency(c, float64(d.Microseconds())/1000.0)
 			lats = append(lats, ms)
 			ids := handleIDs(payload)
@@ -312,26 +303,35 @@ func run(c *cfg) (*verdict.Report, error) {
 			}
 			hits = append(hits, rankOf(ids, p.Expected))
 		}
-		st, evp, sc := latencyUnit(c, "l3-latency", q, lats, c.l3Budget, map[string]any{
-			"plant": c.plant, "token_budget_used": 1500,
-		})
-		add("latency", "l3.latency.p95", st, evp, sc)
+		st, evp, sc := latencyUnit(c, "l"+strings.ToLower(tier[1:])+"-latency", q, lats, budget,
+			map[string]any{"tier": tier, "plant": c.plant, "token_budget_used": 1500})
+		add("latency", "l"+strings.ToLower(tier[1:])+".latency.p95", st, evp, sc)
 
 		r10, mrr := metrics(hits)
-		add("quality", "l3.quality.r_at_10", state(len(hits) > 0 && r10 >= c.rAt10Floor),
-			c.ev("l3-quality-r10", map[string]any{
-				"question":        fmt.Sprintf("QUESTION: is R@10 still at or above the BM25 floor %.3f after any latency work?", c.rAt10Floor),
-				"r_at_10":         r10, "floor": c.rAt10Floor, "n": len(hits), "plant": c.plant,
-				"ranks":           hits,
-				"verdict_meaning": "FAIL means quality was traded for speed. This is the unit that makes 'return fewer results' an unprofitable optimization.",
+		low := strings.ToLower(tier[1:])
+		add("quality", "l"+low+".quality.r_at_10",
+			state(len(hits) > 0 && r10 >= c.rAt10Floor),
+			c.ev("l"+low+"-quality-r10", map[string]any{
+				"question": fmt.Sprintf("QUESTION: is tier %s R@10 at or above the floor %.3f?", tier, c.rAt10Floor),
+				"tier":     tier, "r_at_10": r10, "floor": c.rAt10Floor,
+				"n": len(hits), "ranks": hits, "plant": c.plant,
+				"POPULATION CAVEAT": "the floor came from 1,500 real chat turns scored " +
+					"against document chunks; these probes are self-retrieval plus a " +
+					"curated set. Different population, so the floor is a REGRESSION " +
+					"tripwire here, not a transferred claim.",
+				"verdict_meaning": "FAIL means quality was traded for speed. This is the unit " +
+					"that makes 'return fewer results' an unprofitable optimization.",
 			}), &verdict.Score{Value: r10, Max: 1.0})
-		add("quality", "l3.quality.mrr_at_10", state(len(hits) > 0 && mrr >= c.mrrFloor),
-			c.ev("l3-quality-mrr", map[string]any{
-				"question":        fmt.Sprintf("QUESTION: is MRR@10 still at or above the BM25 baseline %.3f?", c.mrrFloor),
-				"mrr_at_10":       mrr, "floor": c.mrrFloor, "n": len(hits), "plant": c.plant,
-				"verdict_meaning": "FAIL means ordering degraded even where the right answer is still somewhere in the top 10",
+		add("quality", "l"+low+".quality.mrr_at_10",
+			state(len(hits) > 0 && mrr >= c.mrrFloor),
+			c.ev("l"+low+"-quality-mrr", map[string]any{
+				"question": fmt.Sprintf("QUESTION: is tier %s MRR@10 at or above %.3f?", tier, c.mrrFloor),
+				"tier": tier, "mrr_at_10": mrr, "floor": c.mrrFloor, "n": len(hits),
+				"verdict_meaning": "FAIL means ordering degraded even where the right answer is still in the top 10",
 			}), &verdict.Score{Value: mrr, Max: 1.0})
 	}
+	measureTier("L2", c.l2Budget)
+	measureTier("L3", c.l3Budget)
 
 	// An instrument that could not record what it saw has failed. Checked before
 	// the report is constructed, so a run with unwritable evidence cannot emit a
@@ -518,18 +518,68 @@ func sqlQuoteList(vals []string) string {
 // name does not confer the evidence a percentile claim needs.
 const REQUIRED_ZERO_VIOLATION_N = 59
 
-// violationUpperBound returns the one-sided 95% upper bound on the true
-// violation rate given k violations in n samples. Exact for k=0; for k>0 it
-// returns the observed rate, which UNDERSTATES the bound, so the caller must
-// treat any nonzero k as a failure rather than as a bounded estimate.
+// violationUpperBound returns the exact one-sided 95% Clopper-Pearson upper
+// bound on the true violation rate given k violations in n samples.
+//
+// It used to return k/n for k>0, which UNDERSTATES the bound, so the caller had
+// to treat any nonzero k as failure. That made a unit named for a P95 budget
+// enforce a P100 one: "P95 <= 125ms" means up to 5% of requests MAY exceed, and
+// failing on a single violation in 65 holds the system to a stricter contract
+// than the one written down. A gate that enforces something other than its
+// stated claim is the drifted-question defect, whichever direction it drifts.
+//
+// Solved by bisection on the binomial CDF: the upper bound is the p at which
+// P(X <= k | n, p) = 0.05. No stats library, and bisection is exact enough at
+// the sample sizes a gate uses.
+//
+// NOTE for anyone reading this as a loosening: at k=1, n=65 this returns ~7.3%,
+// which still FAILS the 5% requirement. Correcting the statistic did not make
+// the tier pass. That was the check that it is a correction and not a favour.
 func violationUpperBound(k, n int) float64 {
 	if n <= 0 {
+		return 1.0
+	}
+	if k >= n {
 		return 1.0
 	}
 	if k == 0 {
 		return 1.0 - math.Pow(0.05, 1.0/float64(n))
 	}
-	return float64(k) / float64(n)
+	lo, hi := 0.0, 1.0
+	for i := 0; i < 200; i++ {
+		mid := (lo + hi) / 2
+		if binomCDF(k, n, mid) > 0.05 {
+			lo = mid
+		} else {
+			hi = mid
+		}
+	}
+	return (lo + hi) / 2
+}
+
+// binomCDF is P(X <= k) for X ~ Binomial(n, p), summed in log space so a large
+// n does not overflow the factorials.
+func binomCDF(k, n int, p float64) float64 {
+	if p <= 0 {
+		return 1.0
+	}
+	if p >= 1 {
+		return 0.0
+	}
+	sum := 0.0
+	for i := 0; i <= k; i++ {
+		logC := lgamma(float64(n+1)) - lgamma(float64(i+1)) - lgamma(float64(n-i+1))
+		sum += math.Exp(logC + float64(i)*math.Log(p) + float64(n-i)*math.Log(1-p))
+	}
+	if sum > 1 {
+		return 1
+	}
+	return sum
+}
+
+func lgamma(x float64) float64 {
+	v, _ := math.Lgamma(x)
+	return v
 }
 
 // latencyUnit turns a latency sample into a verdict that states what the sample
@@ -556,9 +606,11 @@ func latencyUnit(c *cfg, unit, question string, lats []float64, budget float64,
 	switch {
 	case n == 0:
 		st, meaning = verdict.Error, "ERROR: no samples taken; an empty measurement is not a pass"
-	case violations > 0:
-		st, meaning = verdict.Fail, "FAIL: at least one request exceeded the budget"
-	case n < REQUIRED_ZERO_VIOLATION_N:
+	case bound > 0.05:
+		st = verdict.Fail
+		meaning = fmt.Sprintf("FAIL: %d/%d over budget; the 95%% upper bound on the "+
+			"violation rate is %.1f%%, above the 5%% a P95 claim allows", violations, n, bound*100)
+	case n < REQUIRED_ZERO_VIOLATION_N && violations == 0:
 		st = verdict.Error
 		meaning = fmt.Sprintf("ERROR: zero violations in %d samples bounds the true rate only at "+
 			"%.1f%%, not the 5%% the budget claim needs; %d samples are required. "+
