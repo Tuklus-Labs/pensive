@@ -44,7 +44,7 @@ from jsonschema import Draft202012Validator
 from mcp.server import Server
 from mcp.types import CallToolResult, TextContent, Tool
 
-from recall.engine import recall
+from recall.engine import recall, DEFAULT_TIER, TIERS
 from recall.embedder import embedMissing
 from recall.strata import KIND_CLASSES
 from recall.vector_index import buildClassIndexes, selectIndex
@@ -905,9 +905,22 @@ def handle_pensive_analytics(ctx, args):
 
 
 def handle_recall(ctx, args):
-    """v3 native recall: return the rich tiered payload (not the legacy listing)."""
+    """v3 native recall: return the rich tiered payload (not the legacy listing).
+
+    ``tier`` selects the corpus and the work: L2 (default) answers from authored
+    memory, L3 also reads the imported document corpus. Neither runs the
+    cross-encoder -- see recall/engine.py for the measurement and the reason.
+
+    L2 is the default deliberately. 93% of this store is bulk-imported
+    document_chunk, and walking it by default put source listings into the
+    trusted set of a 1500-token envelope while the atom that actually answered
+    competed with them for budget. A caller that wants the corpus asks for it.
+    """
     _require(args, ["query"])
     _boundedRecallArgs(args, "k")
+    tier = args.get("tier") or DEFAULT_TIER
+    if tier not in TIERS:
+        raise ValueError(f"recall: tier must be one of {TIERS}, got {tier!r}")
     query = args["query"]
     project = args.get("project") or None
     k = int(args.get("k", ctx.defaultK))
@@ -918,11 +931,12 @@ def handle_recall(ctx, args):
     kinds = args.get("kinds")
     out = recall(
         ctx.store, ctx.indexes, ctx.embedder, query,
-        project=project, timeScope=timeScope, kinds=kinds,
-        k=k, tokenBudget=tokenBudget, enrich=True, aux=ctx.aux,
+        project=project, timeScope=timeScope,
+        k=k, tokenBudget=tokenBudget, aux=ctx.aux,
+        tier=tier,
     )
     response = out["payload"]
-    _logReturnedRecall(ctx, out, query, "mcp.recall")
+    _logReturnedRecall(ctx, out, query, f"mcp.recall.{tier}")
     return response
 
 
@@ -1312,6 +1326,11 @@ NATIVE_TOOLS = [
         inputSchema={
             "type": "object",
             "properties": {
+                "tier": {
+                    "type": "string", "enum": ["L2", "L3"], "default": "L2",
+                    "description": "L2 (default): authored memory only, <=20ms. "
+                                   "L3: also reads the imported document corpus, <=125ms.",
+                },
                 "query":       {"type": "string", "description": "What to search for"},
                 "project":     {"type": "string", "description": "Restrict to this project's live atoms"},
                 "timeScope":   {"type": "array", "items": {"type": "integer"},

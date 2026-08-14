@@ -47,7 +47,8 @@ from recall.trust import assessTrust
 from recall.payload import assemblePayload
 from recall.enrich import Enricher
 
-__all__ = ["recall", "FACET_BOOST", "RERANK_HEAD"]
+__all__ = ["recall", "FACET_BOOST", "RERANK_HEAD", "TIERS", "MEMORY_KINDS",
+           "tierDefaults"]
 
 # Post-fusion multiplicative boost for atoms carrying a query-matching entity
 # facet. Small on purpose (a nudge, not an override) and harness-tunable: Task
@@ -60,6 +61,59 @@ FACET_BOOST = 1.15
 # pool, and the harness owns future tuning. Candidates below this head keep their
 # fused RRF order and are appended after the reranked head, never dropped.
 RERANK_HEAD = 64
+
+# --------------------------------------------------------------------------- #
+# The tier contract                                                            #
+# --------------------------------------------------------------------------- #
+#
+# Aegis/CLAUDE.md:113 specifies an L1/L2/L3 memory hierarchy and ends "Do not
+# break the tier structure". The v3 rewrite broke it: one monolithic path where
+# every caller paid for a cross-encoder whether or not its question needed one.
+# Budgets (Gary, 2026-08-12): L1 <= 1ms, L2 <= 20ms, L3 <= 125ms, client-observed.
+#
+# L1 is not here. Identity retrieval has no ranking stage at all and lives in
+# serve/l1.py behind a lean HTTP route, because the MCP tools/call envelope alone
+# measured 2.486ms P95 against a 1ms budget -- the transport choice IS the design.
+#
+# NEITHER L2 NOR L3 RUNS THE CROSS-ENCODER. House rule (Gary, 2026-08-13): batch
+# encodes on the GPU, stream encodes on the CPU. A cross-encoder pass is a stream
+# encode, and on CPU it measured 3164ms for 50 real pairs -- 25x the entire L3
+# budget on its own. It belongs out of band, refining results after they are
+# served, never blocking first token. Ablation, curated probes, in-process:
+#
+#     L2 (memory kinds, enrich)   R@10 5/6   p50  18.62ms   p95  24.36ms
+#     L3 (all kinds, enrich)      R@10 5/6   p50  64.09ms   p95 111.71ms
+#
+# The difference between the tiers is which CORPUS they will read, not how hard
+# they think about it. L2 answers from authored memory. L3 also reads the
+# 283k-row imported corpus, which is where a document_chunk answer lives -- some
+# answers exist ONLY in chunk form, so this is a boundary, never a deletion.
+MEMORY_KINDS = ("atom", "narrative", "snapshot")
+
+TIERS = ("L2", "L3")
+
+# L2 is the DEFAULT for agent retrieve. Filed by Grok in V3.1-AGENT-GRIPES.md:
+# 93% of the store is bulk-imported document_chunk, and walking it by default put
+# `def create_agent` in the trusted set of a 1500-token envelope while the atom
+# that actually answered had to share the budget with it.
+DEFAULT_TIER = "L2"
+
+
+def tierDefaults(tier):
+    """``tier`` -> ``{kinds, rerank, enrich}``. Unknown tier raises.
+
+    Raises rather than falling back to a default: a caller that names a tier this
+    engine does not serve has a wrong belief about the contract, and silently
+    serving it something else is how that belief survives.
+    """
+    if tier == "L2":
+        return {"kinds": list(MEMORY_KINDS), "rerank": False, "enrich": True}
+    if tier == "L3":
+        return {"kinds": None, "rerank": False, "enrich": True}
+    raise ValueError(
+        f"unknown tier {tier!r}: this engine serves {TIERS}; "
+        f"L1 is identity retrieval and lives on the lean route in serve/l1.py"
+    )
 
 # Recall breadth per signal: the plan's top-200 candidate generation. Matches the
 # signals-module default; named here so the orchestrator states its own contract.
@@ -97,7 +151,8 @@ def _auxHits(aux, query, k):
 
 
 def recall(store, indexes, embedder, query, project=None, timeScope=None,
-           kinds=None, k=10, tokenBudget=1500, enrich=False, aux=None):
+           kinds=None, k=10, tokenBudget=1500, enrich=False, aux=None,
+           tier=None, rerankEnabled=True):
     """Run the full recall pipeline and assemble a tiered payload.
 
     ``store`` is the canonical store, ``indexes`` a ``{className: VectorIndex}``
@@ -129,6 +184,14 @@ def recall(store, indexes, embedder, query, project=None, timeScope=None,
     Returns the ``RecallResult`` dict ``{results, payload, tokensUsed,
     lowConfidence}``.
     """
+    # Tier resolution happens FIRST and overrides the individual knobs, so a
+    # caller cannot ask for "L2" and separately pass kinds that contradict it.
+    if tier is not None:
+        d = tierDefaults(tier)
+        kinds = d["kinds"]
+        enrich = d["enrich"]
+        rerankEnabled = d["rerank"]
+
     now = int(time.time())
 
     # Empty/whitespace query: no lexical signal (bm25 sanitizes to nothing) and no
@@ -233,7 +296,14 @@ def recall(store, indexes, embedder, query, project=None, timeScope=None,
     #    decide. The untouched fused tail keeps global RRF order below the head.
     perClass = splitByClass(fused, store, classNames)
     rerankHead = interleave([perClass[name] for name in classNames], RERANK_HEAD)
-    rerankedHead = rerank(query, rerankHead, store)
+    if rerankEnabled:
+        rerankedHead = rerank(query, rerankHead, store)
+    else:
+        # Tiered serve path: keep the fused RRF order. The cross-encoder is a
+        # stream encode and costs 3164ms for 50 real pairs on CPU, which is 25x
+        # the whole L3 budget; it refines out of band instead of blocking a
+        # caller. Measured on the curated probes, dropping it left R@10 at 5/6.
+        rerankedHead = list(rerankHead)
     rerankedIds = {atomId for atomId, _ in rerankedHead}
     headIds = {atomId for atomId, _ in rerankHead}
     reranked = (

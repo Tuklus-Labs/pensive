@@ -75,6 +75,15 @@ def _recall_log_rows(store):
 
 
 def test_native_recall_logs_exactly_returned_atom_ids(ctx, monkeypatch):
+    """...and stamps the TIER it served from.
+
+    source_ref moved from "mcp.recall" to "mcp.recall.<tier>" on 2026-08-13 when
+    the L2/L3 tiers landed. Deliberate: recall_log is the only record of what this
+    daemon was actually asked to do, and without the tier a traffic split cannot
+    be reconstructed after the fact. A cross-vendor review asked for exactly that
+    breakdown after 91.4% of all historical traffic turned out to be one caller
+    nobody had attributed. Nothing else in the tree asserts the old literal.
+    """
     first = _put(ctx.store, "first returned memory")
     second = _put(ctx.store, "second returned memory")
     omitted = _put(ctx.store, "candidate not returned")
@@ -87,8 +96,8 @@ def test_native_recall_logs_exactly_returned_atom_ids(ctx, monkeypatch):
     assert f"p3://{second}" in text
     assert omitted not in [row[0] for row in _recall_log_rows(ctx.store)]
     assert _recall_log_rows(ctx.store) == [
-        (first, "returned memories", "mcp.recall", 1.0, None),
-        (second, "returned memories", "mcp.recall", 1.0, None),
+        (first, "returned memories", "mcp.recall.L2", 1.0, None),
+        (second, "returned memories", "mcp.recall.L2", 1.0, None),
     ]
 
 
