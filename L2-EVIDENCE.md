@@ -118,6 +118,38 @@ measurement taken on this box tonight can distinguish those. The deciding run is
 That unit is not an obstacle to the result. It is the reason the result will
 mean anything.
 
+## Two untuned defaults, offered as hypotheses rather than answers
+
+Found by reading pragmas on the live store, not by measuring. Both sit on the L2
+path and both are stock SQLite defaults that nobody has ever revisited:
+
+| pragma | value | why it is suspicious |
+|---|---|---|
+| `synchronous` | 2 (FULL) | in WAL mode this fsyncs on every commit, and `logRecall` commits on every recall, so each retrieval pays a disk sync for telemetry |
+| `cache_size` | -2000 (2 MB) | for a 1.7 GB database, on a box with plenty of RAM |
+| `mmap_size` | 0 | no memory mapping |
+| `busy_timeout` | 0 | a concurrent writer gets SQLITE_BUSY immediately rather than waiting |
+
+`logRecall` itself is already well written: one `executemany` and one commit, not
+ten round trips. The cost, if there is one, is the commit's durability barrier,
+not the insert count.
+
+**What would falsify the cache_size hypothesis**, and the reason I am not
+claiming it: a 1.7 GB file on a box with this much RAM is probably already
+resident in the OS page cache. If it is, SQLite's own cache being small means
+its reads are cheap syscalls into warm memory rather than actual disk I/O, and
+raising `cache_size` buys much less than the ratio suggests. The test is an A/B
+with the pragma raised, on a quiet box, interleaved.
+
+**What would falsify the synchronous hypothesis**: if the fsync cost is small
+relative to 20ms (likely on NVMe), moving telemetry off the critical path saves
+little. The clean test is to time `logRecall` in isolation against a copy of the
+store at both settings.
+
+Neither should be changed on a hunch. `synchronous=FULL` in particular is a
+durability setting on a store whose stated purpose is retaining a person's voice,
+so it gets measured and argued, not quietly relaxed for a benchmark.
+
 ## What happens next, in order
 
 1. Let the remaining investigations finish and the box go quiet.
