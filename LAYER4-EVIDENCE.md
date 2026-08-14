@@ -40,9 +40,24 @@ Three of five are absent outright. The two that exist carry `kind='atom'` (3)
 and `kind='narrative'` (1), which is to say they are filed identically to any
 other remembered reasoning and rank against 283k chunks on the same scale.
 
-Meanwhile eleven rule files sit in `~/.claude/projects/-home-aegis/memory/`,
+Meanwhile ten rule files sit in `~/.claude/projects/-home-aegis/memory/`,
 indexed by `MEMORY.md`, loaded unconditionally by the harness at every session
 start.
+
+They are not one kind of thing, which matters for any tier built to hold them:
+
+| frontmatter type | count | examples |
+|---|---|---|
+| `user` | 5 | `user_gary_2026q1`, `family-crisis-2026-07`, `user_accessibility` |
+| `feedback` | 4 | `heph-rule-error-message-reflex`, `feedback_no_exploit_paranoia` |
+| `project` | 1 | `pensive-attribution-contract` |
+
+Only the four `feedback` entries are rules in the statute sense: general
+imperatives that should fire on a *situation*. The five `user` entries are
+durable biographical context, which wants to be resident rather than retrieved,
+and the single `project` entry is a technical contract closer to documentation.
+A `kind='rule'` tier that swallows all ten is three different jobs wearing one
+name. The behavioral four are the honest seed.
 
 **That arrangement is the finding.** The statutes were moved out of the memory
 system and onto the filesystem, where a loader could guarantee they surface,
@@ -77,15 +92,15 @@ Stated as constraints so a design can fail them:
    matches it, it has not solved the problem the filesystem loader already
    solves better. The test is whether the error-message reflex surfaces during a
    debugging session that never uses the words "error message reflex."
-2. **Be scarce, and stay scarce.** Eleven files today. A rule tier that grows to
+2. **Be scarce, and stay scarce.** Ten files today, four of them true rules. A rule tier that grows to
    thousands has become another chunk tier with a nicer name. Whatever writes
    rules must be much more reluctant than whatever writes atoms.
 3. **Not depend on importance accrual.** Per `LAYER5-EVIDENCE.md`, importance is
    currently a 1.0-capped scale with 363 atoms already saturated at the top. A
    rule tier built on top of that inherits a plateau.
-4. **Survive the migration honestly.** The eleven files are the seed corpus.
+4. **Survive the migration honestly.** The four `feedback` files are the seed corpus.
    Importing them is a one-time act with a known input, so there is no excuse for
-   a fuzzy result: eleven in, eleven retrievable by situation, verified
+   a fuzzy result: four in, four retrievable by situation, verified
    individually rather than by count.
 
 ## Status
