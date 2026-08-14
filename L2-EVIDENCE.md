@@ -247,3 +247,70 @@ they projected a median saving onto a p95 budget.
 
 The remaining ~22ms of L2's p95 is in the tail. The next work is not another
 encoder; it is finding what stalls.
+
+---
+
+# THE TAIL: a write blocks every read, measured
+
+Found after the A-B-A result showed p95 is set by stalls rather than throughput.
+Measured 2026-08-13 against the live store.
+
+## The mechanism
+
+`ServeContext.reindex()` (`serve/mcp.py:264`) embeds any missing atoms and then
+rebuilds the dense index for every kind class the write touched. Mutating tools
+call it so that an emitted atom is recallable on the next call, which is correct
+behaviour and the reason it exists.
+
+It runs **synchronously on the event-loop thread**. That is not inferred; the
+daemon documents it at `serve/daemon.py`:
+
+> "the tee/shadow boundary handlers are synchronous and run inline on the
+> event-loop thread -- the SAME thread that created the sqlite store (and the
+> same path the MCP `call_tool` handler already takes)"
+
+So a rebuild does not run alongside serving. Every in-flight and subsequent
+request waits behind it.
+
+## The cost
+
+| class | kinds | rebuild |
+|---|---|---:|
+| memory | atom, narrative, snapshot | **272 ms** |
+| code | document_chunk | **18,645 ms** |
+
+An emit of a reasoning atom stalls all recall for roughly a quarter second. A
+`document_chunk` write stalls it for **18.6 seconds**.
+
+## Why this matches the tail and not the median
+
+The A-B-A runs measured L2 p50 at 26 to 32ms with p95 at 42ms, and maxima of
+2,961ms and 6,286ms. A blocking rebuild produces exactly that shape: it does not
+touch the median, because most requests do not coincide with a write, and it
+sets the tail entirely for those that do. It also explains why the stalls appear
+in some runs and not others, which had looked like noise.
+
+Atoms were written at 21:13:52 and 21:18:52, inside the gate windows. Those were
+this session's own memory emits.
+
+## What is NOT established
+
+That the 272ms memory rebuild alone accounts for a 6,286ms sample. It does not,
+arithmetically, and the honest statement is that a mechanism capable of
+multi-second event-loop blocking has been found and measured, not that this
+specific sample has been traced to it. `reindex` also calls `embedMissing`
+first, and other contributors may stack. Closing that gap needs per-request
+instrumentation, not more inference.
+
+## Why this outranks further encoder work
+
+The campaign spent the night on a component that sets the median. This sets the
+tail, and the tier budgets are p95. A 272ms block is 13x the entire L2 budget;
+the 18.6s code-class rebuild is 930x it. No encoder change can be seen through
+that.
+
+The shape of the fix is a design decision, not a tuning one, and belongs to
+whoever picks this up: rebuild off the event loop, make it incremental rather
+than a full class rebuild, or decouple write-visibility from index freshness.
+Each trades something real (staleness, complexity, or memory) and none of them
+should be chosen from a benchmark number alone.
