@@ -63,6 +63,44 @@ which is a destructive op under Guardian and needs Gary's word, not mine. Filed,
 not executed. There is no urgency: 13.7% of a 1.7 GB file is not hurting
 anything measured.
 
+## The background cosine of this corpus, which an adjacency threshold must clear
+
+Measured as a side effect of verifying the ONNX encoder. The negative control
+there pairs each embedding against a DIFFERENT text's embedding, which makes it
+a sample of what "unrelated" scores in this store. Over 375 real texts (250 live
+atom bodies, 125 real queries):
+
+| statistic | cosine |
+|---|---|
+| median | 0.6458 |
+| p90 | 0.8383 |
+| p99 | 0.9233 |
+| max | **0.9756** |
+
+This is the number that governs adjacency design, and it is uncomfortable. A
+pair of *unrelated* atoms in this corpus scores 0.65 at the median, and one in a
+hundred scores above 0.92. The maximum, 0.9756, is not encoder error: it is two
+genuinely near-duplicate texts, which this store is full of because the same
+source chunks were re-emitted thousands of times (see the 84.6% stitcher share
+in `LAYER5-EVIDENCE.md`).
+
+Two consequences:
+
+1. **An absolute cosine threshold for "semantically adjacent" is not viable
+   here.** Any cutoff low enough to catch real adjacency (0.85, say) sits below
+   the 90th percentile of *random* pairs. Adjacency has to be relative (rank
+   against the rest of the candidate set) rather than absolute.
+2. **The high tail is partly an artifact of duplication, not of meaning.**
+   Before tuning any adjacency metric, the near-duplicate population needs to be
+   understood, or the metric will be tuned against Charon's echo rather than
+   against the corpus.
+
+This also retro-justifies a verdict elsewhere in the campaign. The MiniLM
+candidate scored cosine 0.2597 against current output while its own negative
+control scored 0.5337. Against the distribution above, 0.2597 is not merely low,
+it is below what unrelated text scores, which is the signature of a different
+embedding space rather than a worse view of the same one.
+
 ## What is NOT yet measured
 
 Adjacency itself. Whether recall actually returns semantically adjacent results,

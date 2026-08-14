@@ -16,7 +16,13 @@ import time
 
 import numpy as np
 
-__all__ = ["Embedder", "embedMissing", "vecToBlob", "blobToVec"]
+__all__ = ["Embedder", "OnnxEmbedder", "makeEmbedder", "embedMissing",
+           "vecToBlob", "blobToVec"]
+
+# Path to an exported ONNX graph of the SAME model. Unset = feature off and this
+# module behaves exactly as before. See OnnxEmbedder for why the model id does
+# not change when this is set.
+_ONNX_PATH_ENV = "PENSIVE_V3_ONNX_MODEL"
 
 # Plan-specified batch size. The spike used 32; the plan's number governs here.
 _BATCH_SIZE = 64
@@ -142,6 +148,125 @@ class Embedder:
         # alias the batch matrix, and a consumer's in-place op would silently
         # mutate its siblings. 384 float32s per copy, negligible.
         return [matrix[i].copy() for i in range(matrix.shape[0])]
+
+
+class OnnxEmbedder:
+    """Same model, same embedding space, same model id -- different runtime.
+
+    WHY THIS EXISTS: the query embed is a STREAM encode on the serve path, and
+    it was the largest single component of L2 latency. Running the identical
+    bge-small graph under onnxruntime instead of sentence-transformers measured
+    3.49/4.55/5.03/5.75 ms at 30/95/154/223-char queries against 6.44/8.05/9.58/
+    11.97 for the current path (the four lengths are the real p10/p50/p90/p99 of
+    this store's queries).
+
+    WHY ``modelId`` IS UNCHANGED, and why that is not a lie: embeddings are keyed
+    ``(atom_id, model_id)``. This runtime produces the same vectors from the same
+    weights, verified below, so the 340,722 stored vectors remain valid and no
+    re-embed is required. Reporting a different id here would strand every one of
+    them and silently trigger a full re-embed on next startup. The id names the
+    EMBEDDING SPACE, not the inference library.
+
+    VERIFIED before shipping, on this box, against 375 real texts (250 live atom
+    bodies + 125 real recall_log queries):
+
+        paired cosine vs sentence-transformers   min 0.99999940, mean 1.00000000
+        samples below 0.9999                     0
+        negative control (shuffled pairing)      median 0.6458, p99 0.9233
+
+    The control is there because a cosine near 1.0 proves nothing on its own; it
+    is exactly what comparing a thing to itself would produce. The control shows
+    the metric discriminates.
+
+    A NOTE ON THAT CONTROL, because it bit me: an earlier verdict gated on
+    ``paired.min - control.max``, and control.max is 0.9756. That is not encoder
+    error, it is two genuinely near-duplicate atoms in a corpus where the same
+    source chunks were re-emitted thousands of times. Gating on the max of a
+    control asks a question about the corpus, not about the encoder.
+
+    Pooling is folded INTO the exported graph (CLS token, then L2 normalize) so
+    this class cannot drift from the reference by reimplementing it here.
+    """
+
+    def __init__(self, modelId, onnxPath, threads=None):
+        os.environ.setdefault("HF_HUB_OFFLINE", "1")
+        os.environ.setdefault("TRANSFORMERS_OFFLINE", "1")
+        import onnxruntime as ort
+        from transformers import AutoTokenizer
+
+        if not os.path.exists(onnxPath):
+            raise FileNotFoundError(f"ONNX graph not found: {onnxPath}")
+
+        if threads is None:
+            try:
+                threads = int(os.environ.get(_SERVE_THREADS_ENV,
+                                             _DEFAULT_SERVE_THREADS))
+            except ValueError:
+                threads = _DEFAULT_SERVE_THREADS
+        opts = ort.SessionOptions()
+        if threads > 0:
+            opts.intra_op_num_threads = threads
+            opts.inter_op_num_threads = 1
+        opts.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
+
+        self.modelId = modelId
+        self.onnxPath = onnxPath
+        self.device = "cpu"
+        self._tok = AutoTokenizer.from_pretrained(modelId)
+        self._sess = ort.InferenceSession(onnxPath, opts,
+                                          providers=["CPUExecutionProvider"])
+        outs = self._sess.get_outputs()
+        if len(outs) != 1:
+            raise ValueError(
+                f"expected exactly one graph output, got {[o.name for o in outs]}")
+        self._outName = outs[0].name
+        self._inNames = {i.name for i in self._sess.get_inputs()}
+        self.dim = int(outs[0].shape[-1])
+
+    def embed(self, texts):
+        """Embed ``texts`` -> list of unit-normalized float32 vectors.
+
+        Same contract as ``Embedder.embed``: empty in, empty out; each returned
+        vector owns its buffer.
+        """
+        if not texts:
+            return []
+        out = []
+        for i in range(0, len(texts), _BATCH_SIZE):
+            enc = self._tok(texts[i:i + _BATCH_SIZE], padding=True,
+                            truncation=True, max_length=512, return_tensors="np")
+            feed = {"input_ids": enc["input_ids"].astype(np.int64),
+                    "attention_mask": enc["attention_mask"].astype(np.int64)}
+            # bge exports with token_type_ids; a graph without it must not be fed
+            # one, so the input set decides rather than an assumption about BERT.
+            if "token_type_ids" in self._inNames:
+                tt = enc.get("token_type_ids")
+                feed["token_type_ids"] = (
+                    np.zeros_like(feed["input_ids"]) if tt is None
+                    else tt.astype(np.int64))
+            matrix = self._sess.run([self._outName], feed)[0]
+            matrix = matrix.astype(np.float32, copy=False)
+            out.extend(matrix[j].copy() for j in range(matrix.shape[0]))
+        return out
+
+
+def makeEmbedder(modelId):
+    """Build the serve-path embedder: ONNX when configured, torch otherwise.
+
+    A construction failure on the ONNX path is NOT fatal. The feature is a
+    latency optimization over an already-working encoder, so it degrades to the
+    torch path and says so loudly. Silence here would be the bad outcome: an
+    operator who set the env var deserves to know it did not take.
+    """
+    onnxPath = os.environ.get(_ONNX_PATH_ENV)
+    if not onnxPath:
+        return Embedder(modelId)
+    try:
+        return OnnxEmbedder(modelId, onnxPath)
+    except Exception as exc:  # noqa: BLE001
+        print(f"[pensive] ONNX embedder unavailable ({exc}); "
+              f"falling back to sentence-transformers", flush=True)
+        return Embedder(modelId)
 
 
 def embedMissing(store, embedder):
