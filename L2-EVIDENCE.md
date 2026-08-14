@@ -150,14 +150,34 @@ Neither should be changed on a hunch. `synchronous=FULL` in particular is a
 durability setting on a store whose stated purpose is retaining a person's voice,
 so it gets measured and argued, not quietly relaxed for a benchmark.
 
-## What happens next, in order
+## What happens next, in order, and why the order matters
+
+The tempting sequence is: wait for quiet, enable ONNX, run the gate, report the
+improvement. That sequence is wrong, and it would manufacture a false claim.
+
+It changes TWO variables at once. The box going quiet removes contamination that
+was inflating every number, and ONNX removes 4 to 7ms of encoder time. Run them
+together and the whole delta gets attributed to ONNX, when most of it is likely
+the load dropping. That is exactly how a plausible, well-evidenced,
+completely wrong performance claim gets written.
+
+So:
 
 1. Let the remaining investigations finish and the box go quiet.
-2. Re-run `tiergate` and require contamination to PASS before reading any
-   latency figure from it. A REJECT with contamination FAIL is not a result.
-3. Land the ONNX path behind a switch, re-verified locally rather than on the
-   subagent's numbers, and re-run.
-4. If L2 still misses on a clean run, the remaining cost is inside the engine
-   (bm25, vector search, fusion, enrich), and it gets decomposed by measurement
-   rather than by hypothesis. Eight hypotheses died tonight; the cheap probe
-   won every time.
+2. **Run `tiergate` clean with ONNX still OFF.** This is the baseline that does
+   not exist yet: an uncontaminated L2 number for the code as it stands. It is
+   the single most valuable measurement remaining, and it is the one that says
+   whether L2 was ever really 24ms over or whether most of that was neighbours.
+3. Enable ONNX (`90-onnx-embedder.conf.staged`), restart, run `tiergate` again
+   under the same quiet conditions.
+4. The difference between steps 2 and 3 is the ONNX effect, and nothing else.
+   Report that number, not the difference from the contaminated run.
+5. Require `contamination.background-traffic` to PASS on both. A REJECT with
+   contamination FAIL is not a result, in either direction.
+6. If L2 still misses at step 3, the remaining cost is inside the engine (bm25,
+   vector search, fusion, enrich), and it gets decomposed by measurement rather
+   than by hypothesis. Eight hypotheses died tonight and the cheap probe won
+   every time.
+
+Step 2 is the one I would skip if I were in a hurry, and it is the one that
+makes step 4 mean anything.
