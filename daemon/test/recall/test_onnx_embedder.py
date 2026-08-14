@@ -143,6 +143,33 @@ def test_each_returned_vector_owns_its_buffer(onnxEmb):
 # --------------------------------------------------------------------------- #
 
 
+def test_the_daemon_actually_builds_its_embedder_through_the_factory():
+    """The factory must be ON the daemon's startup path, not merely importable.
+
+    This exists because it was not. Every test above passed against a build in
+    which `serve/daemon.py` still called `Embedder(modelId)` directly, so
+    PENSIVE_V3_ONNX_MODEL could be set, the systemd drop-in could be installed,
+    the whole feature could be 'shipped', and production would have kept running
+    the torch path with nothing anywhere reporting a problem.
+
+    That is the same defect class as a gate nothing invokes: the code is correct
+    and unreached. Unit tests cannot see it, because they call the unit
+    directly. Source inspection is a blunt instrument, but it asks the one
+    question the rest of this file cannot: does the caller call it.
+    """
+    import inspect
+
+    import serve.daemon as daemon
+
+    src = inspect.getsource(daemon)
+    assert "makeEmbedder(modelId)" in src, (
+        "serve/daemon.py does not build its embedder through makeEmbedder; "
+        "the ONNX path is unreachable in production")
+    assert "embedder = Embedder(" not in src, (
+        "serve/daemon.py still constructs Embedder directly, which bypasses "
+        "the factory and pins production to the torch path")
+
+
 def test_no_env_var_means_the_torch_path(monkeypatch):
     monkeypatch.delenv("PENSIVE_V3_ONNX_MODEL", raising=False)
     assert type(makeEmbedder(MODEL)).__name__ == "Embedder"

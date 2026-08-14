@@ -56,7 +56,7 @@ from store.store import logRecall  # noqa: E402
 from serve import viz  # noqa: E402
 from ambient.briefer import brief, DEFAULT_BUDGET  # noqa: E402
 from store.store import openStore  # noqa: E402
-from recall.embedder import Embedder  # noqa: E402
+from recall.embedder import makeEmbedder  # noqa: E402
 
 _DEFAULT_STORE = Path.home() / ".local" / "share" / "pensive-v3" / "shadow.db"
 _DEFAULT_PORT = 5999
@@ -90,7 +90,15 @@ def buildContext():
     store = openStore(storePath)
 
     _log(f"loading embedder {modelId}")
-    embedder = Embedder(modelId)
+    # makeEmbedder, not Embedder: it returns the ONNX runtime when
+    # PENSIVE_V3_ONNX_MODEL points at an exported graph of this same model, and
+    # the torch path otherwise. Same weights, same embedding space, same model
+    # id, so stored vectors stay valid either way (see OnnxEmbedder).
+    embedder = makeEmbedder(modelId)
+    # Which runtime actually loaded is not inferable from the line above, and an
+    # operator who set the env var needs to see whether it took. The type name
+    # is the honest answer; the model id is identical in both cases by design.
+    _log(f"embedder runtime: {type(embedder).__name__} on {embedder.device}")
 
     _log("warming cross-encoder reranker")
     from recall.rerank import _getReranker
