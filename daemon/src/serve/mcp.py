@@ -274,14 +274,14 @@ class ServeContext:
         concurrent read waited behind it. That is what set L2's P95 tail; the
         median was never the problem.
 
-        WHY IT IS SAFE. A retirement needs no index work at all, which is the
-        part that looks wrong and is not. ``recall.trust.assessTrust`` runs
-        unconditionally in the pipeline and reads ``status`` from the canonical
-        store for every atom it returns, dropping tombstones and chaining
-        superseded atoms to their live replacement. Verified end to end by
-        injecting a superseded atom into a live index: the raw index returns it,
-        ``recall()`` does not. Index staleness costs ranking QUALITY, never
-        correctness.
+        RETIREMENT IS A SEPARATE CALL. This method only adds; a write that also
+        retires an atom must call :meth:`retireAtom` too, and ``correct`` does.
+        An earlier version of this docstring claimed retirement needed no index
+        work because ``assessTrust`` resolves status per query. That was wrong
+        and is corrected in ``recall.vector_index.VectorIndex``, which holds the
+        single account of why. It is called out here rather than quietly deleted
+        because the wrong version shipped and it read as a licence to delete
+        ``retireAtom``.
 
         Falls back to a full ``reindex`` when the class has no index yet, or when
         the atom has no embedding to add. Falling back is slow and correct; the

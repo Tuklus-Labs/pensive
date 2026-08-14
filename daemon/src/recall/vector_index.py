@@ -66,6 +66,19 @@ class VectorIndex(abc.ABC):
     - ``search(vec, k)`` returns up to ``k`` ``(atomId, score)`` pairs sorted by
       descending ``score`` (cosine similarity). An empty index, an empty query,
       or ``k <= 0`` returns ``[]`` rather than raising.
+    - ``add`` and ``remove`` maintain the index incrementally, so a write does
+      not pay a rebuild. They are a PAIR; see below for why neither is optional.
+
+    WHY ``add`` WITHOUT ``remove`` IS WRONG, recorded once here because both
+    methods depend on it. A rebuild loads live atoms only, which enforced "a
+    retracted atom is not recallable" implicitly. Incremental maintenance has to
+    enforce it explicitly, and the tempting argument against that is wrong:
+    ``recall.trust.assessTrust`` does resolve ``status`` per query, but it does
+    not DROP a superseded atom, it annotates it with ``supersededBy`` at a capped
+    confidence, so the retired claim still reaches the payload beside the current
+    one. `test_correct_supersedes_and_recall_shows_current_truth` is what caught
+    that, by asking a question whose retired answer reappeared next to its own
+    correction.
     """
 
     @abc.abstractmethod
@@ -80,41 +93,20 @@ class VectorIndex(abc.ABC):
     def add(self, atomId, vec):
         """Add ONE already-embedded atom without rebuilding; return ``self``.
 
-        WHY THIS EXISTS. ``build`` is how the index learns who is recallable, and
-        it costs 272ms for the memory class and 18.6s for the code class on this
-        store. Every emit used to pay that, synchronously, on the event-loop
-        thread, which is what set L2's P95 tail (measured maxima of 2,961ms and
-        6,286ms against a 20ms budget). One ``add`` costs 0.115ms.
-
-        ``add`` IS NOT SUFFICIENT ON ITS OWN. It pairs with ``remove``. An
-        earlier version of this seam shipped ``add`` alone, arguing that
-        ``recall.trust.assessTrust`` already resolves status per query and would
-        keep retracted atoms out of results. That argument was wrong in a
-        specific way worth recording: ``assessTrust`` resolves status but does
-        not DROP a superseded atom, it annotates it with ``supersededBy`` at a
-        capped confidence, so the retired claim still reaches the payload beside
-        the current one. The full rebuild used to prevent that implicitly by
-        loading live atoms only.
+        ``build`` costs 272ms for the memory class and 18.6s for the code class
+        on this store, and every emit used to pay it synchronously on the
+        event-loop thread. One ``add`` costs 0.115ms.
 
         ``vec`` must be unit-normalized, as ``build`` requires, because search
-        treats stored rows as unit length.
+        treats stored rows as unit length. Pairs with ``remove``.
         """
 
     @abc.abstractmethod
     def remove(self, atomId):
         """Stop returning ``atomId``; return True if it was present.
 
-        WHY THIS IS REQUIRED AND NOT OPTIONAL. An earlier version of this seam
-        shipped ``add`` alone, on the reasoning that ``recall.trust.assessTrust``
-        already resolves status per query and would keep retracted atoms out of
-        results. It does resolve status, and it does NOT drop them: a superseded
-        atom surfaces ANNOTATED with ``supersededBy`` at a capped confidence.
-        `test_correct_supersedes_and_recall_shows_current_truth` caught it, by
-        asking a question whose retired answer ("100 meters") reappeared beside
-        the current one ("40 meters").
-
-        The full rebuild used to enforce this implicitly by loading only live
-        atoms. Incremental maintenance has to do it explicitly.
+        Not optional: see the class docstring for why ``add`` alone leaves a
+        retracted atom recallable.
         """
 
 
