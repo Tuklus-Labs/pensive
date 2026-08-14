@@ -127,3 +127,75 @@ schema and query-plan facts. The quality measurement waits for a quiet box.
    negative control.** The cosine 0.149 near-miss happened because a plausible
    number arrived without a control beside it. Any adjacency claim needs the
    same discipline: what does an unrelated pair score, and is the gap real.
+
+---
+
+## Design returned 2026-08-13: the substrate is far thinner than the filing implied
+
+Verified the design's most decisive claim at the source rather than on report.
+
+### Every typed edge points from code at memory. None link two memories.
+
+```
+  src_kind        dst_kind    edges
+  document_chunk  atom         2452
+  document_chunk  narrative     357
+  document_chunk  snapshot        1
+```
+
+All 2,810 `relates` edges are `document_chunk -> memory`. There are ZERO
+memory-to-memory edges. The typed-edge layer is not a graph between ideas, it is
+an annotation pointing from a piece of code at the memory that explains it.
+
+That single fact redirects the design. An edge hop cannot go memory to memory
+because no such edge exists; it has to run backward then forward,
+`memA <- chunk -> memB`, which reads as "two memories that explain the same
+code". `idx_edges_dst (dst_atom, type)` already exists, so the traversal is
+indexed and costs nothing new.
+
+### The connective material is ~30x thinner than the filing counted
+
+Codex's filing cited 675,876 entity facets over 211,761 distinct values as
+evidence there is enough to traverse. Those numbers are right and they describe
+the CHUNK corpus. Restricted to the 16,745 live memory-kind atoms that divergent
+ideation should actually walk:
+
+| substrate | whole store | memory kinds only |
+|---|---:|---:|
+| distinct entity values | 211,761 | 4,654 |
+| bridge-eligible (degree 2..100) | 54,308 | **601** |
+| tag values bridge-eligible | - | **900** |
+| memory atoms with any bridge facet | - | **2,710 of 16,745 (16.2%)** |
+
+I re-measured the singleton share independently and got **70.0%** (148,153 of
+211,761) against the design's 74.2% (157,108). Same denominator, different
+numerator, most likely because I counted `COUNT(DISTINCT atom_id)` (atoms
+actually bridged) where the design counted facet rows, and its snapshot predates
+tonight's writes. Recorded rather than smoothed over. The conclusion survives
+either number: roughly three quarters of entity values appear on exactly one
+atom, and a degree-1 facet bridges nothing while still costing index space.
+
+### Tag is the bridge namespace; entity is the noisy secondary
+
+| in the bridge band (degree 2..100) | entity | tag |
+|---|---:|---:|
+| bridge-eligible values over memory | 601 | 900 |
+| share of facet rows that are memory | **1.16%** | **75.4%** |
+| share of values that are wordlike | 25.6% | 97.3% |
+
+Entity extraction was tuned for a code corpus and it shows: 98.8% of entity
+facet rows describe chunks, and three quarters of the values that do survive the
+degree filter are not word-like. Tag is the namespace memory actually populates.
+
+### Consequence for anchoring
+
+A single anchor produced candidates for 9 of 60 random live memory atoms, and
+only 7 of 60 reached the three-candidate bar. With a 10-anchor set: 29 of 40
+trials reached three candidates. The design states its own optimism honestly,
+noting that random anchor sets sample more of the graph than a topically
+clustered L2 top-10 will, so the real hit rate sits below that bound.
+
+Combined with the background-cosine distribution measured earlier in this
+document (unrelated pairs at 0.65 median, 0.92 at p99), both halves point the
+same way: adjacency here cannot be a threshold over a single anchor. It has to
+be a ranked walk from a set.
