@@ -51,6 +51,8 @@ from serve.tee import (  # noqa: E402
 )
 from serve.shadow import runShadow, defaultShadowLogPath  # noqa: E402
 from serve.l1 import handleGet, handleLookup  # noqa: E402
+from recall.engine import recall as recallEngine, TIERS  # noqa: E402
+from store.store import logRecall  # noqa: E402
 from serve import viz  # noqa: E402
 from ambient.briefer import brief, DEFAULT_BUDGET  # noqa: E402
 from store.store import openStore  # noqa: E402
@@ -221,6 +223,54 @@ def buildApp(ctx):
         )
         return JSONResponse(payload, status_code=status)
 
+    async def lean_recall(request):
+        # L2/L3 over a plain route, for the same reason L1 is not an MCP tool.
+        #
+        # Measured on this daemon, 95-char query, 4KB response: the same recall
+        # costs 16.66ms in-process and 24.62ms through MCP tools/call, so the
+        # envelope is ~7.6ms of pydantic and JSON-RPC. Against a 20ms L2 budget
+        # that is not an optimization detail, it is most of the gap. The lean
+        # route serves a 947-byte response in 0.13ms.
+        #
+        # /mcp stays exactly as it is: every wired agent on this box speaks it,
+        # and this is an ADDITIONAL door for callers that need the budget, not a
+        # replacement. Origin- and Host-checked like every other read here.
+        rejection = checkRequestOrigin(request.headers)
+        if rejection is not None:
+            status, payload = rejection
+            return JSONResponse(payload, status_code=status)
+        qp = request.query_params
+        query = qp.get("q", "")
+        if not query.strip():
+            return JSONResponse({"error": "q is required"}, status_code=400)
+        tier = qp.get("tier", "L2")
+        if tier not in TIERS:
+            return JSONResponse(
+                {"error": f"tier must be one of {list(TIERS)}"}, status_code=400)
+        try:
+            k = int(qp.get("k", 10))
+            budget = int(qp.get("budget", 1500))
+        except ValueError:
+            return JSONResponse({"error": "k and budget must be integers"},
+                                status_code=400)
+        if not 1 <= k <= 200 or not 1 <= budget <= 8000:
+            return JSONResponse({"error": "k must be 1..200, budget 1..8000"},
+                                status_code=400)
+        if len(query) > 8192:
+            return JSONResponse({"error": "q exceeds 8192 characters"},
+                                status_code=400)
+        out = recallEngine(
+            ctx.store, ctx.indexes, ctx.embedder, query,
+            k=k, tokenBudget=budget, aux=ctx.aux, tier=tier,
+        )
+        try:
+            logRecall(ctx.store, [r["atomId"] for r in out["results"]],
+                      query=query, sourceRef=f"lean.recall.{tier}")
+        except Exception:  # noqa: BLE001 -- serving wins over telemetry
+            pass
+        return JSONResponse({"tier": tier, "payload": out["payload"],
+                             "count": len(out["results"])})
+
     async def tee_emit(request):
         # ORDER IS THE FIX. This used to `await request.body()` first and call
         # handleTeeEmit (where the guard lives) second, so an unauthenticated
@@ -343,6 +393,7 @@ def buildApp(ctx):
         routes=[
             Route("/tee/emit", tee_emit, methods=["POST"]),
             Route("/shadow/recall", shadow_recall, methods=["POST"]),
+            Route("/recall", lean_recall, methods=["GET"]),
             Route("/get", l1_get, methods=["GET"]),
             Route("/lookup", l1_lookup, methods=["GET"]),
             Route("/status", status, methods=["GET"]),
