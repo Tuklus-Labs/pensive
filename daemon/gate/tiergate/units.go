@@ -430,15 +430,48 @@ func gitHead(dir string) string {
 	return strings.TrimSpace(string(out))
 }
 
+// daemonProc resolves the process this gate is MEASURING, not merely one whose
+// name looks right.
+//
+// It used to run `pgrep -f pensived-v3` and take f[0]. On this box that matches
+// FIVE processes: the unit's MainPID plus three leftover pensive-review A/B
+// daemons carrying about 9.2GB between them, so f[0] was 2195449 while the
+// daemon answering port 5999 was 2359723. The unit whose entire job is
+// certifying that the numbers describe the running artifact was resolving the
+// artifact by name substring and taking whichever matched first.
+//
+// systemd owns the answer, so ask systemd. pgrep remains only as a fallback for
+// a daemon started by hand, and in that case the ambiguity is reported rather
+// than silently resolved: a staleness verdict about the wrong process is worse
+// than no staleness verdict, because it reads as certification.
 func daemonProc() (int, time.Time, error) {
-	out, err := exec.Command("pgrep", "-f", "pensived-v3").Output()
-	if err != nil {
-		return 0, time.Time{}, fmt.Errorf("daemon not running (pgrep pensived-v3 found nothing)")
+	pidStr := ""
+	if out, err := exec.Command("systemctl", "--user", "show", "pensive-v3",
+		"-p", "MainPID", "--value").Output(); err == nil {
+		v := strings.TrimSpace(string(out))
+		if v != "" && v != "0" {
+			pidStr = v
+		}
 	}
-	f := strings.Fields(strings.TrimSpace(string(out)))
-	if len(f) == 0 {
-		return 0, time.Time{}, fmt.Errorf("daemon not running")
+	if pidStr == "" {
+		out, err := exec.Command("pgrep", "-f", "pensived-v3").Output()
+		if err != nil {
+			return 0, time.Time{}, fmt.Errorf("daemon not running (systemd reports no MainPID and pgrep pensived-v3 found nothing)")
+		}
+		f := strings.Fields(strings.TrimSpace(string(out)))
+		if len(f) == 0 {
+			return 0, time.Time{}, fmt.Errorf("daemon not running")
+		}
+		if len(f) > 1 {
+			return 0, time.Time{}, fmt.Errorf(
+				"AMBIGUOUS DAEMON: %d processes match pensived-v3 (%s) and systemd "+
+					"reports no MainPID, so this gate cannot tell which one it is "+
+					"measuring; refusing to certify staleness against a guess",
+				len(f), strings.Join(f, " "))
+		}
+		pidStr = f[0]
 	}
+	f := []string{pidStr}
 	pid, _ := strconv.Atoi(f[0])
 	el, err := exec.Command("ps", "-o", "etimes=", "-p", f[0]).Output()
 	if err != nil {
