@@ -631,3 +631,21 @@ torch cost per encode, so the shipped number is lower than 10.6ms.
 
 Load was 24 to 33 throughout, so both arms are inflated and the RATIO is the
 transferable figure, not the absolutes.
+
+### The same measurement in the PRODUCTION configuration (ONNX encoder)
+
+| arm | p50 | min |
+|---|---:|---:|
+| full class rebuild (the old path) | **363.73 ms** | 347.31 ms |
+| incremental, ONNX encoder | **5.83 ms** | 4.59 ms |
+
+**62x**, and 5.83ms sits comfortably inside the 20ms L2 budget where the old
+path was 18x outside it. This is the shipped number; the 10.6ms above was the
+torch encoder.
+
+Worth naming, because it closes the encoder thread honestly: ONNX halves the
+incremental write path (10.6ms to 5.8ms) while it moved L2's read P95 by 0.07ms.
+The encoder win was real all along. It was landing on the median of a
+distribution whose tail was set by something else, and the write path is the
+place where an encode actually dominates. Two correct measurements pointing at
+different budgets, which is the whole lesson of this document.
