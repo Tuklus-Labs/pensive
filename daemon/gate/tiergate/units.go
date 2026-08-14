@@ -118,6 +118,9 @@ func run(c *cfg) (*verdict.Report, error) {
 	// --- probes (built BEFORE contamination, which must exclude them) --------
 	gen, gerr := generatedProbes(c.storePath, c.genProbes, c.seed)
 	cur, cerr := curatedProbes("probes.json")
+	// Chunk gold, scored at L3 only. See generatedChunkProbes for why a gate
+	// without this family cannot see a change that deletes 94.4% of the corpus.
+	chunks, chErr := generatedChunkProbes(c.storePath, c.genProbes, c.seed)
 
 	// --- contamination ------------------------------------------------------
 	// Refuse to measure a daemon under unknown load rather than quietly
@@ -134,7 +137,8 @@ func run(c *cfg) (*verdict.Report, error) {
 	var bgPerMin float64
 	{
 		q := "QUESTION: is background recall traffic, EXCLUDING this gate's own probe queries, low enough that a latency number describes this gate rather than another process's load?"
-		excl := sqlQuoteList(append(probeQueries(gen), probeQueries(cur)...))
+		excl := sqlQuoteList(append(append(probeQueries(gen), probeQueries(cur)...),
+			probeQueries(chunks)...))
 		// recall_log holds one row PER RETURNED ATOM, not per request, so a raw
 		// row count is in the wrong unit: one background request returning ten
 		// atoms read as ten "events" and tripped a ceiling of five. Estimate
@@ -153,10 +157,10 @@ func run(c *cfg) (*verdict.Report, error) {
 			bgPerMin = float64(n)
 			add("contamination", "contamination.background-traffic", state(bgPerMin <= c.maxBackground),
 				c.ev("contamination", map[string]any{
-					"question":                       q,
+					"question":                        q,
 					"background_requests_est_last60s": n,
-					"background_rows_last60s":        rows,
-					"ceiling_requests_per_min":       c.maxBackground,
+					"background_rows_last60s":         rows,
+					"ceiling_requests_per_min":        c.maxBackground,
 					"KNOWN BLIND SPOT": "a background request that returns ZERO atoms writes no " +
 						"recall_log row and is invisible here, so this guard bounds noisy traffic, " +
 						"not all traffic. It also infers ownership from query equality, so another " +
@@ -252,8 +256,8 @@ func run(c *cfg) (*verdict.Report, error) {
 		}
 		add("correctness", "l1.correctness.exact", state(routeUp && exact),
 			c.ev("l1-correctness", map[string]any{
-				"question":        "QUESTION: does exact lookup return exactly the atom requested, on every iteration?",
-				"atom_id":         knownID, "iterations": len(lats), "all_exact": exact, "http_status": lastCode,
+				"question": "QUESTION: does exact lookup return exactly the atom requested, on every iteration?",
+				"atom_id":  knownID, "iterations": len(lats), "all_exact": exact, "http_status": lastCode,
 				"verdict_meaning": "FAIL means L1 is fast but wrong, which is worse than slow and right",
 			}), nil)
 	}
@@ -267,9 +271,10 @@ func run(c *cfg) (*verdict.Report, error) {
 	covOK := gerr == nil && cerr == nil && len(gen) >= c.minGenerated && len(cur) >= c.minCurated
 	add("coverage", "coverage.probe-count", state(covOK),
 		c.ev("coverage", map[string]any{
-			"question":        "QUESTION: how many probes did this run actually exercise, in each family, and does that clear the floor each family must maintain?",
-			"generated":       len(gen), "curated": len(cur), "total": nProbes,
-			"min_generated":   c.minGenerated, "min_curated": c.minCurated,
+			"question":  "QUESTION: how many probes did this run actually exercise, in each family, and does that clear the floor each family must maintain?",
+			"generated": len(gen), "curated": len(cur), "total": nProbes,
+			"generated_chunk": len(chunks), "generated_chunk_error": errStr(chErr),
+			"min_generated": c.minGenerated, "min_curated": c.minCurated,
 			"generated_error": errStr(gerr), "curated_error": errStr(cerr),
 			"verdict_meaning": "FAIL means a probe family fell below its floor, so the quality verdict covers less than it appears to",
 		}), nil)
@@ -322,11 +327,52 @@ func run(c *cfg) (*verdict.Report, error) {
 				"verdict_meaning": "FAIL means quality was traded for speed. This is the unit " +
 					"that makes 'return fewer results' an unprofitable optimization.",
 			}), &verdict.Score{Value: r10, Max: 1.0})
+		// CHUNK RETRIEVAL, L3 ONLY. The two units above cannot see a change that
+		// removes document_chunk results, because 64 of their 65 gold documents
+		// are memory atoms while chunks are 94.4% of the live corpus. A candidate
+		// that dropped chunks from L3 scored as an IMPROVEMENT on both of them
+		// while losing 92% of chunk retrieval. This unit is what makes that
+		// unprofitable, and it is scored at L3 ALONE because L2 excludes chunks
+		// by contract.
+		if tier == "L3" && len(chunks) > 0 {
+			var chunkHits []int
+			for _, p := range chunks {
+				payload, _, err := m.call("recall", map[string]any{
+					"query": p.Query, "k": 10, "tokenBudget": 1500, "tier": tier,
+				})
+				ids := handleIDs(payload)
+				if c.plant == "empty" {
+					ids = nil
+				}
+				if err != nil {
+					chunkHits = append(chunkHits, 0)
+					continue
+				}
+				chunkHits = append(chunkHits, rankOf(ids, p.Expected))
+			}
+			cr10, cmrr := metrics(chunkHits)
+			add("quality", "l3.quality.chunk_r_at_10",
+				state(len(chunkHits) > 0 && cr10 >= c.chunkRAt10Floor),
+				c.ev("l3-quality-chunk-r10", map[string]any{
+					"question": fmt.Sprintf("QUESTION: can L3 still retrieve a document_chunk "+
+						"given a line of its own text, at R@10 >= %.3f?", c.chunkRAt10Floor),
+					"tier": tier, "chunk_r_at_10": cr10, "chunk_mrr_at_10": cmrr,
+					"floor": c.chunkRAt10Floor, "n": len(chunkHits), "ranks": chunkHits,
+					"plant": c.plant,
+					"WHY THIS FAMILY EXISTS": "the other quality units draw 64 of 65 gold " +
+						"documents from kind='atom' while document_chunk is 282,985 of " +
+						"299,802 live atoms. They scored a 92% loss of chunk retrieval as " +
+						"an improvement.",
+					"verdict_meaning": "FAIL means L3 stopped reaching the corpus it exists " +
+						"to reach. L3 minus chunks is L2 with a longer budget.",
+				}), &verdict.Score{Value: cr10, Max: 1.0})
+		}
+
 		add("quality", "l"+low+".quality.mrr_at_10",
 			state(len(hits) > 0 && mrr >= c.mrrFloor),
 			c.ev("l"+low+"-quality-mrr", map[string]any{
 				"question": fmt.Sprintf("QUESTION: is tier %s MRR@10 at or above %.3f?", tier, c.mrrFloor),
-				"tier": tier, "mrr_at_10": mrr, "floor": c.mrrFloor, "n": len(hits),
+				"tier":     tier, "mrr_at_10": mrr, "floor": c.mrrFloor, "n": len(hits),
 				"verdict_meaning": "FAIL means ordering degraded even where the right answer is still in the top 10",
 			}), &verdict.Score{Value: mrr, Max: 1.0})
 	}
@@ -478,7 +524,6 @@ func emit(c *cfg, r *verdict.Report) {
 	fmt.Printf("report: %s\n", p)
 }
 
-
 // probeQueries returns the exact query strings a probe set will issue, so the
 // contamination guard can subtract the gate's own traffic from the world's.
 func probeQueries(ps []probe) []string {
@@ -503,7 +548,6 @@ func sqlQuoteList(vals []string) string {
 	}
 	return strings.Join(parts, ",")
 }
-
 
 // REQUIRED_ZERO_VIOLATION_N is the sample size at which observing ZERO
 // over-budget requests supports "at most 5% of requests exceed budget" at 95%
@@ -653,7 +697,6 @@ func sampleMax(xs []float64) float64 {
 	}
 	return m
 }
-
 
 // someLiveAtomIDs returns up to n DISTINCT live atom ids, newest first.
 //

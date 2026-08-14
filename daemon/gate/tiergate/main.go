@@ -51,8 +51,12 @@ const (
 	// was scored against BM25 on an identical 1,500-query sample and the in-run
 	// BM25 reproduced its published 0.583/0.432 to the digit. 0.583 is the BM25
 	// floor a tier rewrite must never fall below.
-	defaultRAt10Floor   = 0.583
-	defaultMRRAt10Floor = 0.432
+	defaultRAt10Floor = 0.583
+	// Chunk-retrieval floor, set from the PRE-change measurement of the family
+	// this gate was missing (R@10 0.633 on 60 probes) with headroom for sample
+	// noise. It is a REGRESSION tripwire, not a transferred claim.
+	defaultChunkRAt10Floor = 0.500
+	defaultMRRAt10Floor    = 0.432
 
 	// Contamination ceiling. Charon currently drives ~19 recall events/min
 	// (91.4% of all traffic). A latency number taken under that load measures
@@ -66,25 +70,26 @@ const (
 )
 
 type cfg struct {
-	daemonURL     string
-	storePath     string
-	srcDir        string
-	l1Budget      float64
-	l2Budget      float64
-	l3Budget      float64
-	rAt10Floor    float64
-	mrrFloor      float64
-	maxBackground float64
-	iterations    int
-	genProbes     int
-	seed          int
-	minGenerated  int
-	minCurated    int
-	plant         string
-	epoch         string
-	evidenceDir   string
-	baseline      string
-	evErrs        []string
+	daemonURL       string
+	storePath       string
+	srcDir          string
+	l1Budget        float64
+	l2Budget        float64
+	l3Budget        float64
+	rAt10Floor      float64
+	chunkRAt10Floor float64
+	mrrFloor        float64
+	maxBackground   float64
+	iterations      int
+	genProbes       int
+	seed            int
+	minGenerated    int
+	minCurated      int
+	plant           string
+	epoch           string
+	evidenceDir     string
+	baseline        string
+	evErrs          []string
 }
 
 func main() {
@@ -96,6 +101,8 @@ func main() {
 	flag.Float64Var(&c.l2Budget, "l2-budget-ms", defaultL2BudgetMs, "L2 P95 budget ms")
 	flag.Float64Var(&c.l3Budget, "l3-budget-ms", defaultL3BudgetMs, "L3 P95 budget ms")
 	flag.Float64Var(&c.rAt10Floor, "r10-floor", defaultRAt10Floor, "R@10 floor")
+	flag.Float64Var(&c.chunkRAt10Floor, "chunk-r10-floor", defaultChunkRAt10Floor,
+		"L3 document_chunk R@10 floor")
 	flag.Float64Var(&c.mrrFloor, "mrr-floor", defaultMRRAt10Floor, "MRR@10 floor")
 	flag.Float64Var(&c.maxBackground, "max-background-per-min", defaultMaxBackgroundPerMin, "contamination ceiling")
 	flag.IntVar(&c.iterations, "iterations", 40, "probe iterations per latency unit")
@@ -357,6 +364,87 @@ func generatedProbes(storePath string, n, seed int) ([]probe, error) {
 	return out, nil
 }
 
+// generatedChunkProbes derives (query -> expected document_chunk) pairs the same
+// way generatedProbes derives memory ones: take a line out of a document's own
+// body and require that document back.
+//
+// WHY THIS FAMILY EXISTS. Without it this gate is structurally incapable of
+// seeing the failure it was built to prevent. Both existing families select gold
+// from `kind='atom'` (units.go, and the `principle:` predicate above, which only
+// reasoning atoms carry), and 5 of the 6 curated expectations are memory atoms
+// too. So 64 of 65 gold documents were memory, while document_chunk is 282,985
+// of 299,802 live atoms: 94.4% of the corpus scored by 1.5% of the signal.
+//
+// The consequence is not theoretical. A candidate change that removed chunk
+// results from L3 measured a 92% drop in chunk retrieval (R@10 0.633 -> 0.050 on
+// a family built exactly like this one), and BOTH existing quality units scored
+// it as an IMPROVEMENT, because every document they can score was still there.
+// L3's served ids became equal to L2's on 62 of 65 probes. The tier would have
+// stopped existing and the gate would have certified it green.
+//
+// SCORED AT L3 ONLY. L2 restricts to memory kinds by contract, so a chunk probe
+// failing at L2 is correct tier behaviour and scoring it there would punish the
+// design. That asymmetry IS the tier contract, which is why this family is not
+// simply appended to the others.
+func generatedChunkProbes(storePath string, n, seed int) ([]probe, error) {
+	// Chunks carry no `principle:` line, so the memory extractor cannot reach
+	// them. Select on length and require a line with enough word characters to
+	// be a query rather than a bracket or an import.
+	sql := fmt.Sprintf(`
+	  SELECT a.id AS id, a.text AS text
+	  FROM atoms a
+	  WHERE a.status='live' AND a.kind='document_chunk'
+	    AND LENGTH(a.text) BETWEEN 300 AND 4000
+	  ORDER BY substr(a.id, 1 + (%d %% 20))
+	  LIMIT %d`, seed, n*3)
+	rows, err := query(storePath, sql)
+	if err != nil {
+		return nil, err
+	}
+	var out []probe
+	for _, r := range rows {
+		if len(out) >= n {
+			break
+		}
+		id, _ := r["id"].(string)
+		text, _ := r["text"].(string)
+		line := wordiestLine(text)
+		if id == "" || len(line) < 40 {
+			continue
+		}
+		out = append(out, probe{
+			Query:    trimToRealisticQuery(line, len(out)),
+			Expected: []string{id},
+			Origin:   "generated-chunk",
+		})
+	}
+	return out, nil
+}
+
+// wordiestLine returns the line of text with the most word characters, which for
+// a source chunk is the line most likely to read as a query rather than as
+// punctuation. Ties go to the first, so the choice is deterministic for a given
+// document and the probe set is reproducible across runs.
+func wordiestLine(text string) string {
+	best, bestScore := "", 0
+	for _, ln := range strings.Split(text, "\n") {
+		ln = strings.TrimSpace(ln)
+		if len(ln) < 40 || len(ln) > 400 {
+			continue
+		}
+		score := 0
+		for _, r := range ln {
+			if r == ' ' || (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') {
+				score++
+			}
+		}
+		if score > bestScore {
+			best, bestScore = ln, score
+		}
+	}
+	return best
+}
+
 // REALISTIC_QUERY_CHARS caps a generated probe's query length.
 //
 // Derived from the system of record, not chosen: 2,722 distinct real agent
@@ -377,7 +465,7 @@ func generatedProbes(storePath string, n, seed int) ([]probe, error) {
 // agent queries (the Charon loop excluded, since it was one machine caller
 // producing 91.4% of historical traffic and its shape is not an agent's):
 //
-//     p50  95 chars   p75 154   p90 223
+//	p50  95 chars   p75 154   p90 223
 //
 // Capping every probe at a single length is wrong in both directions. At the
 // p90 the whole set is the 90th-percentile-worst shape, and judging that against
