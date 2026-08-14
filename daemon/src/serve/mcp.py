@@ -1016,20 +1016,20 @@ def handle_recall_records(ctx, args):
             truncated = True
             if not records:
                 # A budget smaller than the top-ranked body must not fail open
-                # as records:[] — that shape is byte-identical to "no match"
+                # as records:[]: that shape is byte-identical to "no match"
                 # and sends callers away believing the memory absent (observed
                 # 2026-08-03: tokenBudget=400 vs long atom bodies read as
                 # missing memories at estimatedTokens=0). Same degradation
                 # ladder as recall.payload.assemblePayload: serve a stub with
                 # real metadata and a sentinel body naming the real cost,
                 # never an empty list. Record-level estimatedTokens keeps the
-                # FULL body cost — the actionable budget-sizing signal — while
+                # FULL body cost, the actionable budget-sizing signal, while
                 # the envelope's estimatedTokens reflects the stub actually
                 # returned.
                 stubContent = (
                     f"[recall: tokenBudget {tokenBudget} cannot hold this "
                     f"record's {recordTokens}-token body; metadata is real, "
-                    f"body omitted — retry with a larger tokenBudget]"
+                    f"body omitted, retry with a larger tokenBudget]"
                 )
                 stub = {**record, "content": stubContent}
                 stubTokens = estimateTokens(stubContent)
