@@ -131,3 +131,83 @@ def test_l3_can_return_a_chunk_and_l2_cannot(mixedStore, embedderFixture):
     assert ids["chunk"] not in l2ids, (
         "L2 returned a document_chunk. L2 exists to keep the bulk corpus out of "
         f"an agent's default retrieve; the boundary is gone. L2 returned {l2ids}")
+
+
+# --------------------------------------------------------------------------- #
+# every recall-serving tool must route through the tier contract               #
+# --------------------------------------------------------------------------- #
+
+
+def test_no_recall_serving_handler_calls_recall_without_a_tier():
+    """THE CLAIM: every handler that serves retrieval routes through
+    `tierDefaults`, so none of them can silently run the cross-encoder.
+
+    This existed as a 74x latency defect and nothing caught it. `handle_recall`
+    passed a tier; `handle_pensive_recall` and `handle_recall_records` did not,
+    so `tier` was None, tier resolution never ran, and `rerankEnabled` kept its
+    function-signature default of True. Measured on a 40-atom scratch store:
+
+        recall native tier=L2      8.4 ms
+        pensive_recall (compat)  620.6 ms
+        recall_records (compat)  606.6 ms
+
+    and roughly 3,190ms against the real store, because rerank cost scales with
+    the candidate count. The tools LIVE AGENTS CALL were the slow ones, and the
+    gate never saw it because the gate only ever exercises the native `recall`.
+
+    A source-level assertion, deliberately: the fast path is the DEFAULT
+    behaviour of a keyword argument, so a new handler that simply forgets to
+    pass `tier` inherits the slow path silently. Nothing about its output says
+    which path it took."""
+    import inspect
+    import re
+
+    import serve.mcp as mcp
+
+    offenders = []
+    for name in dir(mcp):
+        if not name.startswith("handle_"):
+            continue
+        fn = getattr(mcp, name)
+        if not callable(fn):
+            continue
+        try:
+            src = inspect.getsource(fn)
+        except (OSError, TypeError):
+            continue
+        if re.search(r"\brecall\(", src) and "tier=" not in src:
+            offenders.append(name)
+    assert not offenders, (
+        "these handlers call recall() without a tier, so tierDefaults never runs "
+        "and rerankEnabled keeps its default True: the cross-encoder executes on "
+        f"the serve path. {offenders}")
+
+
+def test_the_compat_handlers_do_not_override_the_callers_kinds():
+    """The obvious fix for the compat rerank defect was wrong, and this pins why.
+
+    Passing `tier=DEFAULT_TIER` disables the cross-encoder, but tier resolution
+    also OVERRIDES `kinds`. `recall_records` asks for ('atom', 'document_chunk')
+    by name, so routing it through L2 would have silently dropped the bulk corpus
+    from a records API that requested it: the same shape as a candidate this
+    campaign refused to ship four hours earlier.
+
+    Only the cross-encoder must not run on the compat path. The corpus choice
+    belongs to the caller."""
+    import inspect
+
+    import serve.mcp as mcp
+
+    for name in ("handle_pensive_recall", "handle_recall_records"):
+        src = inspect.getsource(getattr(mcp, name))
+        assert "rerankEnabled=False" in src, (
+            f"{name} does not disable the cross-encoder; it will run on every "
+            "call at roughly 600ms on a small store and 3,190ms on the real one")
+        # Strip comments before checking: this handler's own comment explains
+        # why it does NOT pass a tier, and naive substring matching flagged that
+        # explanation as the defect it warns about.
+        code = "\n".join(
+            ln.split("#", 1)[0] for ln in src.splitlines())
+        assert "tier=" not in code, (
+            f"{name} passes a tier, which overrides the caller's kinds. That "
+            "silently drops document_chunk from a path that asks for it.")

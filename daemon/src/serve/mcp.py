@@ -917,6 +917,13 @@ def handle_pensive_recall(ctx, args):
         ctx.store, ctx.indexes, ctx.embedder, query,
         project=project, k=limit, tokenBudget=ctx.defaultTokenBudget,
         aux=ctx.aux,
+            # rerankEnabled=False, NOT tier=DEFAULT_TIER. Passing a tier would
+            # also override the caller's `kinds`, and recall_records asks for
+            # document_chunk explicitly: routing it through L2 would silently
+            # drop the bulk corpus from a records API that requested it. The
+            # cross-encoder is the thing that must not run here; the corpus
+            # choice belongs to the caller.
+            rerankEnabled=False,
     )
     results = out["results"]
     if not results:
@@ -1021,6 +1028,13 @@ def handle_recall_records(ctx, args):
         k=k,
         tokenBudget=tokenBudget,
         aux=ctx.aux,
+            # rerankEnabled=False, NOT tier=DEFAULT_TIER. Passing a tier would
+            # also override the caller's `kinds`, and recall_records asks for
+            # document_chunk explicitly: routing it through L2 would silently
+            # drop the bulk corpus from a records API that requested it. The
+            # cross-encoder is the thing that must not run here; the corpus
+            # choice belongs to the caller.
+            rerankEnabled=False,
     )
     ranked = out["results"]
     if len(ranked) > k:

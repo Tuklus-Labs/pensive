@@ -359,6 +359,13 @@ def test_recall_records_calls_engine_once_with_normalized_arguments(monkeypatch,
         "k": 32,
         "tokenBudget": 8000,
         "aux": ctx.aux,
+        # rerankEnabled=False ADDED 2026-08-14. The compat handlers passed no
+        # rerank hint, so recall()'s signature default of True applied and the
+        # cross-encoder ran on every call: 620.6ms for pensive_recall and
+        # 606.6ms for recall_records against 8.4ms for the native tier-routed
+        # recall, and ~3,190ms on the real store. The tools live agents call
+        # were the slow ones, and the gate never exercised them.
+        "rerankEnabled": False,
     }, f"engine-keyword contract violated: keywords={keywords!r}"
 
 
@@ -403,6 +410,13 @@ def test_recall_records_accepts_inclusive_argument_endpoints(monkeypatch, ctx): 
         "k": 10,
         "tokenBudget": 1500,
         "aux": ctx.aux,
+        # rerankEnabled=False ADDED 2026-08-14. The compat handlers passed no
+        # rerank hint, so recall()'s signature default of True applied and the
+        # cross-encoder ran on every call: 620.6ms for pensive_recall and
+        # 606.6ms for recall_records against 8.4ms for the native tier-routed
+        # recall, and ~3,190ms on the real store. The tools live agents call
+        # were the slow ones, and the gate never exercised them.
+        "rerankEnabled": False,
     }, f"default-argument rule violated: keywords={calls[3][1]!r}"
 
 
