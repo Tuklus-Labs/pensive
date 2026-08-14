@@ -109,3 +109,60 @@ Nothing built. This is what a Layer 4 design has to survive. The measurement
 that would most change my mind: if a rule filed as `kind='rule'` and given a
 retrieval path still fails constraint 1, then the tier is cosmetic and the
 filesystem loader should stay the mechanism.
+
+---
+
+## Design returned 2026-08-13, and two of its hazards verified independently
+
+A design pass came back against the constraints above. It clears all four, and
+it reframes the layer better than this document did.
+
+**The reframe.** I had been treating Layer 4 as "build a retrieval tier for
+rules". Its answer: the store owns EDITING and VERSIONING, the file keeps
+DELIVERY. Files won because editing a file changes what arrives tomorrow, so the
+fix is to make editing a rule by slug be the thing that edits the file. Rules
+stay structurally invisible to the ranker. That responds to the finding at the
+top of this document without pretending retrieval can do a job that
+unconditional loading already does well.
+
+Mechanically: `kind='rule'` atoms carrying `rule_scope` / `rule_slug` /
+`rule_rank`, one live rule per (scope, slug) enforced by a PARTIAL UNIQUE INDEX
+rather than by convention, edits as supersede-then-insert in one transaction so
+the existing `supersedes` machinery and `history` work unchanged.
+
+**Two hazards, verified against the source rather than taken on report:**
+
+1. `lifecycle/supersede_detect.py::_candidateRows` selects `WHERE status='live'`
+   with NO kind filter (confirmed, line 54). Wiring Layer 5's supersession
+   detector before a rule exclusion exists would let standing rules
+   auto-supersede each other on embedding similarity. This is a hard ordering
+   dependency between layers, not a courtesy.
+2. `store/export.py::ATOM_COLS` (confirmed, line 34) is an explicit 9-column
+   tuple imported by `store/rebuild.py`. Adding rule columns to the table
+   without adding them there means an export-then-rebuild cycle silently drops
+   every rule's identity. A backup and restore would destroy the rule layer
+   while reporting success.
+
+**The finding that outranks the rest.** Rule text becomes instructions loaded
+into every session on this box. `/mcp` is Origin- and Host-guarded but
+deliberately NOT secret-guarded, because every wired agent speaks it. A rule
+WRITE tool on that surface would let anything able to POST to loopback rewrite
+the operating instructions of every session on this machine. The mitigation is
+structural: read-only rule tools on MCP, writes behind the existing 0600
+loopback secret. This is an Aegis Guardian surface and it outranks every
+latency consideration in the layer.
+
+**The number that may kill the layer as scoped.** The live standing-rule corpus
+measures 22 rules, 55,910 chars, roughly 13,985 tokens, and it lands in EVERY
+session's context. That is 9.3x the entire brief budget. Constraint 2 above said
+"be scarce, and stay scarce"; the measurement says the corpus is already not
+scarce. Whatever ships has to answer that before it answers anything about
+latency.
+
+**One piece of discipline worth copying.** The rule-serving query costs 68ms
+without an `INDEXED BY` hint, because production carries no `sqlite_stat1`. The
+obvious fix is `ANALYZE`. The design refused it: `ANALYZE` costs 786ms and
+rewrites statistics for every index in the database, which would silently
+re-plan bm25 and the L2/L3 signal path and therefore re-certify or de-certify
+tier numbers measured the same day. It took the hint and left `ANALYZE` as a
+separate change carrying its own re-certification.
