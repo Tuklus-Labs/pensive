@@ -119,3 +119,45 @@ def test_extra_hosts_are_added_not_replaced(monkeypatch):
 def test_blank_and_whitespace_entries_are_ignored(monkeypatch):
     monkeypatch.setenv("PENSIVE_V3_ALLOWED_HOSTS", " , ,  ")
     assert allowedHostsFromEnv() == DEFAULT_ALLOWED_HOSTS
+
+
+# --------------------------------------------------------------------------- #
+# malformed and duplicate authorities                                          #
+# --------------------------------------------------------------------------- #
+#
+# Found by a blue-team review (gpt-daybreak) after the guard landed. The parser
+# split on the first ':' and took what was left, which accepts several shapes
+# that are not the authority they look like:
+#
+#     Host: [::1].evil.example        parsed as  [::1]
+#     Host: localhost:80@evil.example parsed as  localhost
+#     duplicate Host headers          last one silently wins
+#
+# Scored LOW because a standard browser cannot emit any of them, so the DNS
+# rebinding path this guard exists to close stays closed. It is still wrong: a
+# raw client or a sloppy intermediary can, and a parser that accepts a string
+# it should reject is one intermediary away from being the whole defense.
+
+
+@pytest.mark.parametrize("host", [
+    "[::1].evil.example",
+    "localhost:80@evil.example",
+    "127.0.0.1@evil.example",
+    "localhost:80:90",
+    "[::1",
+    "localhost:notaport",
+])
+# "localhost " with trailing space is NOT here on purpose: RFC 7230 permits
+# optional whitespace around a field value and servers strip it, so that form is
+# legal HTTP. Rejecting it would make the parser stricter than the spec to
+# satisfy a case I wrote carelessly, which is a worse defect than the one being
+# fixed.
+def test_a_malformed_authority_is_refused(host):
+    assert checkAllowedHost(_headers(host), LOOPBACK) is not None, (
+        f"malformed authority {host!r} was accepted"
+    )
+
+
+def test_a_valid_authority_with_a_port_is_still_accepted():
+    for host in ("127.0.0.1:5999", "localhost:80", "[::1]:5999"):
+        assert checkAllowedHost(_headers(host), LOOPBACK) is None, host

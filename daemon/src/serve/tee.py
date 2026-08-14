@@ -32,6 +32,7 @@ Contract notes:
 import hmac
 import json
 import os
+import re
 import secrets
 import threading
 from pathlib import Path
@@ -294,13 +295,61 @@ def allowedHostsFromEnv():
     return hosts
 
 
+# A registered name or IPv4 literal: letters, digits, hyphen, dot. Deliberately
+# no userinfo, no whitespace, no path -- an authority is not a URL.
+_HOST_NAME_RE = re.compile(r"^[a-z0-9.\-]+$")
+_HOST_IPV6_RE = re.compile(r"^\[[0-9a-f:.]+\]$")
+
+
 def _hostnameOf(hostHeader):
-    """Host header -> bare hostname, port removed, IPv6 brackets preserved."""
+    """Host header -> bare hostname, or None when the authority is malformed.
+
+    Returns None rather than a best guess. The previous version split on the
+    first ':' and kept the left side, which silently accepted strings that are
+    not the authority they resemble (found by a blue-team review):
+
+        [::1].evil.example         parsed as  [::1]
+        localhost:80@evil.example  parsed as  localhost
+
+    A standard browser cannot emit either, so the DNS-rebinding path this guard
+    exists to close was never open through them. It is still wrong: a raw client
+    or a sloppy intermediary can, and a parser that accepts a string it should
+    reject is one intermediary away from being the entire defense. Parsing
+    leniently on the way IN is how a guard ends up authorizing something its
+    author never read.
+    """
     value = hostHeader.strip().lower()
+    if not value or value != hostHeader.strip().lower() or " " in value or "\t" in value:
+        return None
+    if "@" in value:
+        return None
     if value.startswith("["):
         end = value.find("]")
-        return value[:end + 1] if end != -1 else value
-    return value.split(":", 1)[0]
+        if end == -1:
+            return None
+        host, rest = value[:end + 1], value[end + 1:]
+        if not _HOST_IPV6_RE.match(host):
+            return None
+        if rest and not _validPort(rest):
+            return None
+        return host
+    parts = value.split(":")
+    if len(parts) > 2:
+        return None
+    host = parts[0]
+    if len(parts) == 2 and not _validPort(":" + parts[1]):
+        return None
+    if not _HOST_NAME_RE.match(host):
+        return None
+    return host
+
+
+def _validPort(rest):
+    """``:1234`` -> True. Anything else, including a bare colon, is malformed."""
+    if not rest.startswith(":"):
+        return False
+    digits = rest[1:]
+    return digits.isdigit() and 0 < int(digits) <= 65535
 
 
 def checkAllowedHost(headers, allowed):
@@ -325,6 +374,9 @@ def checkAllowedHost(headers, allowed):
     if not host:
         return 403, {"error": "missing Host header", "reason": "no-host"}
     name = _hostnameOf(host)
+    if name is None:
+        return 403, {"error": f"malformed Host authority refused: {host!r}",
+                     "reason": "malformed-host"}
     if name not in allowed:
         return 403, {
             "error": f"unrecognized Host refused: {host!r}",
