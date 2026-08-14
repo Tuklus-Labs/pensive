@@ -649,3 +649,42 @@ The encoder win was real all along. It was landing on the median of a
 distribution whose tail was set by something else, and the write path is the
 place where an encode actually dominates. Two correct measurements pointing at
 different budgets, which is the whole lesson of this document.
+
+## Gate after the fix: the tail is gone and L2 is now a MEDIAN problem
+
+Same procedure as the A-B-A (quiet box, warm, n=65, contamination PASS).
+
+| run | L2 viol | L2 p50 | L2 p95 | L2 max | L3 p95 |
+|---|---:|---:|---:|---:|---:|
+| A torch baseline | 65/65 | 31.73 | 41.81 | 51.92 | 107.66 |
+| B onnx | 57/65 | 25.78 | 41.74 | **2961.10** | 83.19 |
+| A2 torch again | 65/65 | 30.26 | 43.72 | 55.75 | 87.50 |
+| **POST incremental** | 60/65 | **24.99** | **36.19** | **47.31** | **77.14** |
+
+Best L2 and L3 figures of the campaign. L1 passes at 0.374ms, L3 passes latency
+at 77.14 against 125.
+
+**L2 still FAILS at 36.19 against 20, and the failure has changed shape.** With
+p50 24.99 and 60 of 65 samples over budget, this is no longer a tail set by
+stalls; it is a median roughly 5ms too slow, uniformly. The stall hunt is
+finished. What is left is throughput, which is a different investigation with
+different suspects.
+
+**A confound named rather than buried.** No writes landed during this gate run,
+so the clean max of 47.31 is NOT by itself evidence the stall fix worked. A run
+with no emits would show no emit-induced stalls either way. The evidence for the
+fix is the direct interleaved measurement (363.73ms to 5.83ms per write), not
+this run's quiet tail. What this run does establish is that with stalls absent,
+L2's remaining gap is entirely in the body of the distribution.
+
+**L3's MRR@10 still fails** at 0.394 against a 0.432 floor, consistent across
+every run at the honest sample size. That is a retrieval-quality gap, unrelated
+to any of tonight's latency work, and it is the other thing standing between L3
+and a clean certification.
+
+### What the next investigation should NOT assume
+
+That the median is one thing. p50 24.99 against a single-query warm measurement
+of 13.2ms on this same daemon says query variety costs ~12ms, so some probes are
+far slower than others. The useful next step is a per-probe breakdown, not
+another whole-pipeline average.
