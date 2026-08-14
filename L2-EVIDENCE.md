@@ -181,3 +181,69 @@ So:
 
 Step 2 is the one I would skip if I were in a hurry, and it is the one that
 makes step 4 mean anything.
+
+---
+
+# RESULT: the first uncontaminated measurement, A-B-A
+
+Run 2026-08-13 on a quiet box (load 4.5 to 6, `face_find` finished,
+`contamination.background-traffic` PASS on every run). Three deploys, each with
+a full restart, an explicit 24-request warm, and n raised to clear the 59-sample
+Clopper-Pearson floor. A/B/A ordering because A-then-B alone cannot separate the
+candidate from the cache it inherits.
+
+## Latency
+
+| tier | A torch | B ONNX | A2 torch | budget |
+|---|---:|---:|---:|---:|
+| L1 p95 | 0.209 | 0.220 | 0.275 | 1.0 |
+| L2 p50 | 31.73 | **25.78** | 30.26 | - |
+| L2 p95 | 41.81 | 41.74 | 43.72 | 20.0 |
+| L2 violations | 65/65 | 57/65 | 65/65 | - |
+| L3 p95 | 107.66 | 83.19 | 87.50 | 125.0 |
+| L3 violations | 1/65 | 0/65 | 0/65 | - |
+
+## What the third run bought
+
+**The ONNX win on L2's median is real.** A and A2 bracket B (31.73 / 25.78 /
+30.26) and the violation count reproduces exactly (65 / 57 / 65). A two-run A/B
+could not have established this; a two-run A/B is also what would have let me
+believe the next line.
+
+**The ONNX win on L3 was mostly an order effect.** B read 83.19 and I was ready
+to call it a 24ms improvement. A2, with ONNX OFF, reads 87.50. Nearly all of
+that gap was the page cache B inherited from A's full test-and-gate cycle, plus
+a single 6,286ms stall that produced A's only violation. Had the run stopped at
+two legs, this document would claim an encoder improvement that does not exist.
+
+## The verdicts
+
+**L1 is CERTIFIED.** Zero violations across 180 samples in three independent
+runs, p95 between 0.209 and 0.275ms against a 1ms budget, contamination PASS,
+staleness PASS. This is the tier the campaign moved onto its own lean route, and
+it holds with roughly 4x margin.
+
+**L3 passes on latency and FAILS on MRR@10.** Zero violations in two of three
+runs; the single failure was one 6.3-second stall. But MRR@10 reads 0.405 /
+0.426 / 0.415 against a 0.432 floor, failing all three times. The earlier
+30-probe run read 0.433, a hair ABOVE floor. Raising the sample from 30 to 65
+did not break L3's quality, it revealed that the passing number was a
+small-sample artifact. R@10 is comfortable at 0.692 to 0.723 against 0.583.
+
+**L2 FAILS, and not for the reason this campaign spent the night assuming.**
+Every one of 65 samples exceeded 20ms in both torch runs. ONNX cuts the median
+by about 5.5ms, exactly as the isolated encoder measurements predicted, and
+moves p95 by 0.07ms. p95 is set by the tail, and the tail is not the encoder:
+observed maxima include 2,961ms and 6,286ms. A multi-second stall in a system
+whose median is 30ms is not slow code, it is something blocking.
+
+## What this means for the encoder work
+
+ONNX stays. It is a genuine ~5.5ms median improvement at zero quality cost and
+no re-embed, reproduced against two independent baselines. But it does not close
+L2 and was never going to: four independent investigations measured the encoder
+correctly in isolation and every projection built on them was wrong, because
+they projected a median saving onto a p95 budget.
+
+The remaining ~22ms of L2's p95 is in the tail. The next work is not another
+encoder; it is finding what stalls.
