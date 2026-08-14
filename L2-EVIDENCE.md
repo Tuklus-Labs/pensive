@@ -599,3 +599,35 @@ later atom); `HnswIndex` drops the key from the usearch graph, verified
 discriminatingly rather than from documentation.
 
 Suite: 751 passed, 1 skipped.
+
+## Measured: the write path, interleaved
+
+Both arms in ONE process, alternating per rep, against the same `.backup` copy
+of the live store (16,779 memory atoms, 282,985 code, both classes on HNSW).
+Interleaved because differencing separately-taken numbers has been wrong every
+time on this box.
+
+| arm | p50 | min |
+|---|---:|---:|
+| full class rebuild (the old path) | **347.33 ms** | 343.78 ms |
+| incremental (`embedOne` + `index.add`) | **10.60 ms** | 10.26 ms |
+
+**33x on the median.** The old write path was 17x the entire 20ms L2 budget, on
+the event-loop thread, so any read arriving during an emit waited behind all of
+it. The new path fits inside the budget.
+
+The 347ms confirms the component estimate: 90ms of `embedMissing` scanning
+299,728 live atoms to return zero rows, plus a 272ms class rebuild, plus the
+write itself.
+
+**What the remaining 10.6ms is, stated so it is not mistaken for index work.**
+The `index.add` is 0.115ms. Essentially all of the remainder is embedding the
+atom that was just written, which is irreducible if a new atom is to be
+dense-recallable at all: the only way to remove it from the write path is to
+defer freshness, which is a different trade. Note also that this run used the
+TORCH encoder, because the measurement script did not set
+`PENSIVE_V3_ONNX_MODEL`; production runs ONNX, which measured roughly half the
+torch cost per encode, so the shipped number is lower than 10.6ms.
+
+Load was 24 to 33 throughout, so both arms are inflated and the RATIO is the
+transferable figure, not the absolutes.
