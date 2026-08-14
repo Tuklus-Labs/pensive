@@ -37,6 +37,31 @@ exceeded 20ms, p50 31.213, violation rate 100% with a 95% upper bound of 100%
 by Clopper-Pearson. L2 is genuinely over budget. The open question is by how
 much, not whether.
 
+## Contamination is not symmetric, and that matters for L1 and L3
+
+All four gate units above came from the same contaminated run, so it is fair to
+ask why L1's 0.168ms and L3's 107.206ms appear in the "may quote" column while
+L2's does not.
+
+Because contamination only ever inflates latency. Background load makes a tier
+look slower than it is, never faster. So:
+
+- **A PASS under contamination is conservative.** L1 met a 1ms budget and L3 met
+  a 125ms budget while the box carried four benchmark agents at load 40 to 69.
+  A quiet box can only improve both. These are lower bounds on the margin, and
+  the margin was already 6x for L1.
+- **A FAIL under contamination is inconclusive.** It establishes that the tier
+  is over budget *under this load*, which is not the question the budget asks.
+
+That asymmetry is why L2 needs a clean re-run and L1/L3 do not. It is also why
+the honest read of the FINAL run is "two tiers certified conservatively, one
+tier unmeasured," rather than "two pass, one fails."
+
+The one thing the L2 FAIL does establish independent of load: 105 of 105
+samples were over, so the miss is not a tail artifact of a handful of slow
+requests. Something structural puts every single L2 request over 20ms under
+load. Whether that something survives a quiet box is the open question.
+
 ## Why 24.36 needs a caveat rather than a dismissal
 
 It is an in-process ablation over curated probes (`engine.py:84`), not a
