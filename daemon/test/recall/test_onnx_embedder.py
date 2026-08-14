@@ -100,10 +100,90 @@ def test_vectors_match_the_torch_path_with_a_negative_control(onnxEmb, torchEmb)
 def test_vectors_are_unit_norm(onnxEmb):
     """A flat cosine search reduces to a dot product only if rows are unit
     length. Normalization is folded into the exported graph, so this asserts
-    the graph, not a helper here."""
+    the graph, not a helper here.
+
+    THIS TEST CARRIES MORE WEIGHT THAN IT LOOKS. An adversarial review of a
+    sibling candidate (2026-08-13) showed that COSINE CANNOT SEE A DROPPED
+    NORMALIZE: cosine is scale-invariant, so an encoder returning correctly
+    directed but unnormalized vectors scores exactly 1.000000000000 against the
+    reference on every sample. A fidelity gate built only on cosine would pass
+    an encoder that silently breaks the store's flat-cosine-equals-dot-product
+    assumption.
+
+    This suite escapes that hole for two reasons, one deliberate and one lucky.
+    Deliberate: this test exists. Lucky: the paired check above uses a raw dot
+    product (`np.sum(ref * got)`) rather than a normalized cosine, so it is
+    scale-SENSITIVE by construction. Writing `cosine_similarity()` there would
+    have reintroduced the blind spot.
+
+    Verified by planting an encoder that preserves direction exactly and scales
+    each row by a different factor: 3 tests fail, this one among them."""
     got = np.vstack(onnxEmb.embed(TEXTS))
     norms = np.linalg.norm(got, axis=1)
     assert np.allclose(norms, 1.0, atol=1e-5), norms
+
+
+# --------------------------------------------------------------------------- #
+# guards derived from an adversarial refutation (2026-08-13)                    #
+# --------------------------------------------------------------------------- #
+#
+# A verifier REFUTED the drop-in claim as originally reported, against an export
+# made with torch.onnx.export(dynamo=True). Three defects, all of which produce
+# a class that CONSTRUCTS FINE and is silently wrong:
+#
+#   1. the graph emits last_hidden_state, so a runner that does no pooling
+#      returns one (seq, 384) object per call instead of a (384,) vector
+#   2. dynamo baked the output batch axis to a literal 1 despite dynamic_axes,
+#      so any batch > 1 raises at LayerNormalization
+#   3. dynamo writes external data: a 0.1MB graph plus a 133MB .data sidecar
+#
+# The shipped export avoids all three (pooling folded in, dynamo=False,
+# self-contained). These tests exist so a future re-export cannot reintroduce
+# them quietly. Defect 2 was already covered by the batch test below, which is
+# the only reason it was never a live risk here.
+
+
+@onnxOnly
+def test_a_vector_is_one_dimensional_and_blob_sized(onnxEmb):
+    """The pooling defect does not raise, it returns the wrong SHAPE.
+
+    An unpooled graph hands back (tokens, 384). That still indexes, still
+    serializes, and writes a blob whose length depends on the input's token
+    count instead of the schema's fixed 1536 bytes."""
+    import numpy as np
+
+    from recall.embedder import vecToBlob
+
+    vec = onnxEmb.embed(["why did the flat index stall? "])[0]
+    assert vec.ndim == 1, f"expected a vector, got shape {vec.shape} (unpooled graph?)"
+    assert len(vecToBlob(vec)) == 1536, (
+        f"blob is {len(vecToBlob(vec))} bytes; schema.sql fixes 1536 "
+        "(384 float32). A token-count-dependent length means no pooling.")
+    assert abs(float(np.linalg.norm(vec)) - 1.0) < 1e-5
+
+
+@onnxOnly
+def test_the_dim_probe_cannot_report_a_token_count(onnxEmb):
+    """`dim` is derived from a forward pass, which is only safe if that pass
+    yields a vector. On the unpooled graph the same probe reported 4, the token
+    count of the probe string, and every downstream size check inherited it."""
+    assert onnxEmb.dim == 384
+
+
+@onnxOnly
+def test_the_artifact_is_self_contained():
+    """External-data exports split into a stub plus a sidecar. Pointing
+    PENSIVE_V3_ONNX_MODEL at the stub works only while the sidecar travels with
+    it, which is a deployment failure waiting for the first copy."""
+    import onnx
+
+    model = onnx.load(ONNX, load_external_data=False)
+    external = [
+        i.name for i in model.graph.initializer
+        if i.HasField("data_location") and i.data_location == onnx.TensorProto.EXTERNAL
+    ]
+    assert not external, f"{len(external)} initializers live in a sidecar file"
+    assert os.path.getsize(ONNX) > 50e6, "a weightless graph, not a model"
 
 
 @onnxOnly
