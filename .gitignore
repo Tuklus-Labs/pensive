@@ -14,3 +14,4 @@ venv/
 dell_ingest.pkl
 *.db
 CLAUDE.md
+.claude/worktrees/
