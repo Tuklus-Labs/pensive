@@ -199,3 +199,41 @@ Combined with the background-cosine distribution measured earlier in this
 document (unrelated pairs at 0.65 median, 0.92 at p99), both halves point the
 same way: adjacency here cannot be a threshold over a single anchor. It has to
 be a ranked walk from a set.
+
+---
+
+## The batch encode path cannot reach the GPU, and nothing notices today
+
+House rule (Gary, 2026-08-13): batch encodes on the GPU, stream encodes on the
+CPU. The daemon honours the second half and structurally cannot honour the first.
+
+`serve/mcp.py:276` calls `embedMissing` when the serve context is built, which
+is a BATCH encode by definition: every live atom lacking a vector under the
+active model. But the unit sets `HIP_VISIBLE_DEVICES=-1` and
+`CUDA_VISIBLE_DEVICES=-1` process-wide, so `Embedder.__init__` resolves
+`torch.cuda.is_available()` to False and the batch runs on CPU alongside the
+stream path. There is no per-call device selection anywhere; the device is a
+property of the process.
+
+**Why nothing has noticed.** The backlog is currently 0: every live atom already
+has a bge vector, so `embedMissing` selects nothing and returns immediately. The
+gap is real and dormant.
+
+**What it costs the day it stops being dormant**, using rates measured during
+the encoder sweep:
+
+| | rate | 299,728 live atoms |
+|---|---:|---:|
+| GPU batch (RX 7900 XTX, batch 64) | 1,034.4 atoms/s | ~4.8 min |
+| CPU batch | 12.3 atoms/s | ~6.8 h |
+
+84x. That difference decides whether a model migration is a coffee break or an
+overnight job, and it is exactly the situation the house rule was written for.
+It also silently shaped an earlier verdict in this campaign: the MiniLM
+candidate's re-embed was called "not the blocker" on the strength of the 4.8
+minute GPU figure, which the daemon as configured could not have achieved.
+
+Not fixed here, and deliberately so. Making the device per-call rather than
+per-process touches `Embedder`, and this campaign's remaining budget belongs to
+certifying L2. Filed with its measurement so the next person does not
+rediscover it at the start of a re-embed.
