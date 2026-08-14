@@ -693,3 +693,68 @@ That the median is one thing. p50 24.99 against a single-query warm measurement
 of 13.2ms on this same daemon says query variety costs ~12ms, so some probes are
 far slower than others. The useful next step is a per-probe breakdown, not
 another whole-pipeline average.
+
+---
+
+# THE GATE WAS BLIND, AND THE PLANTED FAILURE PROVES THE FIX
+
+A multi-agent pass produced a candidate that closed L2's median and L3's MRR.
+An adversarial verifier refuted it at severity HIGH, and the finding was about
+this campaign's own instrument rather than the change.
+
+## The blindness
+
+`tiergate` builds its gold set with `kind='atom'`, and `generatedProbes`
+additionally requires a `principle:` line that only reasoning atoms carry, so a
+document_chunk was unreachable by construction. Five of the six curated
+expectations are memory atoms.
+
+| | share of gold | share of live corpus |
+|---|---|---|
+| memory kinds | 64 of 65 (98.5%) | 5.6% |
+| `document_chunk` | 1 of 65 (1.5%) | **94.4%** |
+
+A change that removes chunk results therefore cannot lower R@10 or MRR@10. It
+can only raise them. The verifier rebuilt the missing family and measured a 92%
+loss of chunk retrieval at L3 (R@10 0.633 to 0.050), while L3's served ids
+became equal to L2's on 62 of 65 probes where the pre arm had differed on 205 of
+205.
+
+The quality unit's own `verdict_meaning` reads: "This is the unit that makes
+'return fewer results' an unprofitable optimization." It could not do that for
+the 94.4% of the corpus L3 exists to reach. Stated intent is not enforcement.
+
+## The planted failure
+
+Plant: restrict L3 to memory kinds, which is the candidate's effect in one line.
+
+| unit | baseline | PLANTED |
+|---|---|---|
+| l3.quality.r_at_10 | 0.800 PASS | 0.829 **PASS** |
+| l3.quality.mrr_at_10 | 0.458 PASS | 0.511 **PASS** |
+| **l3.quality.chunk_r_at_10** | 0.767 PASS | **0.000 FAIL** |
+
+The old units do not merely miss the regression, they **reward** it. L3's MRR
+improved by deleting the corpus, which is precisely the shape of the fix that
+had been proposed for L3's MRR failure. Under the plant, L3's quality figures
+became identical to L2's, because L3 had stopped being a tier.
+
+## The confirmation nobody asked for
+
+Baseline chunk ranks: `[4,2,2,2,2,2,0,4,2,2,0,2,2,2,10,2,4,4,6,6]`. Every hit
+EVEN. The judge separately established that L3's memory ranks contain only ODD
+values, calling it a comb that no score contest could produce. Two independent
+probe families landing on opposite parities is a 1:1 interleave seen from both
+sides.
+
+**So L3's MRR failure is the interleave, not the scoring and not the corpus.**
+The fix is to stop interleaving when no reranker runs, which costs nothing and
+removes nothing. The fix is NOT to drop chunks, which is what the gate would
+have rewarded.
+
+## What did not ship
+
+The candidate. Not because its latency work was wrong (an independent verifier
+reproduced that with a properly controlled three-daemon A/B/A and a calibrated
+baseline), but because its quality claim rested on an instrument that could not
+see what it traded away.
