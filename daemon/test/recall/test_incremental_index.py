@@ -89,6 +89,84 @@ def test_add_after_a_real_build_extends_rather_than_replaces(cls, tmp_path):
     assert index.search(unit(200), 1)[0][0] == "built-0"
 
 
+# --------------------------------------------------------------------------- #
+# retirement, on BOTH implementations                                           #
+# --------------------------------------------------------------------------- #
+#
+# These are parametrized over both index types on purpose. A sabotage pass found
+# that skipping HnswIndex.remove entirely left the whole suite GREEN, because
+# every store a test builds sits below HNSW_THRESHOLD (5,000) and therefore only
+# ever exercises FlatIndex. In production BOTH kind classes are past that
+# threshold (memory 16,763, code 282,985), so the untested implementation is the
+# one that actually runs. Coverage that inverts between test and production is
+# worse than no coverage, because it reads as coverage.
+#
+# Each test asserts INCLUSION before it asserts exclusion, in the same run on the
+# same input. Without that first assertion an exclusion test cannot fail: the
+# atom may be absent because the mechanism worked, or because it was never going
+# to rank. Two probes in this campaign returned the expected answer for the wrong
+# reason before that rule was written down.
+
+
+@pytest.mark.parametrize("cls", [FlatIndex, HnswIndex])
+def test_remove_stops_an_atom_being_returned(cls):
+    index = cls()
+    vecs = {f"r{i}": unit(400 + i) for i in range(5)}
+    for atomId, vec in vecs.items():
+        index.add(atomId, vec)
+
+    victim, victimVec = "r2", vecs["r2"]
+    # INCLUSION FIRST: queried with its own vector it must rank first, or this
+    # test has no power and its later assertion proves nothing.
+    assert index.search(victimVec, 5)[0][0] == victim
+
+    assert index.remove(victim) is True
+    got = [a for a, _ in index.search(victimVec, 5)]
+    assert victim not in got, f"{victim} survived removal: {got}"
+    # and the survivors are untouched
+    assert set(got) == set(vecs) - {victim}
+
+
+@pytest.mark.parametrize("cls", [FlatIndex, HnswIndex])
+def test_remove_is_honest_about_an_unknown_atom(cls):
+    index = cls()
+    index.add("present", unit(500))
+    assert index.remove("never-added") is False
+    assert index.search(unit(500), 1)[0][0] == "present"
+
+
+@pytest.mark.parametrize("cls", [FlatIndex, HnswIndex])
+def test_remove_then_add_keeps_later_atoms_addressable(cls):
+    """FlatIndex masks a row POSITION and HnswIndex drops a usearch key, and in
+    both the surviving entries keep their slots. An implementation that
+    renumbered would hand back the wrong atom id for a correct vector, which is
+    a wrong answer rather than an error."""
+    index = cls()
+    ids = [f"s{i}" for i in range(4)]
+    vecs = [unit(600 + i) for i in range(4)]
+    for atomId, vec in zip(ids, vecs):
+        index.add(atomId, vec)
+    index.remove("s1")
+    late = unit(700)
+    index.add("late", late)
+
+    assert index.search(late, 1)[0][0] == "late"
+    for atomId, vec in zip(ids, vecs):
+        if atomId == "s1":
+            continue
+        assert index.search(vec, 1)[0][0] == atomId
+
+
+@pytest.mark.parametrize("cls", [FlatIndex, HnswIndex])
+def test_removing_every_atom_leaves_an_empty_result_not_a_crash(cls):
+    index = cls()
+    v = unit(800)
+    index.add("only", v)
+    assert index.search(v, 3)[0][0] == "only"
+    index.remove("only")
+    assert index.search(v, 3) == []
+
+
 def test_flat_add_preserves_unit_norm_rows():
     """search() treats stored rows as unit length, so an un-normalized append
     would silently inflate that atom's score against every other."""
