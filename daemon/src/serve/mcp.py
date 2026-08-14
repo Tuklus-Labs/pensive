@@ -321,6 +321,13 @@ class ServeContext:
             index = self.indexes.get(name)
             if index is not None:
                 index.remove(atomId)
+        # The aux index has to hear about retirement too. indexAtom maintains it
+        # on the add side and this method did not on the remove side, so a
+        # corrected atom stayed live in the aux signal. Dormant today only
+        # because aux dense is switched off; an asymmetry that survives because
+        # nothing exercises it is still a bug.
+        if self.aux is not None:
+            self.aux.reindex(self.store, (kind,))
 
     def reindex(self, kinds=None):
         """Embed missing live atoms and rebuild dense indexes.

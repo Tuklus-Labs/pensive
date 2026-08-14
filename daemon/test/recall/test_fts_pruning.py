@@ -133,3 +133,44 @@ def test_the_prune_threshold_is_a_fraction_not_a_count(store):
     """A hardcoded row count would silently stop pruning as the corpus grows,
     which is the failure mode where an instrument gets quieter over time."""
     assert 0.0 < DF_PRUNE_FRACTION < 1.0
+
+
+# --------------------------------------------------------------------------- #
+# cache lifetime                                                                #
+# --------------------------------------------------------------------------- #
+
+
+def test_live_row_count_cache_does_not_outlive_a_write(tmp_path):
+    """THE CLAIM: corpus statistics memoized on the store must not survive a
+    write to that store.
+
+    The daemon holds ONE store for its entire lifetime, so a value computed at
+    startup would describe the corpus forever. A clean-pass audit probed this on
+    a temp store and watched the count freeze at 21 while the store grew past
+    10,121, which left DF pruning permanently disabled because the corpus never
+    appeared to reach MIN_CORPUS_FOR_PRUNING.
+
+    That is worse than no cache: it is right during every test, where stores are
+    small and short-lived, and wrong in production, where they are neither.
+    """
+    from store.store import openStore, putAtom
+    from recall.signals import _liveRowCount
+
+    store = openStore(tmp_path / "cache.db")
+    try:
+        for i in range(3):
+            putAtom(store, {"text": f"seed atom {i}", "kind": "atom",
+                            "project": "p", "provenance": {"source": "bulk-import"}})
+        first = _liveRowCount(store)
+        assert first == 3, f"expected 3 live rows, got {first}"
+
+        for i in range(5):
+            putAtom(store, {"text": f"later atom {i}", "kind": "atom",
+                            "project": "p", "provenance": {"source": "bulk-import"}})
+        second = _liveRowCount(store)
+        assert second == 8, (
+            "the memoized live-row count survived a write: it reports "
+            f"{second} for a store holding 8 live atoms. DF pruning keys on this "
+            "number, so a stale value disables pruning for the life of the daemon.")
+    finally:
+        store.close()

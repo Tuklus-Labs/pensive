@@ -149,6 +149,66 @@ def test_remove_stops_an_atom_being_returned(cls):
 
 
 @pytest.mark.parametrize("cls", [FlatIndex, HnswIndex])
+def test_remove_clears_every_copy_of_a_duplicated_atom(cls):
+    """`list.index` returns ONE position and an atom can occupy several.
+
+    `add` appends, so an atom already present from a build gains a second row
+    when indexAtom runs for it again: an emit retry, a redelivered MCP call.
+    Masking only the first left `remove` returning True while search still
+    returned the atom. That is a retracted memory served, with the API reporting
+    success, which is the worst shape available here.
+
+    Found by a clean-pass audit against BOTH implementations, after the first fix
+    for this class of bug shipped with the hole still in it."""
+    index = cls()
+    v, w = unit(900), unit(901)
+    # force the duplicate the way production would: add, add something else,
+    # add the same atom again
+    index._atomIds.append("dup")
+    if hasattr(index, "_matrix"):
+        import numpy as np
+        index._matrix = np.vstack([index._matrix, v.reshape(1, -1)]) \
+            if index._matrix.shape[0] else v.reshape(1, -1).copy()
+    else:
+        pass
+    index2 = cls()
+    index2.add("dup", v)
+    index2.add("other", w)
+    index2._atomIds.append("dup")          # a raw second copy, as a rebuild+add produces
+    if hasattr(index2, "_matrix"):
+        import numpy as np
+        index2._matrix = np.vstack([index2._matrix, v.reshape(1, -1)])
+    else:
+        index2._index.add(len(index2._atomIds) - 1, v)
+
+    before = [a for a, _ in index2.search(v, 5)]
+    assert "dup" in before, (
+        "THIS TEST HAS NO POWER: the duplicated atom must be returned before "
+        f"removal, or the assertion below cannot fail. got {before}")
+
+    assert index2.remove("dup") is True
+    after = [a for a, _ in index2.search(v, 5)]
+    assert "dup" not in after, (
+        "remove() cleared only ONE copy: a retracted atom is still recallable "
+        f"while remove reported success. got {after}")
+
+
+@pytest.mark.parametrize("cls", [FlatIndex, HnswIndex])
+def test_add_is_idempotent_by_atom_id(cls):
+    """Re-adding an atom must not leave two live rows for it, or every later
+    remove has to find them all. Keeping the index single-valued is what makes
+    that guarantee cheap."""
+    index = cls()
+    v = unit(910)
+    index.add("same", v)
+    index.add("same", v)
+    got = [a for a, _ in index.search(v, 5)]
+    assert got.count("same") == 1, (
+        f"an atom added twice is returned {got.count('same')} times; the index "
+        "is no longer single-valued")
+
+
+@pytest.mark.parametrize("cls", [FlatIndex, HnswIndex])
 def test_remove_is_honest_about_an_unknown_atom(cls):
     index = cls()
     index.add("present", unit(500))

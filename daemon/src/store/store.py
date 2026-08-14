@@ -112,6 +112,20 @@ def _now():
     return int(time.time())
 
 
+
+def _invalidateSignalCaches(store):
+    """Drop recall's memoized corpus statistics after a write.
+
+    Lazy import: `recall.signals` imports `store`, so a module-level import here
+    would be circular. The caches live on the store object because that is the
+    thing whose lifetime they must not outlive.
+    """
+    try:
+        from recall.signals import invalidateSignalCaches
+    except Exception:  # noqa: BLE001 - a missing optional path must not fail a write
+        return
+    invalidateSignalCaches(store)
+
 def putAtom(store, atomInput):
     """Write one atom and its single provenance row in one transaction.
 
@@ -162,6 +176,7 @@ def putAtom(store, atomInput):
             ),
         )
         conn.commit()
+        _invalidateSignalCaches(store)
     except Exception:
         # The atom insert already ran inside this transaction; rollback undoes it
         # (and its fts trigger row) so the failed put leaves the store untouched.
@@ -423,6 +438,7 @@ def supersede(store, oldId, newId, provInput):
             (oldId,),
         )
         conn.commit()
+        _invalidateSignalCaches(store)
     except Exception:
         conn.rollback()
         raise

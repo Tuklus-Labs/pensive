@@ -96,6 +96,26 @@ def ctx(store, embedder):
     return ServeContext(store, embedder, MODEL_ID, agent="heph")
 
 
+@pytest.fixture(params=["flat", "hnsw"], ids=["FlatIndex", "HnswIndex"])
+def ctxBothIndexes(request, store, embedder, monkeypatch):
+    """A ServeContext built under EACH index implementation.
+
+    Test stores hold a handful of atoms, far under HNSW_THRESHOLD (5,000), so
+    the default fixture only ever exercises FlatIndex. Production runs HnswIndex
+    for BOTH kind classes (memory 16,796, code 282,985), which made the untested
+    implementation the one that actually runs. A retirement helper in this file
+    was vacuous against HnswIndex for exactly that reason and nothing caught it.
+
+    Scoped to the tests where retirement semantics matter rather than applied to
+    every ctx, because doubling the whole module costs real wall clock for no
+    additional coverage.
+    """
+    import recall.vector_index as vi
+
+    monkeypatch.setattr(vi, "HNSW_THRESHOLD", 5000 if request.param == "flat" else 0)
+    return ServeContext(store, embedder, MODEL_ID, agent="heph")
+
+
 def _put(store, text, project="aegis", kind="atom", occurredAt=None):
     atomInput = {
         "text": text,
@@ -616,29 +636,28 @@ def test_emit_indexes_the_new_atom_in_memory_and_leaves_code_alone(ctx, tool, ar
 
 
 def _retiredIds(index):
-    """Atom ids the index has retired, whichever way it tracks them.
+    """Atom ids the index has retired. Delegates to the seam.
 
-    FlatIndex masks row POSITIONS in `_retired`; HnswIndex drops the key from
-    the usearch graph and keeps the slot in `_atomIds`. This normalizes both to
-    ids so a test can ask the question once.
-    """
-    retired = getattr(index, "_retired", None)
-    if not retired:
-        return set()
-    return {index._atomIds[pos] for pos in retired}
+    This used to read `index._retired` directly, which exists only on FlatIndex,
+    so it returned an empty set against HnswIndex and every assertion built on it
+    passed vacuously under the PRODUCTION configuration (both kind classes are
+    past HNSW_THRESHOLD). A second attempt probed the index with a vector it
+    could not obtain and returned EVERY id as retired, which is vacuous in the
+    other direction. Retirement is now a question the index answers."""
+    return index.retiredIds()
 
 
-def test_correct_rebuilds_only_the_corrected_atoms_class(ctx):
+def test_correct_rebuilds_only_the_corrected_atoms_class(ctxBothIndexes):
     # `correct` inherits the old atom's kind, so it is the one mutating tool
     # that can touch either class: a memory correction must leave the code
     # index alone, and a code correction must rebuild it (the superseded chunk
     # has to drop out of the dense index).
-    chunk = _put(ctx.store, "class HnswIndex: ...", kind="document_chunk")
-    note = _put(ctx.store, "the chassis fans are slaved to the GPU sensor")
-    ctx.reindex()
+    chunk = _put(ctxBothIndexes.store, "class HnswIndex: ...", kind="document_chunk")
+    note = _put(ctxBothIndexes.store, "the chassis fans are slaved to the GPU sensor")
+    ctxBothIndexes.reindex()
 
-    codeBefore = ctx.indexes["code"]
-    _, err = dispatch(ctx, "correct", {
+    codeBefore = ctxBothIndexes.indexes["code"]
+    _, err = dispatch(ctxBothIndexes, "correct", {
         "oldAtomId": note,
         "newText": "the chassis fans follow the GPU temp sensor, not the CPU",
     })
@@ -648,25 +667,25 @@ def test_correct_rebuilds_only_the_corrected_atoms_class(ctx):
     # asserted instead is the property that mattered: the corrected atom drops
     # out of its class's index, its replacement appears, and the OTHER class is
     # untouched in both object and contents.
-    assert ctx.indexes["code"] is codeBefore
-    assert note in _retiredIds(ctx.indexes["memory"]), (
+    assert ctxBothIndexes.indexes["code"] is codeBefore
+    assert note in _retiredIds(ctxBothIndexes.indexes["memory"]), (
         "the corrected note is still live in the memory index, so it can "
         "surface beside its own correction")
 
-    codeIdsBefore = list(ctx.indexes["code"]._atomIds)
-    memoryBefore = ctx.indexes["memory"]
+    codeIdsBefore = list(ctxBothIndexes.indexes["code"]._atomIds)
+    memoryBefore = ctxBothIndexes.indexes["memory"]
     memoryIdsBefore = list(memoryBefore._atomIds)
-    _, err = dispatch(ctx, "correct", {
+    _, err = dispatch(ctxBothIndexes, "correct", {
         "oldAtomId": chunk,
         "newText": "class HnswIndex: pass",
     })
     assert err is False
     # the code class gained the replacement chunk
-    assert set(ctx.indexes["code"]._atomIds) - set(codeIdsBefore), \
+    assert set(ctxBothIndexes.indexes["code"]._atomIds) - set(codeIdsBefore), \
         "the corrected chunk's replacement never entered the code index"
     # the memory class was not disturbed by a code-class correction
-    assert ctx.indexes["memory"] is memoryBefore
-    assert ctx.indexes["memory"]._atomIds == memoryIdsBefore
+    assert ctxBothIndexes.indexes["memory"] is memoryBefore
+    assert ctxBothIndexes.indexes["memory"]._atomIds == memoryIdsBefore
 
 
 def test_reindex_default_still_rebuilds_every_class(ctx):
@@ -767,29 +786,29 @@ def test_history_missing_atom_errors(ctx):
 # --------------------------------------------------------------------------- #
 
 
-def test_correct_supersedes_and_recall_shows_current_truth(ctx, _rerankerWarm):
-    old = _put(ctx.store, "the survey line spacing is 100 meters", project="aegis")
-    ctx.reindex()
+def test_correct_supersedes_and_recall_shows_current_truth(ctxBothIndexes, _rerankerWarm):
+    old = _put(ctxBothIndexes.store, "the survey line spacing is 100 meters", project="aegis")
+    ctxBothIndexes.reindex()
 
-    text, isError = dispatch(ctx, "correct", {
+    text, isError = dispatch(ctxBothIndexes, "correct", {
         "oldAtomId": old,
         "newText": "the survey line spacing is 40 meters after the overlap fix",
         "provenance": {"source": "explicit-emit", "agent": "heph"},
     })
     assert isError is False
-    new = edgesTo(ctx.store, old, "supersedes")[0]["srcAtom"]
+    new = edgesTo(ctxBothIndexes.store, old, "supersedes")[0]["srcAtom"]
     assert f"p3://{new}" in text                         # returns the new id
 
     # The store recorded the supersession: old is superseded, new is live.
-    assert getAtom(ctx.store, old)["status"] == "superseded"
-    assert getAtom(ctx.store, new)["status"] == "live"
+    assert getAtom(ctxBothIndexes.store, old)["status"] == "superseded"
+    assert getAtom(ctxBothIndexes.store, new)["status"] == "live"
     # The corrected atom inherits the old atom's project (a correction stays put).
-    assert getAtom(ctx.store, new)["project"] == "aegis"
+    assert getAtom(ctxBothIndexes.store, new)["project"] == "aegis"
 
     # correct reindexes over LIVE atoms, so recall returns the CURRENT truth: the
     # live successor, trusted. The retired "100 meters" claim is not standalone --
     # it is now history, reachable through history()/the supersession chain.
-    rtext, _ = dispatch(ctx, "recall", {"query": "survey line spacing meters"})
+    rtext, _ = dispatch(ctxBothIndexes, "recall", {"query": "survey line spacing meters"})
     assert "40 meters after the overlap fix" in rtext
     assert "100 meters" not in rtext
 

@@ -109,6 +109,18 @@ class VectorIndex(abc.ABC):
         retracted atom recallable.
         """
 
+    @abc.abstractmethod
+    def retiredIds(self):
+        """Atom ids this index has retired since its last build.
+
+        Part of the seam because the two implementations track retirement
+        DIFFERENTLY: FlatIndex masks row positions, HnswIndex drops usearch keys
+        and keeps the slot. A caller that reads `_retired` directly works against
+        one and silently returns an empty set against the other, which is how a
+        test came to pass vacuously under the production index while appearing
+        to assert something.
+        """
+
 
 class FlatIndex(VectorIndex):
     """Brute-force cosine index: an in-memory matrix scanned per query.
@@ -152,14 +164,29 @@ class FlatIndex(VectorIndex):
         # names _matrix[i]), so deleting a row would renumber every atom after it
         # and hand back wrong ids for correct vectors. The mask costs one bool
         # per row and is applied in search.
-        try:
-            pos = self._atomIds.index(atomId)
-        except ValueError:
+        # EVERY matching position, not just the first. `list.index` returns one
+        # position, and an atom can occupy several: `add` appends
+        # unconditionally, so an atom already present from a build gains a second
+        # row when indexAtom runs for it again (an emit retry, a redelivered MCP
+        # call). Masking one of them left `remove` returning True while search
+        # still returned the atom, which is a retracted memory served with the
+        # API reporting success. Reproduced on both implementations before this
+        # fix; pinned by test_remove_clears_every_copy_of_a_duplicated_atom.
+        found = [i for i, a in enumerate(self._atomIds) if a == atomId]
+        if not found:
             return False
-        self._retired.add(pos)
+        self._retired.update(found)
         return True
 
+    def retiredIds(self):
+        return {self._atomIds[pos] for pos in self._retired}
+
     def add(self, atomId, vec):
+        # Idempotent by identity: re-adding an atom retires its previous rows
+        # first, so the index stays single-valued and the newest vector wins.
+        # Without this an emit retry silently doubles a row.
+        if atomId in self._atomIds:
+            self.remove(atomId)
         row = np.asarray(vec, dtype=np.float32).reshape(1, -1)
         if self._matrix.shape[0] == 0:
             # A never-built or empty index carries shape (0, 0), so vstack would

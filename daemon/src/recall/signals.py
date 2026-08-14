@@ -162,9 +162,28 @@ def ftsDocFreq(store, term):
     return value
 
 
+def invalidateSignalCaches(store):
+    """Drop the memoized DF and live-row-count caches for ``store``.
+
+    Called by the write paths. WITHOUT THIS the caches never expire: the daemon
+    holds one store for its entire lifetime, so a value computed at startup
+    describes the corpus forever. Probed on a temp store during a clean-pass
+    audit, the count froze at 21 while the store grew past 10,121, which left DF
+    pruning permanently disabled because the corpus never appeared to reach
+    MIN_CORPUS_FOR_PRUNING. A cache that is correct only until the first write is
+    worse than no cache, because it is right during every test and wrong in
+    production.
+    """
+    for attr in ("_dfCache", "_liveRowCountCache"):
+        if hasattr(store, attr):
+            delattr(store, attr)
+
+
 def _liveRowCount(store):
     """Live row count, memoized per store: a COUNT(*) over 320k rows on every
-    query is the same self-defeating shape as the schema statement was."""
+    query is the same self-defeating shape as the schema statement was.
+
+    Invalidated by :func:`invalidateSignalCaches` on write."""
     cached = getattr(store, "_liveRowCountCache", None)
     if cached is not None:
         return cached

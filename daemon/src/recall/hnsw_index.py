@@ -54,6 +54,10 @@ class HnswIndex(VectorIndex):
         # positive ndim to construct, so an empty store leaves the index unbuilt
         # and search() short-circuits to [] on it.
         self._index = None
+        # Ids retired since the last build. usearch drops the key from the graph
+        # and leaves no residue, so unlike FlatIndex there is no position mask to
+        # read back; retirement has to be remembered explicitly.
+        self._retiredIds = set()
 
     def build(self, store, modelId, kinds=None):
         # EXACTLY FlatIndex.build's query: same LIVE filter, same model, same
@@ -70,6 +74,7 @@ class HnswIndex(VectorIndex):
             (modelId, *kindParams),
         ).fetchall()
         self._atomIds = [r[0] for r in rows]
+        self._retiredIds = set()
         if not rows:
             self._index = None
             return self
@@ -88,18 +93,25 @@ class HnswIndex(VectorIndex):
     def remove(self, atomId):
         if self._index is None:
             return False
-        try:
-            key = self._atomIds.index(atomId)
-        except ValueError:
+        keys = [i for i, a in enumerate(self._atomIds) if a == atomId]
+        if not keys:
             return False
         # usearch drops the key from the graph, so search stops returning it.
         # Verified discriminatingly rather than by documentation: an atom queried
         # with its OWN vector ranks first, and is absent from the top-3 after
         # remove. _atomIds keeps its slot so every later key still maps correctly.
-        self._index.remove(key)
+        for key in keys:
+            self._index.remove(key)
+        self._retiredIds.add(atomId)
         return True
 
+    def retiredIds(self):
+        return set(self._retiredIds)
+
     def add(self, atomId, vec):
+        # Idempotent by identity, same reason as FlatIndex.add.
+        if atomId in self._atomIds:
+            self.remove(atomId)
         row = np.asarray(vec, dtype=np.float32).reshape(-1)
         if self._index is None:
             # build() leaves _index None on an empty store because usearch needs
