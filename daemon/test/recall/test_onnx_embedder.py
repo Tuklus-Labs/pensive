@@ -121,12 +121,21 @@ def test_a_batch_larger_than_the_batch_size_still_returns_one_vector_each(onnxEm
 
 @onnxOnly
 def test_each_returned_vector_owns_its_buffer(onnxEmb):
-    """A row view would alias the batch matrix, so a consumer's in-place op
-    would silently mutate its siblings."""
+    """Each vector must own its data rather than view the batch matrix.
+
+    The first version of this test wrote zeros into got[0] and asserted got[1]
+    was unchanged. That assertion CANNOT FAIL: distinct rows of a matrix never
+    alias each other, view or copy, so it passed against a planted defect that
+    removed the .copy() entirely. It was a test shaped like a guard.
+
+    What actually distinguishes the two is ownership: a view carries a .base
+    pointing at the parent matrix and keeps that whole (batch x 384) array alive
+    for as long as any one vector survives. Asserting on .base is a question the
+    defect can answer wrongly."""
     got = onnxEmb.embed(TEXTS)
-    before = got[1].copy()
-    got[0][:] = 0.0
-    assert np.array_equal(got[1], before)
+    offenders = [i for i, v in enumerate(got) if v.base is not None]
+    assert not offenders, (
+        f"vectors {offenders} are views into the batch matrix, not owned copies")
 
 
 # --------------------------------------------------------------------------- #
