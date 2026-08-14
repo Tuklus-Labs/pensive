@@ -221,7 +221,15 @@ class OnnxEmbedder:
                 f"expected exactly one graph output, got {[o.name for o in outs]}")
         self._outName = outs[0].name
         self._inNames = {i.name for i in self._sess.get_inputs()}
-        self.dim = int(outs[0].shape[-1])
+        # dim comes from a real forward pass, not from the declared output shape.
+        # onnxruntime happens to resolve this graph's trailing axis to a literal
+        # 384, but that is a property of how it was exported: raw graph
+        # inspection shows a SYMBOLIC name there, and an export that kept the
+        # symbol would make int(shape[-1]) raise at construction. That failure
+        # degrades to the torch path, which is safe but silently costs the
+        # optimization. One tiny inference at startup makes the number measured
+        # rather than declared, which is the rule applied everywhere else here.
+        self.dim = len(self.embed(["dimension probe"])[0])
 
     def embed(self, texts):
         """Embed ``texts`` -> list of unit-normalized float32 vectors.
