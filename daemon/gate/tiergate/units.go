@@ -7,6 +7,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"sort"
 	"strconv"
 	"strings"
@@ -167,6 +168,50 @@ func run(c *cfg) (*verdict.Report, error) {
 						"caller issuing an identical query would be excluded as ours.",
 					"verdict_meaning": "FAIL means this run's latency figures are contaminated and must not be quoted",
 				}), nil)
+		}
+	}
+
+	// --- host load ----------------------------------------------------------
+	// The sibling guard above bounds contamination from OTHER RECALL TRAFFIC.
+	// It says nothing about contamination from the HOST, and the daemon's
+	// embedder runs on CPU (GPU is banned for it by a systemd drop-in), so a
+	// busy machine inflates every tier's latency without writing a single
+	// recall_log row. On 2026-08-19 a full run rejected on all three latency
+	// units at load average 19.5 on 24 cores while every quality unit passed;
+	// the background-traffic guard read 1 request/min and cheerfully certified
+	// the run as uncontaminated. A gate that refuses to measure under one kind
+	// of interference and reports confidently under another is measuring the
+	// wrong question (STYLE.md: instruments fail because the QUESTION drifted).
+	{
+		q := "QUESTION: is host CPU load low enough that a latency number describes this daemon rather than the machine's run queue?"
+		ceiling := c.maxLoadPerCore * float64(runtime.NumCPU())
+		raw, err := os.ReadFile("/proc/loadavg")
+		if err != nil {
+			add("contamination", "contamination.host-load", verdict.Fail,
+				c.ev("host-load", map[string]any{"question": q, "error": err.Error()}), nil)
+		} else {
+			fields := strings.Fields(string(raw))
+			load1, perr := strconv.ParseFloat(fields[0], 64)
+			if perr != nil || len(fields) == 0 {
+				add("contamination", "contamination.host-load", verdict.Fail,
+					c.ev("host-load", map[string]any{"question": q,
+						"error": "could not parse /proc/loadavg", "raw": string(raw)}), nil)
+			} else {
+				add("contamination", "contamination.host-load", state(load1 <= ceiling),
+					c.ev("host-load", map[string]any{
+						"question":         q,
+						"load1":            load1,
+						"cores":            runtime.NumCPU(),
+						"load_per_core":    load1 / float64(runtime.NumCPU()),
+						"ceiling_per_core": c.maxLoadPerCore,
+						"ceiling_load1":    ceiling,
+						"KNOWN BLIND SPOT": "load average counts uninterruptible I/O wait as well as " +
+							"runnable tasks, so a disk-bound neighbour trips this guard even when CPU " +
+							"is idle. It also samples ONCE, at the end of the run, so a burst that ended " +
+							"before this line executed is invisible.",
+						"verdict_meaning": "FAIL means this run's latency figures measure the machine, not the daemon, and must not be quoted as a regression",
+					}), nil)
+			}
 		}
 	}
 

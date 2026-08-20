@@ -63,6 +63,15 @@ const (
 	// the retry loop, so the gate refuses rather than reporting it.
 	defaultMaxBackgroundPerMin = 5.0
 
+	// Host-load ceiling, as load1 per core. The sibling ceiling above bounds
+	// contamination from other RECALL traffic; this one bounds contamination
+	// from the machine. 0.5 means "fewer than half the cores are queued", which
+	// leaves generous headroom on an idle box (load 1-2 of 24) while refusing
+	// to certify latency during a build, a model load, or a parallel agent
+	// fleet. Set from the 2026-08-19 run that rejected on all three latency
+	// units at load 19.5/24 cores while every quality unit passed.
+	defaultMaxLoadPerCore = 0.5
+
 	// An id that cannot exist: valid ULID alphabet, never issued. The negative
 	// half of the self-testing canary (STYLE.md: prefer instruments that carry
 	// their own negative half).
@@ -78,6 +87,7 @@ type cfg struct {
 	l3Budget        float64
 	rAt10Floor      float64
 	chunkRAt10Floor float64
+	maxLoadPerCore  float64
 	mrrFloor        float64
 	maxBackground   float64
 	iterations      int
@@ -105,6 +115,7 @@ func main() {
 		"L3 document_chunk R@10 floor")
 	flag.Float64Var(&c.mrrFloor, "mrr-floor", defaultMRRAt10Floor, "MRR@10 floor")
 	flag.Float64Var(&c.maxBackground, "max-background-per-min", defaultMaxBackgroundPerMin, "contamination ceiling")
+	flag.Float64Var(&c.maxLoadPerCore, "max-load-per-core", defaultMaxLoadPerCore, "host load1-per-core ceiling; above this the gate refuses to quote latency")
 	flag.IntVar(&c.iterations, "iterations", 40, "probe iterations per latency unit")
 	flag.IntVar(&c.genProbes, "gen-probes", 25, "generated self-retrieval probes")
 	flag.IntVar(&c.seed, "seed", 42, "sample seed for generated probes")
