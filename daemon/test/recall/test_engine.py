@@ -504,6 +504,29 @@ def test_kinds_filter_excluding_everything_returns_sentinel(store, embedder):
     assert out["lowConfidence"] is True
 
 
+def test_filter_agent_keeps_stamped_drops_null_and_other(store):
+    # I8: the retrieve filter is a provenance join on the fused list, not a
+    # guess about NULL rows. No embedder: this is the SELECT, not ranking.
+    grokId = _put(store, "zanthic modem calibration grok-lane", agent="grok")
+    hephId = _put(store, "zanthic modem calibration heph-lane", agent="heph")
+    nullId = _put(store, "zanthic modem calibration unattributed-lane", agent=None)
+    fused = [(grokId, 1.0), (hephId, 0.9), (nullId, 0.8)]
+
+    grokOnly = engine._filterAgent(store, fused, "grok")
+    grokIds = [atomId for atomId, _ in grokOnly]
+    assert grokIds == [grokId], (
+        f"agent-filter invariant violated: kept={grokIds} "
+        f"grok={grokId} heph={hephId} null={nullId}"
+    )
+
+    unscoped = fused  # recall() skips _filterAgent when agent is unset
+    unscopedIds = [atomId for atomId, _ in unscoped]
+    assert unscopedIds == [grokId, hephId, nullId], (
+        "unscoped-recall invariant violated: the filter helper was applied "
+        f"without an agent ids={unscopedIds}"
+    )
+
+
 def test_whitespace_query_returns_sentinel_without_touching_models(store):
     # Empty/whitespace query short-circuits to the sentinel. dense() would embed
     # whitespace to a valid unit vector and return the whole index, so the guard is

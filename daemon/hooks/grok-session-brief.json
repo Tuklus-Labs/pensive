@@ -1,0 +1,26 @@
+{
+  "hooks": {
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "/home/aegis/Projects/pensive/daemon/hooks/session-brief-v3-grok.sh",
+            "timeout": 8
+          }
+        ]
+      }
+    ],
+    "SessionEnd": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "/home/aegis/Projects/pensive/daemon/hooks/session-brief-v3-grok.sh",
+            "timeout": 8
+          }
+        ]
+      }
+    ]
+  }
+}

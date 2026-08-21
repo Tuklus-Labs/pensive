@@ -141,6 +141,10 @@ RECALL_RECORDS_INPUT_SCHEMA = {
         "tokenBudget": {
             "type": "integer", "minimum": 1, "maximum": 8000, "default": 1500,
         },
+        "agent": {
+            "type": ["string", "null"], "minLength": 1, "maxLength": 64,
+            "pattern": r".*\S.*",
+        },
     },
     "required": ["query"],
 }
@@ -533,7 +537,7 @@ def _recallKinds(value):
 
 
 def _recallRecordsArgs(args):
-    allowed = {"query", "project", "timeScope", "kinds", "k", "tokenBudget"}
+    allowed = {"query", "project", "timeScope", "kinds", "k", "tokenBudget", "agent"}
     unknown = sorted(set(args) - allowed)
     if unknown:
         raise ValueError(f"recall_records: unknown fields: {unknown}")
@@ -547,7 +551,8 @@ def _recallRecordsArgs(args):
     tokenBudget = _boundedJSONInt(
         args.get("tokenBudget", 1500), "tokenBudget", 1, 8000
     )
-    return query, project, timeScope, kinds, k, tokenBudget
+    agent = _sanitizeAgent(args.get("agent"))
+    return query, project, timeScope, kinds, k, tokenBudget, agent
 
 
 @dataclass(frozen=True)
@@ -917,13 +922,9 @@ def handle_pensive_recall(ctx, args):
         ctx.store, ctx.indexes, ctx.embedder, query,
         project=project, k=limit, tokenBudget=ctx.defaultTokenBudget,
         aux=ctx.aux,
-            # rerankEnabled=False, NOT tier=DEFAULT_TIER. Passing a tier would
-            # also override the caller's `kinds`, and recall_records asks for
-            # document_chunk explicitly: routing it through L2 would silently
-            # drop the bulk corpus from a records API that requested it. The
-            # cross-encoder is the thing that must not run here; the corpus
-            # choice belongs to the caller.
-            rerankEnabled=False,
+        # L2: authored memory. This is the listing tool live agents call.
+        # Passing rerankEnabled=False without a tier used to walk 93% chunks.
+        tier=DEFAULT_TIER,
     )
     results = out["results"]
     if not results:
@@ -1004,37 +1005,61 @@ def handle_recall(ctx, args):
     if timeScope is not None:
         timeScope = (int(timeScope[0]), int(timeScope[1]))
     kinds = args.get("kinds")
+    if kinds is not None:
+        kinds = _recallKinds(kinds)
+    agent = _sanitizeAgent(args.get("agent"))
+    recallKw = {
+        "project": project,
+        "timeScope": timeScope,
+        "k": k,
+        "tokenBudget": tokenBudget,
+        "aux": ctx.aux,
+    }
+    if kinds is not None:
+        # Caller named a corpus. Do not let default L2 override it (that is
+        # how kinds became a schema lie: extracted, then dropped).
+        recallKw["kinds"] = kinds
+        recallKw["rerankEnabled"] = False
+        logTier = "kinds"
+    else:
+        recallKw["tier"] = tier
+        logTier = tier
+    if agent:
+        recallKw["agent"] = agent
     out = recall(
         ctx.store, ctx.indexes, ctx.embedder, query,
-        project=project, timeScope=timeScope,
-        k=k, tokenBudget=tokenBudget, aux=ctx.aux,
-        tier=tier,
+        **recallKw,
     )
     response = out["payload"]
-    _logReturnedRecall(ctx, out, query, f"mcp.recall.{tier}")
+    _logReturnedRecall(ctx, out, query, f"mcp.recall.{logTier}")
     return response
 
 
 def handle_recall_records(ctx, args):
-    query, project, timeScope, kinds, k, tokenBudget = _recallRecordsArgs(args)
-    out = recall(
-        ctx.store,
-        ctx.indexes,
-        ctx.embedder,
-        query,
+    query, project, timeScope, kinds, k, tokenBudget, agent = _recallRecordsArgs(args)
+    recallKw = dict(
         project=project,
         timeScope=timeScope,
         kinds=kinds,
         k=k,
         tokenBudget=tokenBudget,
         aux=ctx.aux,
-            # rerankEnabled=False, NOT tier=DEFAULT_TIER. Passing a tier would
-            # also override the caller's `kinds`, and recall_records asks for
-            # document_chunk explicitly: routing it through L2 would silently
-            # drop the bulk corpus from a records API that requested it. The
-            # cross-encoder is the thing that must not run here; the corpus
-            # choice belongs to the caller.
-            rerankEnabled=False,
+        # rerankEnabled=False, NOT tier=DEFAULT_TIER. Passing a tier would
+        # also override the caller's `kinds`, and recall_records asks for
+        # document_chunk explicitly: routing it through L2 would silently
+        # drop the bulk corpus from a records API that requested it. The
+        # cross-encoder is the thing that must not run here; the corpus
+        # choice belongs to the caller.
+        rerankEnabled=False,
+    )
+    if agent:
+        recallKw["agent"] = agent
+    out = recall(
+        ctx.store,
+        ctx.indexes,
+        ctx.embedder,
+        query,
+        **recallKw,
     )
     ranked = out["results"]
     if len(ranked) > k:
@@ -1423,6 +1448,8 @@ NATIVE_TOOLS = [
                                 "description": "Keep only these atom kinds (atom|narrative|snapshot|document_chunk)"},
                 "k":           {"type": "integer", "description": "Max results", "default": 10},
                 "tokenBudget": {"type": "integer", "description": "Payload token budget", "default": 1500},
+                "agent":       {"type": "string",
+                                "description": "Restrict to this provenance.agent. Unset = unscoped. Connection ?agent= does not apply this filter."},
             },
             "required": ["query"],
         },

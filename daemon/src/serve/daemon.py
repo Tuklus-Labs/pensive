@@ -347,6 +347,8 @@ def buildApp(ctx):
         # SessionStart hook can curl it; agent + budget are query params. brief()
         # performs zero writes, so this handler is read-only like /status.
         agent = request.query_params.get("agent")
+        if isinstance(agent, str):
+            agent = agent.strip() or None
         budgetRaw = request.query_params.get("budget")
         if budgetRaw in (None, ""):
             budget = DEFAULT_BUDGET

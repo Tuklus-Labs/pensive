@@ -215,7 +215,7 @@ def test_recall_records_schemas_are_strict():  # I1, B8, C2
         f"required-input rule violated: required={inputSchema['required']!r}"
     )
     assert set(inputSchema["properties"]) == {
-        "query", "project", "timeScope", "kinds", "k", "tokenBudget",
+        "query", "project", "timeScope", "kinds", "k", "tokenBudget", "agent",
     }, f"input-field rule violated: properties={sorted(inputSchema['properties'])!r}"
     assert inputSchema["properties"]["query"]["minLength"] == 1, (
         f"query-min rule violated: schema={inputSchema['properties']['query']!r}"
@@ -418,6 +418,81 @@ def test_recall_records_accepts_inclusive_argument_endpoints(monkeypatch, ctx): 
         # were the slow ones, and the gate never exercised them.
         "rerankEnabled": False,
     }, f"default-argument rule violated: keywords={calls[3][1]!r}"
+
+
+def test_pensive_recall_passes_l2_tier(monkeypatch, ctx):
+    # I11: the listing tool must not walk document_chunk by default.
+    calls = []
+
+    def fakeRecall(*args, **kwargs):
+        calls.append(kwargs)
+        return _engineResult()
+
+    monkeypatch.setattr(mcp_module, "recall", fakeRecall)
+    dispatch(ctx, "pensive_recall", {"query": "q"})
+    assert calls and calls[0].get("tier") == "L2", (
+        f"pensive_recall L2-default rule violated: keywords={calls[0] if calls else None!r}"
+    )
+    assert "rerankEnabled" not in calls[0] or calls[0].get("rerankEnabled") is False, (
+        f"pensive_recall rerank-off rule violated: keywords={calls[0]!r}"
+    )
+
+
+def test_handle_recall_forwards_kinds_instead_of_default_tier(monkeypatch, ctx):
+    # M3: kinds extracted then dropped was the clean-pass finding.
+    calls = []
+
+    def fakeRecall(*args, **kwargs):
+        calls.append(kwargs)
+        return {"payload": "ok", "results": [], "tokensUsed": 0, "lowConfidence": True}
+
+    monkeypatch.setattr(mcp_module, "recall", fakeRecall)
+    dispatch(ctx, "recall", {"query": "q", "kinds": ["narrative"]})
+    assert calls, "handle_recall kinds-honor rule violated: engine not called"
+    assert calls[0].get("kinds") == ("narrative",), (
+        f"handle_recall kinds-honor rule violated: keywords={calls[0]!r}"
+    )
+    assert "tier" not in calls[0], (
+        f"handle_recall kinds-honor rule violated: default tier overrode kinds "
+        f"keywords={calls[0]!r}"
+    )
+
+
+def test_handle_recall_does_not_forward_transport_agent(monkeypatch, ctx):
+    # I10: ServeContext.agent is a write stamp. Unscoped recall stays unscoped.
+    calls = []
+
+    def fakeRecall(*args, **kwargs):
+        calls.append(kwargs)
+        return {"payload": "ok", "results": [], "tokensUsed": 0, "lowConfidence": True}
+
+    monkeypatch.setattr(mcp_module, "recall", fakeRecall)
+    ctx.agent = "heph"
+    dispatch(ctx, "recall", {"query": "q"})
+    assert "agent" not in calls[0], (
+        f"transport-autoscope rule violated: ctx.agent leaked into retrieve "
+        f"keywords={calls[0]!r}"
+    )
+
+
+def test_recall_records_forwards_agent_only_when_set(monkeypatch, ctx):
+    # C2: unset must omit the keyword (existing exact-dict tests). Set must
+    # reach the engine. Connection identity is not this path.
+    calls = []
+
+    def fakeRecall(*args, **kwargs):
+        calls.append(kwargs)
+        return _engineResult()
+
+    monkeypatch.setattr(mcp_module, "recall", fakeRecall)
+    dispatch(ctx, "recall_records", {"query": "q"})
+    assert "agent" not in calls[0], (
+        f"unset-agent-omit rule violated: keywords={calls[0]!r}"
+    )
+    dispatch(ctx, "recall_records", {"query": "q", "agent": "grok"})
+    assert calls[1].get("agent") == "grok", (
+        f"agent-forwarding rule violated: keywords={calls[1]!r}"
+    )
 
 
 def test_recall_records_preserves_rank_metadata_provenance_and_trust(

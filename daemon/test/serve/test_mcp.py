@@ -331,6 +331,74 @@ def test_pensive_recall_project_filter_maps_empty_to_no_filter(ctx, _rerankerWar
     assert text.startswith("Found ")
 
 
+def test_pensive_recall_default_excludes_document_chunk(ctx, _rerankerWarm):
+    # I11: the listing tool live agents call must default to L2 memory kinds.
+    chunkBody = "xylophonic chunk corpus line that would swamp a trusted listing"
+    atomBody = "xylophonic authored memory line that should win the listing"
+    _put(ctx.store, chunkBody, kind="document_chunk")
+    _put(ctx.store, atomBody, kind="atom")
+    ctx.reindex()
+    text, isError = dispatch(ctx, "pensive_recall",
+                             {"query": "xylophonic listing swamp"})
+    assert isError is False, (
+        f"pensive_recall L2 default rule violated: isError result={text!r}"
+    )
+    assert chunkBody not in text, (
+        "pensive_recall L2 default rule violated: document_chunk leaked into "
+        f"the default listing result={text!r}"
+    )
+    assert "xylophonic authored memory" in text, (
+        "pensive_recall L2 default rule violated: memory atom missing from "
+        f"the default listing result={text!r}"
+    )
+
+
+def test_handle_recall_honors_kinds(ctx, _rerankerWarm):
+    # M3: kinds extracted then dropped is the clean-pass finding. A narrative
+    # filter must not return an atom.
+    _put(ctx.store, "kind-filter unique narrative about qorbline sonar",
+         kind="narrative")
+    _put(ctx.store, "kind-filter unique atom about qorbline sonar",
+         kind="atom")
+    ctx.reindex()
+    text, isError = dispatch(ctx, "recall", {
+        "query": "qorbline sonar",
+        "kinds": ["narrative"],
+        "k": 10,
+        "tokenBudget": 1500,
+    })
+    assert isError is False, (
+        f"handle_recall kinds-honor rule violated: isError result={text!r}"
+    )
+    assert "unique narrative about qorbline" in text, (
+        f"handle_recall kinds-honor rule violated: narrative missing result={text!r}"
+    )
+    assert "unique atom about qorbline" not in text, (
+        f"handle_recall kinds-honor rule violated: atom leaked through kinds="
+        f"['narrative'] result={text!r}"
+    )
+
+
+def test_handle_recall_does_not_autoscope_from_transport(ctx, _rerankerWarm):
+    # I10: ctx.agent is heph (the fixture). Retrieve must still return a grok
+    # atom unless the caller passed agent=.
+    from store.store import putAtom
+    putAtom(ctx.store, {
+        "text": "transport-scope unique grok atom about wendigo ranging",
+        "kind": "atom",
+        "project": "aegis",
+        "provenance": {"source": "explicit-emit", "agent": "grok"},
+    })
+    ctx.reindex()
+    text, isError = dispatch(ctx, "recall",
+                             {"query": "wendigo ranging", "k": 10})
+    assert isError is False
+    assert "transport-scope unique grok atom" in text, (
+        "transport-autoscope rule violated: connection agent=heph hid a grok "
+        f"atom from unscoped recall result={text!r}"
+    )
+
+
 # --------------------------------------------------------------------------- #
 # Compat emits: exact result strings, written to the v3 store                  #
 # --------------------------------------------------------------------------- #

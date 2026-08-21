@@ -152,7 +152,7 @@ def _auxHits(aux, query, k):
 
 def recall(store, indexes, embedder, query, project=None, timeScope=None,
            kinds=None, k=10, tokenBudget=1500, enrich=False, aux=None,
-           tier=None, rerankEnabled=True):
+           tier=None, rerankEnabled=True, agent=None):
     """Run the full recall pipeline and assemble a tiered payload.
 
     ``store`` is the canonical store, ``indexes`` a ``{className: VectorIndex}``
@@ -170,6 +170,10 @@ def recall(store, indexes, embedder, query, project=None, timeScope=None,
     - ``kinds``: restrict to these atom kinds. Stratification runs over only the
       classes overlapping ``kinds`` (a single-class request degrades to today's
       non-stratified behavior).
+    - ``agent``: restrict to atoms whose provenance.agent matches. A string or
+      a sequence of strings. Unset (None/empty) is unscoped: today's behavior.
+      NULL-agent rows are excluded when this is set. Connection ``?agent=`` is
+      a write stamp, not this filter.
     - ``k``: number of results to return (default 10).
     - ``tokenBudget``: payload budget by the conservative heuristic (default 1500).
     - ``enrich``: attach serve-time enrichment lines (chunk file location and
@@ -288,6 +292,9 @@ def recall(store, indexes, embedder, query, project=None, timeScope=None,
     if kinds is not None:
         fused = _filterKinds(store, fused, kinds)
 
+    if agent:
+        fused = _filterAgent(store, fused, agent)
+
     if not fused:
         return _emptyResult(store, tokenBudget)
 
@@ -359,3 +366,30 @@ def _filterKinds(store, fused, kinds):
     ).fetchall()
     kindById = {r[0]: r[1] for r in rows}
     return [pair for pair in fused if kindById.get(pair[0]) in kindSet]
+
+
+def _filterAgent(store, fused, agent):
+    """Keep fused atoms that carry at least one provenance.agent in ``agent``.
+
+    One batched SELECT, same shape as :func:`_filterKinds`. An atom with two
+    provenance rows (heph and grok) is eligible for both. NULL-agent rows are
+    not a silent majority: they drop unless the caller left the filter unset.
+    """
+    if not fused:
+        return []
+    if isinstance(agent, str):
+        wanted = (agent,)
+    else:
+        wanted = tuple(a for a in agent if a)
+    if not wanted:
+        return []
+    atomIds = [atomId for atomId, _ in fused]
+    idPh = ",".join("?" for _ in atomIds)
+    agPh = ",".join("?" for _ in wanted)
+    rows = store._conn.execute(
+        f"SELECT DISTINCT atom_id FROM provenance "
+        f"WHERE atom_id IN ({idPh}) AND agent IN ({agPh})",
+        atomIds + list(wanted),
+    ).fetchall()
+    keep = {r[0] for r in rows}
+    return [pair for pair in fused if pair[0] in keep]

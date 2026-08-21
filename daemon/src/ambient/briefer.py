@@ -61,6 +61,7 @@ import time
 
 from recall.payload import estimateTokens, tier0Handle, tier1Entry
 from recall.fusion import importanceFactor, timeFactor
+from recall.strata import MEMORY_KINDS
 
 __all__ = [
     "brief",
@@ -201,23 +202,56 @@ def _addressedIds(store):
     return {r[0] for r in rows}
 
 
-def _activeRanked(store, now, excludeIds):
+def _normalizeBriefAgent(agent):
+    """None when the caller did not name an agent. Blank string is unset, not
+    a match against ``for:`` or ``provenance.agent``."""
+    if agent is None:
+        return None
+    if not isinstance(agent, str):
+        return None
+    value = agent.strip()
+    return value or None
+
+
+def _activeRanked(store, now, excludeIds, agent=None):
     """Active-thread candidates ranked by ``importanceFactor * timeFactor``.
 
-    Draws the ``ACTIVE_CANDIDATE_CAP`` most-recent live atoms, drops the ones
-    already shown elsewhere (pins, loose ends), scores each with fusion's own math
-    -- :func:`recall.fusion.importanceFactor` times
+    Draws the ``ACTIVE_CANDIDATE_CAP`` most-recent live MEMORY atoms, drops the
+    ones already shown elsewhere (pins, loose ends), scores each with fusion's
+    own math -- :func:`recall.fusion.importanceFactor` times
     :func:`recall.fusion.timeFactor`, the exact prior
     :func:`recall.fusion.applyPriors` uses -- and returns ``[(atomId, project,
     score)]`` best-first. The sort is stable, so equal scores keep the recency
-    order the SQL imposed."""
-    rows = store._conn.execute(
-        "SELECT id, project, importance, COALESCE(occurred_at, created_at) "
-        "FROM atoms WHERE status = 'live' "
-        "ORDER BY COALESCE(occurred_at, created_at) DESC, id "
-        "LIMIT ?",
-        (ACTIVE_CANDIDATE_CAP,),
-    ).fetchall()
+    order the SQL imposed.
+
+    When ``agent`` is set this is a provenance join, not a filter of the global
+    recent tail. The live failure (2026-08-20): Theia occupied the fleet's 500
+    most-recent rows, so post-filtering that window by ``agent=grok`` returned
+    empty and ``/brief?agent=grok`` stayed byte-identical to heph. Chunks are
+    corpus and never "active", scoped or not.
+    """
+    kindPlaceholders = ",".join("?" for _ in MEMORY_KINDS)
+    if agent is not None:
+        rows = store._conn.execute(
+            "SELECT a.id, a.project, a.importance, "
+            "COALESCE(a.occurred_at, a.created_at) "
+            "FROM atoms a "
+            "WHERE a.status = 'live' "
+            f"AND a.kind IN ({kindPlaceholders}) "
+            "AND a.id IN (SELECT atom_id FROM provenance WHERE agent = ?) "
+            "ORDER BY COALESCE(a.occurred_at, a.created_at) DESC, a.id "
+            "LIMIT ?",
+            (*MEMORY_KINDS, agent, ACTIVE_CANDIDATE_CAP),
+        ).fetchall()
+    else:
+        rows = store._conn.execute(
+            "SELECT id, project, importance, COALESCE(occurred_at, created_at) "
+            "FROM atoms WHERE status = 'live' "
+            f"AND kind IN ({kindPlaceholders}) "
+            "ORDER BY COALESCE(occurred_at, created_at) DESC, id "
+            "LIMIT ?",
+            (*MEMORY_KINDS, ACTIVE_CANDIDATE_CAP),
+        ).fetchall()
     scored = []
     for atomId, project, importance, effectiveTime in rows:
         if atomId in excludeIds:
@@ -316,8 +350,10 @@ def brief(store, opts=None):
     ``now`` (unix seconds) that lets a caller brief "as of" a fixed clock -- it
     defaults to the wall clock and is the hook tests use for determinism.
 
-    - ``agent``: the starting agent; drives the loose-ends section. ``None`` (or
-      absent) yields no loose-ends section.
+    - ``agent``: the starting agent; drives the loose-ends section AND the
+      active-thread pool. ``None`` (or blank) is the operator fleet view:
+      no loose-ends section, active is every agent's recent memory-kind
+      emits. A named agent restricts active to that agent's stamped emits.
     - ``budget``: token budget for the whole brief by
       :func:`recall.payload.estimateTokens` (default :data:`DEFAULT_BUDGET`).
 
@@ -327,7 +363,7 @@ def brief(store, opts=None):
     section is empty the result is :data:`EMPTY_BRIEF`. Performs ZERO writes.
     """
     opts = opts or {}
-    agent = opts.get("agent")
+    agent = _normalizeBriefAgent(opts.get("agent"))
     budget = opts.get("budget", DEFAULT_BUDGET)
     now = opts.get("now")
     if now is None:
@@ -339,7 +375,7 @@ def brief(store, opts=None):
     # some agent's loose-ends section, not the ambient active threads). looseIds is
     # a subset of the addressed set, so this also de-dups the current agent's notes.
     exclude = set(pinnedIds) | _addressedIds(store)
-    activeScored = _activeRanked(store, now, exclude)
+    activeScored = _activeRanked(store, now, exclude, agent=agent)
 
     sections = []
     pinnedBlock = _renderPinned(store, pinnedIds, budget)
