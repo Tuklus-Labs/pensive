@@ -222,6 +222,21 @@ def recall(store, indexes, embedder, query, project=None, timeScope=None,
     if filterSet is not None and not filterSet:
         return _emptyResult(store, tokenBudget)
 
+    # Agent is membership, not a kind class. Restrict the universe BEFORE
+    # candidate gen the way project does: a post-filter of the fused top-200
+    # is the Theia-tail bug (gripe: grok rows exist, fused list does not
+    # contain them, filter returns empty).
+    if agent:
+        agentSet = _agentAtomSet(store, agent)
+        if not agentSet:
+            return _emptyResult(store, tokenBudget)
+        if filterSet is None:
+            filterSet = agentSet
+        else:
+            filterSet = filterSet & agentSet
+            if not filterSet:
+                return _emptyResult(store, tokenBudget)
+
     # 2. Per-class candidate generation. classesForKinds(None) is every class;
     #    a kinds subset narrows to the overlapping classes. No class -> sentinel.
     classes = classesForKinds(kinds)
@@ -232,7 +247,7 @@ def recall(store, indexes, embedder, query, project=None, timeScope=None,
     bmHits = []
     dnHits = []
     for name, classKinds in classes:
-        bmHits.extend(bm25(store, query, _SIGNAL_K, kinds=classKinds))
+        bmHits.extend(bm25(store, query, _SIGNAL_K, kinds=classKinds, agent=agent))
         classIndex = indexes.get(name)
         if classIndex is not None:
             dnHits.extend(dense(classIndex, embedder, query, _SIGNAL_K))
@@ -366,6 +381,27 @@ def _filterKinds(store, fused, kinds):
     ).fetchall()
     kindById = {r[0]: r[1] for r in rows}
     return [pair for pair in fused if kindById.get(pair[0]) in kindSet]
+
+
+def _agentAtomSet(store, agent):
+    """Live-or-not atom ids that carry at least one provenance.agent match.
+
+    Stamped-only: NULL rows are not a silent majority. An atom with two
+    provenance rows (heph and grok) is in both sets. Used as a filterSet so
+    candidate generation is restricted, not just the fused tail.
+    """
+    if isinstance(agent, str):
+        wanted = (agent,)
+    else:
+        wanted = tuple(a for a in agent if a)
+    if not wanted:
+        return set()
+    ph = ",".join("?" for _ in wanted)
+    rows = store._conn.execute(
+        f"SELECT DISTINCT atom_id FROM provenance WHERE agent IN ({ph})",
+        wanted,
+    ).fetchall()
+    return {r[0] for r in rows}
 
 
 def _filterAgent(store, fused, agent):

@@ -203,7 +203,7 @@ def _stub_recall_dependencies(monkeypatch, fused, reranked):
         "boostSet": set(),
         "filterSet": None,
     })
-    monkeypatch.setattr(engine, "bm25", lambda store, query, k, kinds=None: [])
+    monkeypatch.setattr(engine, "bm25", lambda store, query, k, kinds=None, agent=None: [])
     monkeypatch.setattr(engine, "dense", lambda index, embedder, query, k: [])
     monkeypatch.setattr(engine, "rrf", lambda hits: list(fused))
     monkeypatch.setattr(engine, "applyPriors", lambda fusedPairs, store, hints: fusedPairs)
@@ -291,7 +291,7 @@ def test_rerank_head_is_interleaved_across_classes(store, monkeypatch):
     seen = {}
     monkeypatch.setattr(engine, "facetSignal",
                         lambda store, hints: {"boostSet": set(), "filterSet": None})
-    monkeypatch.setattr(engine, "bm25", lambda store, query, k, kinds=None: [])
+    monkeypatch.setattr(engine, "bm25", lambda store, query, k, kinds=None, agent=None: [])
     monkeypatch.setattr(engine, "dense", lambda index, embedder, query, k: [])
     monkeypatch.setattr(engine, "rrf", lambda hits: list(fused))
     monkeypatch.setattr(engine, "applyPriors",
@@ -502,6 +502,22 @@ def test_kinds_filter_excluding_everything_returns_sentinel(store, embedder):
     assert out["results"] == []
     assert out["payload"] == SENTINEL_LOW_CONFIDENCE
     assert out["lowConfidence"] is True
+
+
+def test_bm25_agent_scopes_the_candidate_universe(store):
+    # Theia-tail analogue for retrieve: the top-k must be drawn FROM grok's
+    # stamps, not post-filtered from a global list that already dropped her.
+    from recall.signals import bm25
+    grokId = _put(store, "zanthic modem calibration grok-lane", agent="grok")
+    hephId = _put(store, "zanthic modem calibration heph-lane", agent="heph")
+    hits = bm25(store, "zanthic modem", k=10, agent="grok")
+    ids = [atomId for atomId, _ in hits]
+    assert grokId in ids, (
+        f"bm25-agent-universe rule violated: grok stamp missing ids={ids}"
+    )
+    assert hephId not in ids, (
+        f"bm25-agent-universe rule violated: heph stamp in grok universe ids={ids}"
+    )
 
 
 def test_filter_agent_keeps_stamped_drops_null_and_other(store):

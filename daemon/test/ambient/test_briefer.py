@@ -699,8 +699,9 @@ def test_document_chunk_never_in_active(store):
     )
 
 
-def test_grok_hook_daemon_down_preserves_existing_brief(tmp_path):
-    # P2 C4: fail-open, and a dead daemon must not truncate a good file.
+def test_grok_hook_daemon_down_does_not_keep_stale_brief(tmp_path):
+    # Session still starts (exit 0). Yesterday's VIEW must not stay standing
+    # law: replace with unavailable, do not keep the stale file.
     dest = tmp_path / "pensive-brief.md"
     dest.write_text("prior good brief\n", encoding="utf-8")
     env = {
@@ -718,9 +719,14 @@ def test_grok_hook_daemon_down_preserves_existing_brief(tmp_path):
         f"grok-hook fail-open rule violated: daemon-down exit={proc.returncode} "
         f"stderr={proc.stderr!r}"
     )
-    assert dest.read_text(encoding="utf-8") == "prior good brief\n", (
-        "grok-hook preserve-on-failure rule violated: existing brief was "
-        f"clobbered content={dest.read_text(encoding='utf-8')!r}"
+    text = dest.read_text(encoding="utf-8")
+    assert "pensive brief unavailable" in text, (
+        "stale-view-as-law rule violated: daemon-down left yesterday's brief "
+        f"content={text!r}"
+    )
+    assert "prior good brief" not in text, (
+        "stale-view-as-law rule violated: stale body survived "
+        f"content={text!r}"
     )
 
 
