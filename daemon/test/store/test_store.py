@@ -2,7 +2,7 @@ import sqlite3
 
 import pytest
 
-from store.store import openStore, CURRENT_SCHEMA_VERSION
+from store.store import openStore, CURRENT_SCHEMA_VERSION, putAtom, addFacet, facetsOf, removeFacet
 
 
 EXPECTED_TABLES = [
@@ -102,3 +102,32 @@ def test_open_refuses_future_schema_version(tmp_path):
 
     with pytest.raises(RuntimeError):
         openStore(dbfile)
+
+
+def test_remove_facet_is_idempotent_and_does_not_delete_the_atom(tmp_path):
+    s = openStore(tmp_path / "mem.db")
+    try:
+        aid = putAtom(s, {
+            "text": "CITATION (museum specimen, not a session memory)",
+            "kind": "atom",
+            "project": "charon",
+            "provenance": {"source": "explicit-emit"},
+        })
+        addFacet(s, aid, "pin", "true")
+        addFacet(s, aid, "tag", "poison-citation")
+        removeFacet(s, aid, "pin")
+        keys = {f["key"] for f in facetsOf(s, aid)}
+        assert "pin" not in keys, (
+            f"removeFacet-pin rule violated: pin survived facets={facetsOf(s, aid)!r}"
+        )
+        assert "tag" in keys, (
+            f"removeFacet-scope rule violated: unrelated tag was dropped "
+            f"facets={facetsOf(s, aid)!r}"
+        )
+        removeFacet(s, aid, "pin")  # idempotent
+        from store.store import getAtom
+        assert getAtom(s, aid) is not None, (
+            "removeFacet-atom-lifetime rule violated: unpin deleted the atom"
+        )
+    finally:
+        s.close()

@@ -56,6 +56,7 @@ from store.store import (
     logRecall,
     supersede,
     addFacet,
+    removeFacet,
     facetsOf,
     edgesFrom,
     edgesTo,
@@ -1310,6 +1311,17 @@ def handle_pin(ctx, args):
     return f"pinned {_HANDLE}{atomId} (ok)"
 
 
+def handle_unpin(ctx, args):
+    """Drop every ``key='pin'`` facet on ``atomId``. Idempotent. A missing
+    atom errors so a typo does not look like a successful unpin."""
+    _require(args, ["atomId"])
+    atomId = args["atomId"]
+    if getAtom(ctx.store, atomId) is None:
+        raise ValueError(f"unpin: atom {atomId!r} not found")
+    removeFacet(ctx.store, atomId, "pin")
+    return f"unpinned {_HANDLE}{atomId} (ok)"
+
+
 # --------------------------------------------------------------------------- #
 # Tool definitions                                                              #
 # --------------------------------------------------------------------------- #
@@ -1498,6 +1510,17 @@ NATIVE_TOOLS = [
         },
     ),
     Tool(
+        name="unpin",
+        description="Unpin an atom (drop its pin facet). Idempotent. The atom stays live.",
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "atomId": {"type": "string", "description": "The atom id to unpin"},
+            },
+            "required": ["atomId"],
+        },
+    ),
+    Tool(
         name="recall_records",
         description="Versioned structured recall records for kernel-owned memory adapters.",
         inputSchema=RECALL_RECORDS_INPUT_SCHEMA,
@@ -1522,6 +1545,7 @@ HANDLERS = {
     "history": handle_history,
     "correct": handle_correct,
     "pin": handle_pin,
+    "unpin": handle_unpin,
 }
 
 

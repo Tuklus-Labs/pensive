@@ -23,6 +23,7 @@ __all__ = [
     "atomCount",
     "addEdge",
     "addFacet",
+    "removeFacet",
     "facetsOf",
     "supersede",
     "edgesFrom",
@@ -381,6 +382,32 @@ def addFacet(store, atomId, key, value):
             "INSERT OR IGNORE INTO facets(atom_id, key, value) VALUES (?, ?, ?)",
             (atomId, key, value),
         )
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+
+
+def removeFacet(store, atomId, key, value=None):
+    """Drop a facet membership fact. Idempotent: missing row is a no-op.
+
+    ``value=None`` removes every facet with that ``key`` on ``atomId`` (the
+    unpin case: production pins are ``true``, tests use ``1`` or a rank).
+    The atom itself is not touched. A missing atom is also a no-op at this
+    layer; callers that need a loud miss check ``getAtom`` first.
+    """
+    conn = store._conn
+    try:
+        if value is None:
+            conn.execute(
+                "DELETE FROM facets WHERE atom_id = ? AND key = ?",
+                (atomId, key),
+            )
+        else:
+            conn.execute(
+                "DELETE FROM facets WHERE atom_id = ? AND key = ? AND value = ?",
+                (atomId, key, value),
+            )
         conn.commit()
     except Exception:
         conn.rollback()

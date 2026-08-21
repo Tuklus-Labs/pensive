@@ -251,7 +251,7 @@ def test_compat_tool_schemas_are_verbatim():
 
 def test_native_tools_present_with_required_fields():
     names = {t.name for t in NATIVE_TOOLS}
-    assert names == {"recall", "history", "correct", "pin", "recall_records"}, (
+    assert names == {"recall", "history", "correct", "pin", "unpin", "recall_records"}, (
         f"native-tool set rule violated: names={sorted(names)!r}"
     )
     expectedRequired = {
@@ -260,6 +260,7 @@ def test_native_tools_present_with_required_fields():
         "history": ["atomId"],
         "correct": ["oldAtomId", "newText"],
         "pin": ["atomId"],
+        "unpin": ["atomId"],
     }
     for name, required in expectedRequired.items():
         actual = _tool(NATIVE_TOOLS, name).inputSchema["required"]
@@ -945,6 +946,27 @@ def test_pin_is_idempotent_and_missing_atom_errors(ctx):
     # Daemon keeps serving after the failed pin.
     ok, e4 = dispatch(ctx, "pin", {"atomId": aid})
     assert e4 is False
+
+
+def test_unpin_is_idempotent_and_missing_atom_errors(ctx):
+    aid = _put(ctx.store, "a pinnable atom", project="aegis")
+    dispatch(ctx, "pin", {"atomId": aid})
+    one, e1 = dispatch(ctx, "unpin", {"atomId": aid})
+    two, e2 = dispatch(ctx, "unpin", {"atomId": aid})
+    assert e1 is False and e2 is False, (
+        f"unpin-idempotent rule violated: first=({one!r},{e1}) second=({two!r},{e2})"
+    )
+    pins = [f for f in facetsOf(ctx.store, aid) if f["key"] == "pin"]
+    assert pins == [], (
+        f"unpin-clears-pin rule violated: pin facets survived={pins!r}"
+    )
+    assert getAtom(ctx.store, aid) is not None, (
+        "unpin-atom-lifetime rule violated: unpin deleted the atom"
+    )
+    bad, e3 = dispatch(ctx, "unpin", {"atomId": "01MISSINGXXXXXXXXXXXXXXXXXX"})
+    assert e3 is True and "error:" in bad, (
+        f"unpin-missing-atom rule violated: result={bad!r} isError={e3}"
+    )
 
 
 def test_unknown_tool_is_an_error_response(ctx):
