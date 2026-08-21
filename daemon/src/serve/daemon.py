@@ -79,6 +79,23 @@ def _setProcTitle():
         _log(f"setproctitle unavailable ({exc}); process name unchanged")
 
 
+def _warmReranker():
+    """Load the cross-encoder if it will import. Never take the daemon down.
+
+    Serve-path L2/L3 do not run the reranker (CPU, 3164ms for 50 pairs). Startup
+    still used to import it unconditionally, so a torchcodec/FFmpeg mismatch
+    crash-looped pensive-v3 on every restart while the already-running process
+    kept answering. Fail open: log, serve without it.
+    """
+    try:
+        from recall.rerank import _getReranker
+        _getReranker()
+        return True
+    except Exception as exc:
+        _log(f"cross-encoder warmup failed; serving without rerank ({exc})")
+        return False
+
+
 def buildContext():
     """Open the store, load the models, warm the reranker, build the index."""
     storePath = Path(os.environ.get("PENSIVE_V3_STORE", str(_DEFAULT_STORE)))
@@ -101,9 +118,7 @@ def buildContext():
     _log(f"embedder runtime: {type(embedder).__name__} on {embedder.device}")
 
     _log("warming cross-encoder reranker")
-    from recall.rerank import _getReranker
-
-    _getReranker()
+    _warmReranker()
 
     # Aux dense signal (optional): construction failure means feature-off, never
     # a dead daemon -- recall must come up on base signals no matter what.
