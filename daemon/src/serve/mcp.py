@@ -46,7 +46,7 @@ from mcp.types import CallToolResult, TextContent, Tool
 
 from recall.engine import recall, DEFAULT_TIER, TIERS
 from recall.embedder import embedMissing, embedOne, blobToVec
-from recall.strata import KIND_CLASSES
+from recall.strata import KIND_CLASSES, MEMORY_KINDS
 from recall.vector_index import buildClassIndexes, selectIndex
 from recall.payload import assembleTier2, estimateTokens
 from serve import viz
@@ -922,9 +922,15 @@ def handle_pensive_recall(ctx, args):
         ctx.store, ctx.indexes, ctx.embedder, query,
         project=project, k=limit, tokenBudget=ctx.defaultTokenBudget,
         aux=ctx.aux,
-        # L2: authored memory. This is the listing tool live agents call.
-        # Passing rerankEnabled=False without a tier used to walk 93% chunks.
-        tier=DEFAULT_TIER,
+        # L2 corpus, but do NOT pass tier=. tierDefaults overrides kinds, and
+        # test_the_compat_handlers_do_not_override_the_callers_kinds forbids
+        # that on this handler. kinds=MEMORY_KINDS is the L2 set without
+        # clobbering a caller who cannot even send kinds (compat schema has none).
+        # rerankEnabled=False: without it, signature default True runs the
+        # cross-encoder. Do not pass a tier here.
+        kinds=list(MEMORY_KINDS),
+        rerankEnabled=False,
+        enrich=True,
     )
     results = out["results"]
     if not results:
@@ -1015,21 +1021,22 @@ def handle_recall(ctx, args):
         "tokenBudget": tokenBudget,
         "aux": ctx.aux,
     }
-    if kinds is not None:
-        # Caller named a corpus. Do not let default L2 override it (that is
-        # how kinds became a schema lie: extracted, then dropped).
-        recallKw["kinds"] = kinds
-        recallKw["rerankEnabled"] = False
-        logTier = "kinds"
-    else:
-        recallKw["tier"] = tier
-        logTier = tier
     if agent:
         recallKw["agent"] = agent
-    out = recall(
-        ctx.store, ctx.indexes, ctx.embedder, query,
-        **recallKw,
-    )
+    if kinds is not None:
+        # Caller named a corpus. Do not pass tier= here: tierDefaults would
+        # overwrite kinds (that is how kinds became a schema lie).
+        out = recall(
+            ctx.store, ctx.indexes, ctx.embedder, query,
+            kinds=kinds, rerankEnabled=False, **recallKw,
+        )
+        logTier = "kinds"
+    else:
+        out = recall(
+            ctx.store, ctx.indexes, ctx.embedder, query,
+            tier=tier, **recallKw,
+        )
+        logTier = tier
     response = out["payload"]
     _logReturnedRecall(ctx, out, query, f"mcp.recall.{logTier}")
     return response

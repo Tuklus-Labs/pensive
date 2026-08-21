@@ -420,8 +420,10 @@ def test_recall_records_accepts_inclusive_argument_endpoints(monkeypatch, ctx): 
     }, f"default-argument rule violated: keywords={calls[3][1]!r}"
 
 
-def test_pensive_recall_passes_l2_tier(monkeypatch, ctx):
-    # I11: the listing tool must not walk document_chunk by default.
+def test_pensive_recall_defaults_to_memory_kinds_without_a_tier(monkeypatch, ctx):
+    # I11: listing tool must not walk document_chunk. Must not pass tier=, which
+    # would override kinds (test_the_compat_handlers_do_not_override_the_callers_kinds).
+    from recall.strata import MEMORY_KINDS
     calls = []
 
     def fakeRecall(*args, **kwargs):
@@ -430,11 +432,17 @@ def test_pensive_recall_passes_l2_tier(monkeypatch, ctx):
 
     monkeypatch.setattr(mcp_module, "recall", fakeRecall)
     dispatch(ctx, "pensive_recall", {"query": "q"})
-    assert calls and calls[0].get("tier") == "L2", (
-        f"pensive_recall L2-default rule violated: keywords={calls[0] if calls else None!r}"
+    assert calls, "pensive_recall L2-default rule violated: engine not called"
+    kw = calls[0]
+    assert "tier" not in kw, (
+        f"pensive_recall must not pass tier= (overrides kinds) keywords={kw!r}"
     )
-    assert "rerankEnabled" not in calls[0] or calls[0].get("rerankEnabled") is False, (
-        f"pensive_recall rerank-off rule violated: keywords={calls[0]!r}"
+    assert tuple(kw.get("kinds") or ()) == tuple(MEMORY_KINDS), (
+        f"pensive_recall L2-default rule violated: kinds={kw.get('kinds')!r} "
+        f"expected={MEMORY_KINDS!r}"
+    )
+    assert kw.get("rerankEnabled") is False, (
+        f"pensive_recall rerank-off rule violated: keywords={kw!r}"
     )
 
 
