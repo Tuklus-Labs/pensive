@@ -19,6 +19,7 @@ __all__ = [
     "migrate",
     "CURRENT_SCHEMA_VERSION",
     "putAtom",
+    "correctAtom",
     "getAtom",
     "atomCount",
     "addEdge",
@@ -127,6 +128,45 @@ def _invalidateSignalCaches(store):
         return
     invalidateSignalCaches(store)
 
+
+def _insertAtom(conn, atomId, atomInput, now):
+    """Insert an atom on ``conn`` without committing."""
+    conn.execute(
+        "INSERT INTO atoms(id, text, kind, project, created_at, occurred_at, "
+        "importance, status, schema_version) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        (
+            atomId,
+            atomInput["text"],
+            atomInput["kind"],
+            atomInput.get("project"),
+            now,
+            atomInput.get("occurredAt"),
+            atomInput.get("importance", 0.0),
+            "live",
+            CURRENT_SCHEMA_VERSION,
+        ),
+    )
+
+
+def _insertProvenance(conn, atomId, provInput, now):
+    """Insert one provenance row on ``conn`` and return its id."""
+    provId = ulid()
+    conn.execute(
+        "INSERT INTO provenance(id, atom_id, source, session_id, agent, "
+        "source_ref, recorded_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+        (
+            provId,
+            atomId,
+            provInput["source"],
+            provInput.get("sessionId"),
+            provInput.get("agent"),
+            provInput.get("sourceRef"),
+            now,
+        ),
+    )
+    return provId
+
 def putAtom(store, atomInput):
     """Write one atom and its single provenance row in one transaction.
 
@@ -147,35 +187,8 @@ def putAtom(store, atomInput):
     atomId = ulid()
     prov = atomInput["provenance"]
     try:
-        conn.execute(
-            "INSERT INTO atoms(id, text, kind, project, created_at, occurred_at, "
-            "importance, status, schema_version) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-            (
-                atomId,
-                atomInput["text"],
-                atomInput["kind"],
-                atomInput.get("project"),
-                now,
-                atomInput.get("occurredAt"),
-                atomInput.get("importance", 0.0),
-                "live",
-                CURRENT_SCHEMA_VERSION,
-            ),
-        )
-        conn.execute(
-            "INSERT INTO provenance(id, atom_id, source, session_id, agent, "
-            "source_ref, recorded_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
-            (
-                ulid(),
-                atomId,
-                prov["source"],
-                prov.get("sessionId"),
-                prov.get("agent"),
-                prov.get("sourceRef"),
-                now,
-            ),
-        )
+        _insertAtom(conn, atomId, atomInput, now)
+        _insertProvenance(conn, atomId, prov, now)
         conn.commit()
         _invalidateSignalCaches(store)
     except Exception:
@@ -184,6 +197,87 @@ def putAtom(store, atomInput):
         conn.rollback()
         raise
     return atomId
+
+
+def _staleCorrectionError(conn, oldId, status):
+    successors = [
+        row[0]
+        for row in conn.execute(
+            "SELECT src_atom FROM edges "
+            "WHERE dst_atom = ? AND type = 'supersedes' ORDER BY id",
+            (oldId,),
+        ).fetchall()
+    ]
+    guidance = "inspect history before retrying"
+    if successors:
+        handles = ", ".join(f"p3://{atomId}" for atomId in successors)
+        guidance = f"known successor handle(s): {handles}; {guidance}"
+    return ValueError(
+        f"correct: atom {oldId!r} is not live (status={status!r}); {guidance}"
+    )
+
+
+def correctAtom(store, oldId, atomInput):
+    """Correct one live atom in a single canonical SQLite transaction.
+
+    The successor, its authorship and supersession provenance, retained metadata,
+    supersedes edge, and predecessor status are committed together. A write lock
+    is acquired before reading the predecessor, and the status update repeats the
+    live predicate as a compare-and-swap so two connections cannot both win.
+    ``oldId`` remains readable. The return value is the successor's bare id.
+
+    Only pin and tag facets are carried forward. Entity facets describe the old
+    content and are deliberately not asserted about the replacement text.
+    """
+    conn = store._conn
+    newId = ulid()
+    prov = atomInput["provenance"]
+    now = _now()
+    try:
+        # SQLite serializes competing writers before either writer observes the
+        # predecessor. This closes the read-then-write race between connections.
+        conn.execute("BEGIN IMMEDIATE")
+        old = conn.execute(
+            "SELECT kind, project, occurred_at, importance, status "
+            "FROM atoms WHERE id = ?",
+            (oldId,),
+        ).fetchone()
+        if old is None:
+            raise ValueError(f"correct: atom {oldId!r} not found")
+        kind, project, occurredAt, importance, status = old
+        if status != "live":
+            raise _staleCorrectionError(conn, oldId, status)
+
+        _insertAtom(conn, newId, {
+            "text": atomInput["text"],
+            "kind": kind,
+            "project": project,
+            "occurredAt": occurredAt,
+            "importance": importance,
+        }, now)
+        # Keep the replacement's authorship separate from the supersession event.
+        _insertProvenance(conn, newId, prov, now)
+        edgeProvId = _insertProvenance(conn, newId, prov, now)
+        _insertEdge(conn, newId, oldId, "supersedes", 1.0, edgeProvId)
+        conn.execute(
+            "INSERT INTO facets(atom_id, key, value) "
+            "SELECT ?, key, value FROM facets "
+            "WHERE atom_id = ? AND key IN ('pin', 'tag')",
+            (newId, oldId),
+        )
+        changed = conn.execute(
+            "UPDATE atoms SET status = 'superseded' "
+            "WHERE id = ? AND status = 'live'",
+            (oldId,),
+        ).rowcount
+        if changed != 1:
+            raise _staleCorrectionError(conn, oldId, status)
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    _invalidateSignalCaches(store)
+    return newId
 
 
 def logRecall(store, atomIds, query=None, sourceRef=None, weight=1.0):
@@ -211,14 +305,20 @@ def logRecall(store, atomIds, query=None, sourceRef=None, weight=1.0):
     return len(ids)
 
 
-def getAtom(store, atomId):
+def getAtom(store, atomId, *, provenanceLimit=None):
     """Return the atom ``atomId`` as a dict with its provenance list, or None.
 
     The returned shape is ``{id, text, kind, project, createdAt, occurredAt,
     importance, status, schemaVersion, provenance: [ {id, atomId, source,
     sessionId, agent, sourceRef, recordedAt}, ... ]}``. Provenance rows are
-    ordered by their ULID, i.e. write order. Missing atom -> None.
+    ordered by their ULID, i.e. write order. ``provenanceLimit`` optionally
+    bounds that ordered prefix; it must be a positive integer. Missing atom ->
+    None.
     """
+    if provenanceLimit is not None and (
+        type(provenanceLimit) is not int or provenanceLimit <= 0
+    ):
+        raise ValueError("getAtom: provenanceLimit must be a positive integer")
     conn = store._conn
     atomRow = conn.execute(
         "SELECT id, text, kind, project, created_at, occurred_at, importance, "
@@ -227,11 +327,15 @@ def getAtom(store, atomId):
     ).fetchone()
     if atomRow is None:
         return None
-    provRows = conn.execute(
+    provenanceSql = (
         "SELECT id, atom_id, source, session_id, agent, source_ref, recorded_at "
-        "FROM provenance WHERE atom_id = ? ORDER BY id",
-        (atomId,),
-    ).fetchall()
+        "FROM provenance WHERE atom_id = ? ORDER BY id"
+    )
+    provenanceParams = [atomId]
+    if provenanceLimit is not None:
+        provenanceSql += " LIMIT ?"
+        provenanceParams.append(provenanceLimit)
+    provRows = conn.execute(provenanceSql, provenanceParams).fetchall()
     return {
         "id": atomRow[0],
         "text": atomRow[1],
@@ -445,20 +549,7 @@ def supersede(store, oldId, newId, provInput):
     conn = store._conn
     now = _now()
     try:
-        provId = ulid()
-        conn.execute(
-            "INSERT INTO provenance(id, atom_id, source, session_id, agent, "
-            "source_ref, recorded_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
-            (
-                provId,
-                newId,
-                provInput["source"],
-                provInput.get("sessionId"),
-                provInput.get("agent"),
-                provInput.get("sourceRef"),
-                now,
-            ),
-        )
+        provId = _insertProvenance(conn, newId, provInput, now)
         _insertEdge(conn, newId, oldId, "supersedes", 1.0, provId)
         conn.execute(
             "UPDATE atoms SET status = 'superseded' WHERE id = ?",

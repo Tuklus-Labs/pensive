@@ -269,6 +269,18 @@ def test_recall_records_schemas_are_strict():  # I1, B8, C2
         f"provenance-required-content rule violated: "
         f"schema={recordSchema['properties']['provenance']!r}"
     )
+    assert recordSchema["properties"]["provenanceTruncated"] == {
+        "type": "boolean", "const": True,
+    } and "provenanceTruncated" not in recordSchema["required"], (
+        f"optional-truncation-marker rule violated: schema={recordSchema!r}"
+    )
+    assert recordSchema["properties"]["estimatedTokens"]["maximum"] == (
+        9_007_199_254_740_991
+    ) and outputSchema["properties"]["estimatedTokens"]["maximum"] == 8000, (
+        "record-vs-envelope token ceiling rule violated: "
+        f"record={recordSchema['properties']['estimatedTokens']!r} "
+        f"envelope={outputSchema['properties']['estimatedTokens']!r}"
+    )
     assert recordSchema["properties"]["status"]["enum"] == ["live", "superseded"], (
         f"recallable-status rule violated: schema={recordSchema['properties']['status']!r}"
     )
@@ -737,9 +749,9 @@ def test_recall_records_bounds_schema_maximum_shape_without_building_it_all(
     calls = []
     originalGetAtom = mcp_module.getAtom
 
-    def trackedGetAtom(*args):
+    def trackedGetAtom(*args, **kwargs):
         calls.append(args[1])
-        return originalGetAtom(*args)
+        return originalGetAtom(*args, **kwargs)
 
     monkeypatch.setattr(mcp_module, "getAtom", trackedGetAtom)
     monkeypatch.setattr(mcp_module, "recall", lambda *a, **kw: _engineResult(ranked))
@@ -1212,8 +1224,8 @@ def test_recall_records_budget_starvation_serves_stub_not_empty(
     assert stub["id"] == bigId and stub["content"] != "y" * 60, (
         f"stub-identity rule violated: stub={stub!r}"
     )
-    assert "tokenBudget 10" in stub["content"] and "20-token" in stub["content"], (
-        f"stub-cost disclosure rule violated: content={stub['content']!r}"
+    assert "omitted" in stub["content"] and starved.value["estimatedTokens"] <= 10, (
+        f"stub notice must disclose omission within the budget: value={starved.value!r}"
     )
     assert stub["estimatedTokens"] == 20, (
         f"stub real-cost accounting rule violated: {stub['estimatedTokens']!r}"
@@ -1234,3 +1246,94 @@ def test_recall_records_budget_starvation_serves_stub_not_empty(
     assert empty.value["truncated"] is False, (
         f"no-match truncation-flag rule violated: value={empty.value!r}"
     )
+
+
+@pytest.mark.parametrize("total", [64, 65, 1000])
+def test_long_provenance_is_bounded_and_disclosed_without_losing_results(
+        monkeypatch, ctx, store, total):  # P1/P2/P4, RISK_MODEL_BOUNDED_RECORDS
+    rich = _put(store, "a memory with a long history")
+    tail = _put(store, "the next useful result")
+    _addProvenanceRows(store, rich, total - 1, sourceChars=8, textChars=8)
+    complete = getAtom(store, rich)["provenance"]
+    monkeypatch.setattr(mcp_module, "recall", lambda *a, **kw:
+                        _engineResult([_trust(rich), _trust(tail)]))
+    fetched_sizes = []
+    original = mcp_module.getAtom
+
+    def measured(*args, **kwargs):
+        atom = original(*args, **kwargs)
+        if atom and atom["id"] == rich:
+            fetched_sizes.append(len(atom["provenance"]))
+        return atom
+
+    monkeypatch.setattr(mcp_module, "getAtom", measured)
+    value, error = dispatch(ctx, "recall_records", {"query": "retained history"})
+    assert error is False, f"P1 valid long history must remain recallable: result={value!r}"
+    records = value.value["records"]
+    assert [row["id"] for row in records] == [rich, tail], (
+        "P1 one long history cannot lose adjacent results: "
+        f"recordIds={[row['id'] for row in records]!r}")
+    assert records[0]["provenance"] == complete[:64], (
+        f"P2 provenance prefix must remain exact: count={total}, "
+        f"servedIds={[row['id'] for row in records[0]['provenance']]!r}, "
+        f"expectedIds={[row['id'] for row in complete[:64]]!r}")
+    assert records[0].get("provenanceTruncated", False) is (total > 64), (
+        f"P2 truncated history must be disclosed: count={total}, "
+        f"marker={records[0].get('provenanceTruncated')!r}, "
+        f"servedCount={len(records[0]['provenance'])}")
+    assert value.value["truncated"] is (total > 64), (
+        f"P2 later records cannot clear earlier truncation: count={total}, "
+        f"truncated={value.value['truncated']!r}, "
+        f"recordIds={[row['id'] for row in records]!r}")
+    assert fetched_sizes and max(fetched_sizes) <= 65, (
+        f"P1 provenance reads must be bounded before rendering: sizes={fetched_sizes!r}")
+    assert len(getAtom(store, rich)["provenance"]) == total, (
+        f"P2 rendering must not delete canonical provenance: total={total}")
+    if total == 64:
+        assert "provenanceTruncated" not in records[0], (
+            f"P4 complete record shape must stay unchanged: keys={sorted(records[0])!r}")
+    jsonschema.validate(value.value, _tool("recall_records").outputSchema)
+    assert _wireBytes(value) <= mcp_module.MAX_RECALL_RECORDS_CALL_RESULT_BYTES, (
+        f"P4 truncation markers must be included in wire admission: bytes={_wireBytes(value)}")
+
+
+@pytest.mark.parametrize("budget", [1, 5, 10, 20, 80])
+def test_starved_record_notice_respects_body_budget_without_hiding_identity(
+        monkeypatch, ctx, store, budget):  # P3, RISK_MODEL_BOUNDED_RECORDS
+    atom = _put(store, "a long remembered decision " * 30)
+    real_cost = estimateTokens(getAtom(store, atom)["text"])
+    monkeypatch.setattr(mcp_module, "recall", lambda *a, **kw:
+                        _engineResult([_trust(atom)]))
+    value, error = dispatch(ctx, "recall_records", {
+        "query": "decision", "tokenBudget": budget})
+    assert error is False and len(value.value["records"]) == 1, (
+        f"P3 starved content retains a real handle: budget={budget}, value={value!r}")
+    stub = value.value["records"][0]
+    assert stub["id"] == atom and stub["estimatedTokens"] == real_cost, (
+        f"P3 retry metadata stays real: budget={budget}, stub={stub!r}")
+    assert value.value["truncated"] and value.value["estimatedTokens"] <= budget, (
+        f"P3 a notice must fit the body budget: budget={budget}, value={value.value!r}")
+    assert estimateTokens(stub["content"]) == value.value["estimatedTokens"], (
+        f"P3 body accounting matches actual notice: stub={stub!r}, value={value.value!r}")
+
+
+def test_starved_max_emit_body_preserves_full_cost_without_schema_failure(
+        monkeypatch, ctx, store):  # P3/P5, RISK_MODEL_BOUNDED_RECORDS
+    body = "x" * 32_000
+    atom = _put(store, body)
+    real_cost = estimateTokens(body)
+    monkeypatch.setattr(mcp_module, "recall", lambda *a, **kw:
+                        _engineResult([_trust(atom)]))
+
+    value, error = dispatch(ctx, "recall_records", {
+        "query": "maximum emit body", "tokenBudget": 8000})
+
+    assert error is False and len(value.value["records"]) == 1, (
+        f"P5 maximum-body stub must remain schema-valid: result={value!r}, error={error}")
+    stub = value.value["records"][0]
+    assert stub["id"] == atom and stub["estimatedTokens"] == real_cost > 8000, (
+        f"P5 maximum-body full-cost metadata must survive: cost={real_cost}, stub={stub!r}")
+    assert value.value["estimatedTokens"] <= 8000 and value.value["truncated"] is True, (
+        f"P5 maximum-body notice must respect body budget: value={value.value!r}")
+    assert _wireBytes(value) <= mcp_module.MAX_RECALL_RECORDS_CALL_RESULT_BYTES, (
+        f"P5 maximum-body stub must respect wire cap: bytes={_wireBytes(value)}")

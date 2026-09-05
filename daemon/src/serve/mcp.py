@@ -16,8 +16,8 @@ Two audiences share one server:
 - **Natives** (``recall``, ``history``, ``correct``, ``pin``, ``recall_records``).
   These expose the v3 capabilities the legacy names cannot: the rich tiered
   ``recall`` payload, a ``history`` view (Tier-2 neighborhood + supersession
-  chain), a one-flow ``correct`` (put + supersede, the trust layer's decades
-  rule), ``pin``, and bounded machine-readable records.
+  graph), an atomic ``correct`` operation, ``pin``, and bounded machine-readable
+  records.
 
 Design rules fixed by the task brief:
 
@@ -38,6 +38,7 @@ boundary directly against a real store and models without spawning the daemon.
 """
 from dataclasses import dataclass
 import json
+import re
 import uuid
 
 from jsonschema import Draft202012Validator
@@ -52,9 +53,9 @@ from recall.payload import assembleTier2, estimateTokens
 from serve import viz
 from store.store import (
     putAtom,
+    correctAtom,
     getAtom,
     logRecall,
-    supersede,
     addFacet,
     removeFacet,
     facetsOf,
@@ -84,6 +85,8 @@ _EMIT_SOURCE = "explicit-emit"
 # The handle scheme the payload layer uses; reused by history/correct so every
 # atom reference across the server anchors on one token.
 _HANDLE = "p3://"
+_MAX_RECORD_PROVENANCE = 64
+_ATOM_ID_RE = re.compile(r"^[0-7][0-9A-HJKMNP-TV-Z]{25}$")
 
 # Legacy pensive_recall never truncated its summary; a v3 atom body can be long,
 # so the compat listing collapses whitespace to one line and caps the length to
@@ -194,14 +197,17 @@ _RECORD_OUTPUT_SCHEMA = {
         "provenance": {
             "type": "array", "items": _PROVENANCE_OUTPUT_SCHEMA,
             "minItems": 1,
-            "maxItems": 64,
+            "maxItems": _MAX_RECORD_PROVENANCE,
         },
+        "provenanceTruncated": {"type": "boolean", "const": True},
         "score": {"type": "number"},
         "confidence": {"type": "number", "minimum": 0.0, "maximum": 1.0},
         "shouldTrust": {"type": "boolean"},
         "why": {"type": "string", "minLength": 1, "maxLength": 2048},
         "supersededBy": _NULLABLE_ID_SCHEMA,
-        "estimatedTokens": {"type": "integer", "minimum": 0, "maximum": 8000},
+        "estimatedTokens": {
+            "type": "integer", "minimum": 0, "maximum": _MAX_JSON_INTEGER,
+        },
     },
     "required": [
         "id", "kind", "project", "content", "createdAt", "occurredAt",
@@ -375,6 +381,28 @@ def _require(args, names):
         value = args.get(name)
         if value is None or (isinstance(value, str) and not value.strip()):
             raise ValueError(f"missing required field: {name}")
+
+
+def _normalizeAtomId(raw, field="atomId"):
+    """Accept a bare ULID or exactly one ``p3://`` prefix.
+
+    Native handles are displayed with ``p3://`` so agents can paste them back
+    into another tool. Keeping normalization at this boundary prevents a scheme
+    or a second prefix from becoming a late "not found" write-path decision.
+    """
+    if not isinstance(raw, str) or not raw:
+        raise ValueError(f"{field}: atom id must be a non-empty ULID or p3:// handle")
+    if raw.startswith(_HANDLE):
+        value = raw[len(_HANDLE):]
+        if value.startswith(_HANDLE):
+            raise ValueError(f"{field}: atom id must contain exactly one p3:// prefix")
+    else:
+        value = raw
+    if "://" in value or value.startswith(("ref:", "p3:/")):
+        raise ValueError(f"{field}: atom id has an unsupported scheme or ref prefix")
+    if not _ATOM_ID_RE.fullmatch(value):
+        raise ValueError(f"{field}: atom id must be a 26-character ULID")
+    return value
 
 
 # Provenance ``source`` values that identify a SYSTEM writer, not an agent. A
@@ -1078,6 +1106,7 @@ def handle_recall_records(ctx, args):
     records = []
     tokens = 0
     truncated = bool(ranked)
+    provenanceTruncated = False
 
     def makeStructured(candidateRecords, candidateTokens, candidateTruncated):
         return _structuredResult({
@@ -1099,15 +1128,14 @@ def handle_recall_records(ctx, args):
         )
 
     for index, result in enumerate(ranked):
-        atom = getAtom(ctx.store, result["atomId"])
+        atom = getAtom(ctx.store, result["atomId"],
+                       provenanceLimit=_MAX_RECORD_PROVENANCE + 1)
         if atom is None:
             raise ValueError(
                 f"recall_records: atom {result['atomId']!r} absent from the store"
             )
-        if len(atom["provenance"]) > 64:
-            raise ValueError(
-                f"recall_records: atom {atom['id']!r} has more than 64 provenance rows"
-            )
+        recordProvenanceTruncated = len(atom["provenance"]) > _MAX_RECORD_PROVENANCE
+        provenanceTruncated = provenanceTruncated or recordProvenanceTruncated
         recordTokens = estimateTokens(atom["text"])
         record = {
             "id": atom["id"],
@@ -1119,7 +1147,7 @@ def handle_recall_records(ctx, args):
             "importance": atom["importance"],
             "status": atom["status"],
             "atomSchemaVersion": atom["schemaVersion"],
-            "provenance": atom["provenance"],
+            "provenance": atom["provenance"][:_MAX_RECORD_PROVENANCE],
             "score": result["score"],
             "confidence": result["confidence"],
             "shouldTrust": result["shouldTrust"],
@@ -1127,6 +1155,10 @@ def handle_recall_records(ctx, args):
             "supersededBy": result.get("supersededBy"),
             "estimatedTokens": recordTokens,
         }
+        if recordProvenanceTruncated:
+            # Ordinary records retain their v1 shape. A long history stays in
+            # the store and is reachable through this record's history handle.
+            record["provenanceTruncated"] = True
         if tokens + recordTokens > tokenBudget:
             truncated = True
             if not records:
@@ -1146,6 +1178,10 @@ def handle_recall_records(ctx, args):
                     f"record's {recordTokens}-token body; metadata is real, "
                     f"body omitted, retry with a larger tokenBudget]"
                 )
+                if estimateTokens(stubContent) > tokenBudget:
+                    stubContent = f"[body omitted: {recordTokens} tokens]"
+                if estimateTokens(stubContent) > tokenBudget:
+                    stubContent = ""
                 stub = {**record, "content": stubContent}
                 stubTokens = estimateTokens(stubContent)
                 candidate = makeStructured([stub], stubTokens, True)
@@ -1159,7 +1195,7 @@ def handle_recall_records(ctx, args):
             break
         candidateRecords = [*records, record]
         candidateTokens = tokens + recordTokens
-        candidateTruncated = index < len(ranked) - 1
+        candidateTruncated = provenanceTruncated or index < len(ranked) - 1
         candidate = makeStructured(
             candidateRecords, candidateTokens, candidateTruncated)
         if (
@@ -1183,63 +1219,115 @@ def handle_recall_records(ctx, args):
 
 
 def _supersessionChain(store, atomId):
-    """The full supersession chain through ``atomId``, oldest id first.
+    """The supersession graph through ``atomId``, oldest members first.
 
     A supersedes edge points new -> old (src=new, dst=old). Walking
     ``edgesFrom(cur, 'supersedes')`` steps toward older atoms; walking
     ``edgesTo(cur, 'supersedes')`` steps toward newer ones. Both walks are guarded
     against a cycle by a seen-set (a corrupt cycle stops the walk rather than
     looping forever; the trust layer is where a cycle raises). A lone atom with no
-    supersedes edge returns ``[atomId]``.
+    supersedes edge returns ``[atomId]``. Legacy forks include every branch in
+    deterministic edge order.
     """
-    seen = {atomId}
-
-    older = []
-    cur = atomId
-    while True:
+    # First discover the whole undirected component. Starting from only the
+    # queried atom's ancestors and descendants misses a sibling branch reached
+    # by walking oldward to a fork and then newward down the other side.
+    component = {atomId}
+    pending = [atomId]
+    edgesById = {}
+    while pending:
+        cur = pending.pop()
         edges = edgesFrom(store, cur, "supersedes")
-        if not edges:
-            break
-        dst = edges[0]["dstAtom"]
-        if dst in seen:
-            break
-        older.append(dst)
-        seen.add(dst)
-        cur = dst
-    older.reverse()   # oldest first
+        edges.extend(edgesTo(store, cur, "supersedes"))
+        for edge in edges:
+            edgesById[edge["id"]] = edge
+            for neighbor in (edge["srcAtom"], edge["dstAtom"]):
+                if neighbor not in component:
+                    component.add(neighbor)
+                    pending.append(neighbor)
 
-    newer = []
-    cur = atomId
-    while True:
-        edges = edgesTo(store, cur, "supersedes")
-        if not edges:
-            break
-        src = edges[0]["srcAtom"]
-        if src in seen:
-            break
-        newer.append(src)
-        seen.add(src)
-        cur = src
+    # Render oldest to newest. In the stored direction (new -> old), an oldest
+    # root has no outgoing supersedes edge. Reverse each edge for a stable Kahn
+    # walk; sibling successors enter the queue in edge order. Corrupt cycles have
+    # no root, so append their still-unseen members by id after the acyclic part.
+    olderCount = {member: 0 for member in component}
+    newerByOld = {member: [] for member in component}
+    for edge in sorted(edgesById.values(), key=lambda item: item["id"]):
+        newer = edge["srcAtom"]
+        old = edge["dstAtom"]
+        olderCount[newer] += 1
+        newerByOld[old].append(newer)
 
-    return older + [atomId] + newer
+    ready = sorted(member for member, count in olderCount.items() if count == 0)
+    ordered = []
+    queued = set(ready)
+    while ready:
+        cur = ready.pop(0)
+        ordered.append(cur)
+        for newer in newerByOld[cur]:
+            olderCount[newer] -= 1
+            if olderCount[newer] == 0 and newer not in queued:
+                ready.append(newer)
+                queued.add(newer)
+    ordered.extend(sorted(component.difference(ordered)))
+    return ordered
 
 
 def handle_history(ctx, args):
-    """Tier-2 neighborhood for ``atomId`` plus its supersession chain.
+    """Tier-2 neighborhood for ``atomId`` plus its supersession graph.
 
     The Tier-2 block (via :func:`recall.payload.assembleTier2`) renders the atom's
     body, provenance, and LIVE outgoing edges. Because a supersedes edge points at
-    a NON-live (superseded) atom, the chain is rendered separately: one line per
-    chain member, oldest to newest, each with its live/superseded status. A
+    a NON-live (superseded) atom, the graph is rendered separately: one line per
+    reachable member, oldest to newest, each with its live/superseded status. A
     missing ``atomId`` raises (loud) via the payload layer's ``_fetch``.
     """
     _require(args, ["atomId"])
-    atomId = args["atomId"]
+    atomId = _normalizeAtomId(args["atomId"])
     block = assembleTier2(ctx.store, atomId)
     chain = _supersessionChain(ctx.store, atomId)
     if len(chain) <= 1:
         return block
-    lines = [block, "", "supersession chain (oldest to newest):"]
+    members = set(chain)
+    graphEdges = sorted(
+        (
+            edge
+            for member in chain
+            for edge in edgesFrom(ctx.store, member, "supersedes")
+            if edge["dstAtom"] in members
+        ),
+        key=lambda item: item["id"],
+    )
+    successorsByOld = {}
+    olderByNew = {}
+    for edge in graphEdges:
+        successors = successorsByOld.setdefault(edge["dstAtom"], [])
+        if edge["srcAtom"] not in successors:
+            successors.append(edge["srcAtom"])
+        older = olderByNew.setdefault(edge["srcAtom"], [])
+        if edge["dstAtom"] not in older:
+            older.append(edge["dstAtom"])
+    forks = [
+        (member, successorsByOld[member])
+        for member in chain
+        if len(successorsByOld.get(member, ())) > 1
+    ]
+    nonlinear = (
+        forks
+        or any(len(older) > 1 for older in olderByNew.values())
+        or len(graphEdges) != len(chain) - 1
+    )
+    heading = (
+        "supersession graph (oldest to newest; branches are parallel):"
+        if nonlinear
+        else "supersession chain (oldest to newest):"
+    )
+    lines = [block, "", heading]
+    for predecessor, successors in forks:
+        handles = ", ".join(f"{_HANDLE}{successor}" for successor in successors)
+        lines.append(
+            f"fork {_HANDLE}{predecessor} -> successor branches: {handles}"
+        )
     for cid in chain:
         atom = getAtom(ctx.store, cid)
         status = atom["status"] if atom else "missing"
@@ -1249,25 +1337,70 @@ def handle_history(ctx, args):
     return "\n".join(lines)
 
 
+def _maintainCorrectionIndexes(ctx, oldId, newId, kind):
+    """Maintain derived indexes after a committed correction.
+
+    Indexes live outside the SQLite transaction. If incremental maintenance
+    fails, rebuild the affected class. If recovery also fails, report the
+    committed successor so the caller can retry maintenance without issuing a
+    second correction.
+    """
+    try:
+        ctx.indexAtom(newId, kind)
+    except Exception as addError:
+        try:
+            ctx.reindex(kinds=(kind,))
+            return
+        except Exception as rebuildError:
+            details = [
+                f"incremental index add failed: {addError}",
+                f"class rebuild failed: {rebuildError}",
+            ]
+            try:
+                ctx.retireAtom(oldId, kind)
+            except Exception as retireError:
+                details.append(f"old-index retirement failed: {retireError}")
+            raise ValueError(
+                f"correct: correction COMMITTED as {_HANDLE}{newId}; "
+                + "; ".join(details)
+            ) from rebuildError
+    try:
+        ctx.retireAtom(oldId, kind)
+    except Exception as retireError:
+        try:
+            ctx.reindex(kinds=(kind,))
+        except Exception as rebuildError:
+            raise ValueError(
+                f"correct: correction COMMITTED as {_HANDLE}{newId}; "
+                f"old-index retirement failed: {retireError}; "
+                f"class rebuild failed: {rebuildError}"
+            ) from rebuildError
+
+
 def handle_correct(ctx, args):
-    """Create a corrected atom and supersede the old one, in one flow.
+    """Create a corrected atom and supersede the old one atomically.
 
     The new atom inherits the old atom's ``project`` and ``kind`` (a correction of
     a narrative is still a narrative) and carries the caller-supplied provenance
     (defaulting ``source`` to ``explicit-emit``, ``agent`` to the context agent).
     The old atom's existence is checked BEFORE the put so a missing target errors
-    cleanly without orphaning a freshly written atom. After both writes commit,
-    :meth:`ServeContext.reindex` makes the new atom recallable and the old atom
-    surfaces only chained (the trust layer's decades rule) on the next recall.
+    cleanly without orphaning a freshly written atom. After the canonical write
+    commits, incremental index maintenance makes the new atom recallable and the
+    old atom surfaces only chained (the trust layer's decades rule) on recall.
     """
     _require(args, ["oldAtomId", "newText"])
-    oldId = args["oldAtomId"]
+    oldId = _normalizeAtomId(args["oldAtomId"], "oldAtomId")
     newText = args["newText"]
+    if not isinstance(newText, str):
+        raise ValueError("correct: newText must be a string")
+    rawProvenance = args.get("provenance")
+    if rawProvenance is not None and not isinstance(rawProvenance, dict):
+        raise ValueError("correct: provenance must be an object")
     old = getAtom(ctx.store, oldId)
     if old is None:
         raise ValueError(f"correct: atom {oldId!r} not found")
 
-    prov = args.get("provenance") or {}
+    prov = rawProvenance or {}
     _rejectReservedSource(prov.get("source"))
     _rejectEscapingSourceRef(prov.get("sourceRef"))
     _boundedEmitText(newText, "correct: newText")
@@ -1289,16 +1422,11 @@ def handle_correct(ctx, args):
     if resolved:
         provenance["agent"] = resolved
 
-    newId = putAtom(ctx.store, {
+    newId = correctAtom(ctx.store, oldId, {
         "text": newText,
-        "kind": old["kind"],
-        "project": old["project"],
-        "importance": 0.0,
         "provenance": provenance,
     })
-    supersede(ctx.store, oldId, newId, provenance)
-    ctx.indexAtom(newId, old["kind"])
-    ctx.retireAtom(oldId, old["kind"])
+    _maintainCorrectionIndexes(ctx, oldId, newId, old["kind"])
     return f"corrected {_HANDLE}{oldId} -> {_HANDLE}{newId} (ok)"
 
 
@@ -1306,7 +1434,9 @@ def handle_pin(ctx, args):
     """Pin ``atomId`` via a ``key='pin'`` facet. Idempotent (facet INSERT OR
     IGNORE); a missing atom trips the facet foreign key and errors cleanly."""
     _require(args, ["atomId"])
-    atomId = args["atomId"]
+    atomId = _normalizeAtomId(args["atomId"])
+    if getAtom(ctx.store, atomId) is None:
+        raise ValueError(f"pin: atom {atomId!r} not found")
     addFacet(ctx.store, atomId, "pin", "true")
     return f"pinned {_HANDLE}{atomId} (ok)"
 
@@ -1315,7 +1445,7 @@ def handle_unpin(ctx, args):
     """Drop every ``key='pin'`` facet on ``atomId``. Idempotent. A missing
     atom errors so a typo does not look like a successful unpin."""
     _require(args, ["atomId"])
-    atomId = args["atomId"]
+    atomId = _normalizeAtomId(args["atomId"])
     if getAtom(ctx.store, atomId) is None:
         raise ValueError(f"unpin: atom {atomId!r} not found")
     removeFacet(ctx.store, atomId, "pin")
@@ -1437,7 +1567,7 @@ COMPAT_TOOLS = [
     ),
     Tool(
         name="pensive_analytics",
-        description="View Pensive query analytics: latency percentiles, SA/L2 agreement rates, recent misses, and source distribution.",
+        description="View v3 store counts by atom kind and status, plus embedding coverage for the active model.",
         inputSchema={
             "type": "object",
             "properties": {},
@@ -1475,22 +1605,22 @@ NATIVE_TOOLS = [
     ),
     Tool(
         name="history",
-        description="An atom's Tier-2 neighborhood (body, provenance, live edges) plus its full supersession chain.",
+        description="An atom's Tier-2 neighborhood (body, provenance, live edges) plus its supersession graph.",
         inputSchema={
             "type": "object",
             "properties": {
-                "atomId": {"type": "string", "description": "The atom id (p3:// handle without the scheme)"},
+                "atomId": {"type": "string", "description": "Bare atom ULID or displayed p3:// handle"},
             },
             "required": ["atomId"],
         },
     ),
     Tool(
         name="correct",
-        description="Correct an atom: write a new atom and supersede the old one in one flow. The old atom stays readable, chained to its successor. Returns the new atom id.",
+        description="Correct an atom atomically: write a successor and supersede the old one. The old atom stays readable, chained to its successor. Returns the new atom id.",
         inputSchema={
             "type": "object",
             "properties": {
-                "oldAtomId":  {"type": "string", "description": "Id of the atom being corrected"},
+                "oldAtomId":  {"type": "string", "description": "Bare atom ULID or displayed p3:// handle being corrected"},
                 "newText":    {"type": "string", "description": "The corrected atom body"},
                 "provenance": {"type": "object",
                                "description": "Optional provenance {source, agent?, sessionId?, sourceRef?}; source defaults to explicit-emit"},
@@ -1504,7 +1634,7 @@ NATIVE_TOOLS = [
         inputSchema={
             "type": "object",
             "properties": {
-                "atomId": {"type": "string", "description": "The atom id to pin"},
+                "atomId": {"type": "string", "description": "Bare atom ULID or displayed p3:// handle to pin"},
             },
             "required": ["atomId"],
         },
@@ -1515,7 +1645,7 @@ NATIVE_TOOLS = [
         inputSchema={
             "type": "object",
             "properties": {
-                "atomId": {"type": "string", "description": "The atom id to unpin"},
+                "atomId": {"type": "string", "description": "Bare atom ULID or displayed p3:// handle to unpin"},
             },
             "required": ["atomId"],
         },

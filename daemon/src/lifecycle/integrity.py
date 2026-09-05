@@ -91,12 +91,20 @@ def _supersessionSanity(conn):
     ).fetchall()
     dangling = []
     graph = {}
+    predecessors = {}
     for edgeId, src, dst in rows:
         srcExists = conn.execute("SELECT 1 FROM atoms WHERE id = ?", (src,)).fetchone()
         dstExists = conn.execute("SELECT 1 FROM atoms WHERE id = ?", (dst,)).fetchone()
         if srcExists is None or dstExists is None:
             dangling.append({"id": edgeId, "srcAtom": src, "dstAtom": dst})
         graph.setdefault(src, []).append(dst)
+        predecessors.setdefault(dst, []).append(src)
+
+    forked = [
+        {"atomId": atomId, "successors": sorted(set(successors))}
+        for atomId, successors in sorted(predecessors.items())
+        if len(set(successors)) > 1
+    ]
 
     cycles = []
     for start in graph:
@@ -110,7 +118,11 @@ def _supersessionSanity(conn):
                 elif nxt not in seen:
                     seen.add(nxt)
                     stack.append((nxt, path + [nxt]))
-    return {"danglingSuccessors": dangling, "cycles": cycles}
+    return {
+        "danglingSuccessors": dangling,
+        "cycles": cycles,
+        "forkedPredecessors": forked,
+    }
 
 
 def _checksums(conn):
@@ -154,6 +166,7 @@ def integrityScan(store, emit=None):
         or report["orphanProvenance"]
         or report["supersessionChains"]["danglingSuccessors"]
         or report["supersessionChains"]["cycles"]
+        or report["supersessionChains"]["forkedPredecessors"]
         or report["checksums"]["ftsMissingAtoms"]
     )
     report["warnings"] = _warnings(report)
