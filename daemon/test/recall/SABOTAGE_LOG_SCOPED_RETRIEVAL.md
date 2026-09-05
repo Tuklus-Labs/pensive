@@ -35,6 +35,6 @@ The corresponding assertion mutation added
 `PENSIVE_WEAKEN_TEST=<test>`. Production runs exited 1; weakened-test runs exited
 0. The temporary plugin is outside the repository and is not part of the diff.
 
-`mutmut` was also attempted for the wider daemon campaign, but it crashes while
-re-importing NumPy under CPython 3.14. The targeted plugin mutations above are the
-executed fallback; no result is inferred from the generic runner failure.
+Generic-run limitations for the wider daemon campaign are recorded in
+`SABOTAGE_LOG_TRUST_DELIVERY.md`. The targeted plugin mutations above are the
+executed evidence; no result is inferred from a failed or uncovered generic run.

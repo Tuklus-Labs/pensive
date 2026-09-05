@@ -35,8 +35,8 @@ the four scoped files were searched for mutation markers before final testing.
 ## Limits
 
 This is a targeted campaign over high-risk branches, not exhaustive mutation of
-every byte or two mutations per each of the 39 parameterized cases. The generic
-`mutmut` route was not repeated: the established Python 3.14 environment failure
-is a repeated NumPy import in mutated workers and does not measure these tests.
+every byte or two mutations per each of the 39 parameterized cases. Generic-run
+limitations are recorded in `../recall/SABOTAGE_LOG_TRUST_DELIVERY.md`; those
+attempts do not measure this correction test set.
 The campaign does not cover live daemon behavior, real HNSW/FAISS recovery,
 service restart, or a production database. Those operations were outside scope.

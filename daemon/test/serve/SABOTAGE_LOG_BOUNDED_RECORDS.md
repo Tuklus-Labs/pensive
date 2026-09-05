@@ -43,7 +43,8 @@ safe JSON integer maximum; the envelope body budget remains 8,000.
 
 This was a targeted campaign over the six requested source mutations and two
 assertion mutations. It is not exhaustive mutation of `mcp.py` or all 136
-assertions in the structured test file. Generic `mutmut` was not repeated: its
-known Python 3.14 worker path fails on repeated NumPy import even with plugin
-autoload disabled, so it does not produce trustworthy mutation evidence here.
+assertions in the structured test file. Generic-run limitations for this
+campaign are recorded in `../recall/SABOTAGE_LOG_TRUST_DELIVERY.md`; this file
+claims only its executed targeted mutations. Earlier wording attributed every
+generic-run failure to NumPy, which was too broad.
 No live database, service, GPU, or production index was used.
