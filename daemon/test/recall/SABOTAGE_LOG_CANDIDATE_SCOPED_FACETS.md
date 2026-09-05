@@ -27,4 +27,3 @@ evidence; the same mutant then failed.
 All mutation runs used the CPU-only text runtime with
 `HIP_VISIBLE_DEVICES=-1`, `ROCR_VISIBLE_DEVICES=-1`, and
 `CUDA_VISIBLE_DEVICES=-1`.
-

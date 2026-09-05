@@ -84,4 +84,3 @@
 | C3, framework trap | `test_candidate_scope_forces_atom_first_facet_index` |
 | B3 | Existing signal breadth constants cap the pool; verified by the engine spy in the frozen-clock test and documented inspection. |
 | P1 | Repository diff and schema/export suites; this change contains no store file. |
-

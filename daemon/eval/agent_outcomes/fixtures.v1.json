@@ -1,0 +1,446 @@
+{
+  "version": 1,
+  "description": "Frozen synthetic workflow outcome replay. This is not LongMemEval and is not a general-accuracy benchmark.",
+  "cases": [
+    {
+      "id": "case-01",
+      "category": "workflow",
+      "project": "aurora",
+      "taskId": "aurora-root",
+      "question": "What exact command validates an Aurora archive?",
+      "dialogue": [],
+      "memories": [
+        {
+          "key": "fact",
+          "body": "Aurora archive validator accepts aurora verify --manifest. The older aurora check command only checks config syntax.",
+          "kind": "atom"
+        }
+      ],
+      "checkpoints": [],
+      "siblings": [],
+      "expected": {
+        "answer": "aurora verify --manifest",
+        "abstained": false
+      }
+    },
+    {
+      "id": "case-02",
+      "category": "followup",
+      "project": "birch",
+      "taskId": "birch-root",
+      "question": "Which one should we use for it?",
+      "dialogue": [
+        {
+          "user": "We are repairing Birch report exports.",
+          "assistant": "I will look up the export procedure."
+        }
+      ],
+      "memories": [
+        {
+          "key": "fact",
+          "body": "Birch report exports require birch export --compat-v2. The default export format cannot be read by the deployed viewer.",
+          "kind": "atom"
+        }
+      ],
+      "checkpoints": [],
+      "siblings": [],
+      "expected": {
+        "answer": "birch export --compat-v2",
+        "abstained": false
+      }
+    },
+    {
+      "id": "case-03",
+      "category": "completed",
+      "project": "cedar",
+      "taskId": "cedar-root",
+      "question": "Continue the Cedar release; what exact next action remains?",
+      "dialogue": [
+        {
+          "user": "We are working on the Cedar release.",
+          "assistant": "I will check where this task stopped."
+        }
+      ],
+      "memories": [
+        {
+          "key": "snapshot-1",
+          "kind": "snapshot",
+          "body": "cedar task checkpoint revision 1, state active: Next action: publish cedar. The package is ready."
+        },
+        {
+          "key": "snapshot-2",
+          "kind": "snapshot",
+          "body": "cedar task checkpoint revision 2, state completed: Cedar was published and verified. Do not publish it again. Next action: monitor cedar."
+        }
+      ],
+      "checkpoints": [
+        [
+          "active",
+          "Next action: publish cedar. The package is ready."
+        ],
+        [
+          "completed",
+          "Cedar was published and verified. Do not publish it again. Next action: monitor cedar."
+        ]
+      ],
+      "siblings": [],
+      "expected": {
+        "answer": "monitor cedar",
+        "abstained": false
+      }
+    },
+    {
+      "id": "case-04",
+      "category": "blocked",
+      "project": "dune",
+      "taskId": "dune-root",
+      "question": "What exact item is blocking the Dune import?",
+      "dialogue": [
+        {
+          "user": "Resume the Dune import.",
+          "assistant": "I will recover its checkpoint."
+        }
+      ],
+      "memories": [
+        {
+          "key": "snapshot-1",
+          "kind": "snapshot",
+          "body": "dune task checkpoint revision 1, state active: Dune import is waiting for the source archive."
+        },
+        {
+          "key": "snapshot-2",
+          "kind": "snapshot",
+          "body": "dune task checkpoint revision 2, state blocked: The source archive arrived. The only blocker is the signed manifest."
+        }
+      ],
+      "checkpoints": [
+        [
+          "active",
+          "Dune import is waiting for the source archive."
+        ],
+        [
+          "blocked",
+          "The source archive arrived. The only blocker is the signed manifest."
+        ]
+      ],
+      "siblings": [],
+      "expected": {
+        "answer": "signed manifest",
+        "abstained": false
+      }
+    },
+    {
+      "id": "case-05",
+      "category": "parallel",
+      "project": "elm",
+      "taskId": "elm-root",
+      "question": "Which Elm artifact should this task build?",
+      "dialogue": [
+        {
+          "user": "This is the Elm documentation task.",
+          "assistant": "I will recover this task state."
+        }
+      ],
+      "memories": [
+        {
+          "key": "snapshot-1",
+          "kind": "snapshot",
+          "body": "elm task checkpoint revision 1, state active: This task must build elm-docs.tar. The runtime release belongs to a different task."
+        },
+        {
+          "key": "worker",
+          "kind": "snapshot",
+          "body": "elm worker task state active: This worker builds elm-runtime.tar; the runtime artifact is ready."
+        }
+      ],
+      "checkpoints": [
+        [
+          "active",
+          "This task must build elm-docs.tar. The runtime release belongs to a different task."
+        ]
+      ],
+      "siblings": [
+        [
+          "worker",
+          "active",
+          "This worker builds elm-runtime.tar; the runtime artifact is ready."
+        ]
+      ],
+      "expected": {
+        "answer": "elm-docs.tar",
+        "abstained": false
+      }
+    },
+    {
+      "id": "case-06",
+      "category": "false-premise",
+      "project": "fir",
+      "taskId": "fir-root",
+      "question": "Which Fir setting enables cloud sync? Return the setting name, or unsupported if unavailable.",
+      "dialogue": [],
+      "memories": [
+        {
+          "key": "fact",
+          "body": "The Fir installation is offline-only. Cloud sync is unsupported in this deployment; sync_enabled is not a valid setting.",
+          "kind": "atom"
+        }
+      ],
+      "checkpoints": [],
+      "siblings": [],
+      "expected": {
+        "answer": "unsupported",
+        "abstained": false
+      }
+    },
+    {
+      "id": "case-07",
+      "category": "absent",
+      "project": "gale",
+      "taskId": "gale-root",
+      "question": "What is the approved Gale retention period in days?",
+      "dialogue": [],
+      "memories": [
+        {
+          "key": "fact",
+          "body": "Gale records use daily partitions. The retention proposal is still awaiting a decision; no retention period has been approved.",
+          "kind": "atom"
+        }
+      ],
+      "checkpoints": [],
+      "siblings": [],
+      "expected": {
+        "answer": null,
+        "abstained": true
+      }
+    },
+    {
+      "id": "case-08",
+      "category": "missing",
+      "project": "hazel",
+      "taskId": "hazel-root",
+      "question": "What is the Hazel production account number?",
+      "dialogue": [],
+      "memories": [
+        {
+          "key": "fact",
+          "body": "Hazel packaging uses signed checksums and a text manifest.",
+          "kind": "atom"
+        }
+      ],
+      "checkpoints": [],
+      "siblings": [],
+      "expected": {
+        "answer": null,
+        "abstained": true
+      }
+    },
+    {
+      "id": "case-09",
+      "category": "correction",
+      "project": "iris",
+      "taskId": "iris-root",
+      "question": "What is the current Iris health-check port?",
+      "dialogue": [],
+      "memories": [
+        {
+          "key": "fact",
+          "body": "Iris health checks now use port 7341. The previous value 7314 was a transcription error.",
+          "kind": "atom"
+        }
+      ],
+      "checkpoints": [],
+      "siblings": [],
+      "expected": {
+        "answer": "7341",
+        "abstained": false
+      }
+    },
+    {
+      "id": "case-10",
+      "category": "standalone",
+      "project": "juniper",
+      "taskId": "juniper-root",
+      "question": "For Juniper backups, what exact file proves that the archive passed verification?",
+      "dialogue": [
+        {
+          "user": "We were discussing Fir sync.",
+          "assistant": "Fir may need a separate check."
+        }
+      ],
+      "memories": [
+        {
+          "key": "fact",
+          "body": "A verified Juniper backup contains VERIFIED.manifest. archive.done only means compression finished.",
+          "kind": "atom"
+        }
+      ],
+      "checkpoints": [],
+      "siblings": [],
+      "expected": {
+        "answer": "VERIFIED.manifest",
+        "abstained": false
+      }
+    },
+    {
+      "id": "case-11",
+      "category": "short-question",
+      "project": "kelp",
+      "taskId": "kelp-root",
+      "question": "Any blockers?",
+      "dialogue": [
+        {
+          "user": "We are continuing the Kelp catalog import.",
+          "assistant": "I will recover the import state."
+        }
+      ],
+      "memories": [
+        {
+          "key": "snapshot-1",
+          "kind": "snapshot",
+          "body": "kelp task checkpoint revision 1, state blocked: Kelp catalog import is blocked only by schema approval."
+        }
+      ],
+      "checkpoints": [
+        [
+          "blocked",
+          "Kelp catalog import is blocked only by schema approval."
+        ]
+      ],
+      "siblings": [],
+      "expected": {
+        "answer": "schema approval",
+        "abstained": false
+      }
+    },
+    {
+      "id": "case-12",
+      "category": "restart",
+      "project": "larch",
+      "taskId": "larch-root",
+      "question": "What exact command should I run to resume this Larch task?",
+      "dialogue": [
+        {
+          "user": "Resume the Larch image build after restart.",
+          "assistant": "I will look up the saved step."
+        }
+      ],
+      "memories": [
+        {
+          "key": "snapshot-1",
+          "kind": "snapshot",
+          "body": "larch task checkpoint revision 1, state active: The dependency download completed. Resume with larch package --reuse-cache."
+        }
+      ],
+      "checkpoints": [
+        [
+          "active",
+          "The dependency download completed. Resume with larch package --reuse-cache."
+        ]
+      ],
+      "siblings": [],
+      "expected": {
+        "answer": "larch package --reuse-cache",
+        "abstained": false
+      }
+    },
+    {
+      "id": "case-13",
+      "category": "gotcha",
+      "project": "maple",
+      "taskId": "maple-root",
+      "question": "Which Maple mode writes a report without modifying records?",
+      "dialogue": [],
+      "memories": [
+        {
+          "key": "fact",
+          "body": "Maple audit --preview still updates access timestamps. Only maple audit --report-only leaves records unchanged.",
+          "kind": "atom"
+        }
+      ],
+      "checkpoints": [],
+      "siblings": [],
+      "expected": {
+        "answer": "maple audit --report-only",
+        "abstained": false
+      }
+    },
+    {
+      "id": "case-14",
+      "category": "historical",
+      "project": "nori",
+      "taskId": "nori-root",
+      "question": "Before the Nori migration on September 2, what was its index format?",
+      "dialogue": [],
+      "memories": [
+        {
+          "key": "fact",
+          "body": "Nori migrated from zeta-2 to zeta-4 on September 2. Current format is zeta-4; immediately before migration the format was zeta-2.",
+          "kind": "atom"
+        }
+      ],
+      "checkpoints": [],
+      "siblings": [],
+      "expected": {
+        "answer": "zeta-2",
+        "abstained": false
+      }
+    },
+    {
+      "id": "case-15",
+      "category": "fresh-user",
+      "project": "oak",
+      "taskId": "oak-root",
+      "question": "Use the updated Oak destination I just gave you. What is it?",
+      "dialogue": [
+        {
+          "user": "Oak uploads must now go to oak-new. This replaces oak-old.",
+          "assistant": "Understood."
+        }
+      ],
+      "memories": [
+        {
+          "key": "fact",
+          "body": "Oak uploads historically go to oak-old.",
+          "kind": "atom"
+        }
+      ],
+      "checkpoints": [],
+      "siblings": [],
+      "expected": {
+        "answer": "oak-new",
+        "abstained": false
+      }
+    },
+    {
+      "id": "case-16",
+      "category": "state-only",
+      "project": "pine",
+      "taskId": "pine-root",
+      "question": "What exact Pine build target remains for this task?",
+      "dialogue": [
+        {
+          "user": "Continue the Pine build.",
+          "assistant": "I will recover its state."
+        }
+      ],
+      "memories": [
+        {
+          "key": "snapshot-1",
+          "kind": "snapshot",
+          "body": "pine task checkpoint revision 1, state active: The only remaining build target is pine-doc-index."
+        }
+      ],
+      "checkpoints": [
+        [
+          "active",
+          "The only remaining build target is pine-doc-index."
+        ]
+      ],
+      "siblings": [],
+      "expected": {
+        "answer": "pine-doc-index",
+        "abstained": false
+      }
+    }
+  ]
+}

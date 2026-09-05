@@ -12,4 +12,3 @@ Every assertion message:
 - states the rule in the present tense.
 
 Exemptions: none.
-
