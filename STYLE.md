@@ -1,5 +1,11 @@
 # pensive Engineering Style
 
+The standards below describe the standalone library in `src/pensive/` and its
+tests in `tests/`. Agent-memory work lives in `daemon/`; its natural-language
+recall and canonical-store contracts are summarized in
+[`daemon/README.md`](daemon/README.md). Library-specific rules about entity-exact
+queries, graph buffers and pickle persistence do not describe the v3 daemon.
+
 Pensive (`pypensive` on PyPI) is the spreading-activation retrieval core: a sparse bipartite entity-graph that answers entity-exact queries in sub-millisecond time at 50M+ documents, and the engine the wider AEGIS Engram/memory layer leans on for recall. The library is published; downstream callers `pip install pypensive` and trust the contract. The graph is also the substrate cognitive subsystems query when they reconstruct what the system knows. That makes correctness load-bearing in ways a one-off script never is.
 
 The failure modes that actually hurt here, grounded in this code:

@@ -1,5 +1,15 @@
 # Pensive
 
+Pensive's agent-memory service lives in [`daemon/`](daemon/README.md). It stores
+memories with provenance and correction history, and retrieves them using
+natural-language queries through MCP and HTTP.
+
+This repository also contains the independently packaged `pypensive` retrieval
+library described below. Its entity-exact query API is a different entry point
+from the agent-memory service.
+
+## Retrieval library
+
 Spreading activation retrieval for document collections. Sub-millisecond queries at 50M+ documents.
 
 Pensive builds a sparse entity graph from your documents using regex-based extraction, then retrieves answers via spreading activation -- a biologically-inspired algorithm where query terms "light up" connected entities and the activation spreads to relevant answers.
