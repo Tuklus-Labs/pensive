@@ -325,6 +325,10 @@ def facetSignal(store, hints):
       "filter to nothing", distinct from "no filter at all".
     - ``query`` (str): raw query text; entities extracted from it via the v2
       ``MegaExtractor`` boost the live atoms carrying a matching entity facet.
+    - ``candidateIds`` (iterable): restrict entity boosts to these atom IDs.
+      ``None`` or omission preserves the legacy global lookup; an empty iterable
+      is a real empty scope and skips entity extraction. Recall supplies its
+      fused candidates here because facets boost candidates but never create them.
 
     ``filterSet`` is the intersection of the project and time constraints, or
     ``None`` when neither is given (meaning "do not filter"). ``boostSet`` is a
@@ -363,17 +367,36 @@ def facetSignal(store, hints):
     # boostSet: live atoms whose entity facets match entities in the query text.
     boostSet = set()
     query = hints.get("query")
-    if query:
-        labels = {label for label, _etype in _getExtractor().extract(query)}
+    candidateIds = hints.get("candidateIds")
+    candidates = None
+    if candidateIds is not None:
+        candidates = tuple(dict.fromkeys(candidateIds))
+    if query and candidates != ():
+        labels = tuple(sorted({
+            label for label, _etype in _getExtractor().extract(query)
+        }))
         if labels:
-            placeholders = ",".join("?" for _ in labels)
-            rows = conn.execute(
-                "SELECT DISTINCT f.atom_id FROM facets f "
-                "JOIN atoms a ON a.id = f.atom_id "
-                "WHERE f.key = 'entity' AND a.status = 'live' "
-                f"AND f.value IN ({placeholders})",
-                tuple(labels),
-            ).fetchall()
+            labelPlaceholders = ",".join("?" for _ in labels)
+            if candidates is None:
+                rows = conn.execute(
+                    "SELECT DISTINCT f.atom_id FROM facets f "
+                    "JOIN atoms a ON a.id = f.atom_id "
+                    "WHERE f.key = 'entity' AND a.status = 'live' "
+                    f"AND f.value IN ({labelPlaceholders})",
+                    labels,
+                ).fetchall()
+            else:
+                candidatePlaceholders = ",".join("?" for _ in candidates)
+                rows = conn.execute(
+                    "SELECT DISTINCT f.atom_id FROM facets f "
+                    "INDEXED BY sqlite_autoindex_facets_1 "
+                    "JOIN atoms a INDEXED BY sqlite_autoindex_atoms_1 "
+                    "ON a.id = f.atom_id "
+                    f"WHERE f.atom_id IN ({candidatePlaceholders}) "
+                    "AND f.key = 'entity' AND a.status = 'live' "
+                    f"AND f.value IN ({labelPlaceholders})",
+                    (*candidates, *labels),
+                ).fetchall()
             boostSet = {r[0] for r in rows}
 
     return {"boostSet": boostSet, "filterSet": filterSet}

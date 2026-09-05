@@ -290,11 +290,6 @@ def recall(store, indexes, embedder, query, project=None, timeScope=None,
     if filterSet is not None and not filterSet:
         return _emptyResult(store, tokenBudget)
 
-    # Entity facets are a boost signal. Scope membership comes from the combined
-    # query above so project, time, kinds, and agent share one AND intersection.
-    facet = facetSignal(store, {"query": query})
-    boostSet = facet["boostSet"]
-
     # 2. Per-class candidate generation. classesForKinds(None) is every class;
     #    a kinds subset narrows to the overlapping classes. No class -> sentinel.
     classes = classesForKinds(kinds)
@@ -342,9 +337,6 @@ def recall(store, indexes, embedder, query, project=None, timeScope=None,
         signalHits.setdefault(atomId, set()).add("dense")
     for atomId, _ in oaHits:
         signalHits.setdefault(atomId, set()).update(("dense", "openai"))
-    for atomId in boostSet:
-        signalHits.setdefault(atomId, set()).add("facet")
-
     # 3. The combined filterSet is also a defensive pre-fusion boundary.
     if filterSet is not None:
         bmHits = [pair for pair in bmHits if pair[0] in filterSet]
@@ -358,6 +350,19 @@ def recall(store, indexes, embedder, query, project=None, timeScope=None,
     if aux is not None:
         signalLists.append(oaHits)
     fused = rrf(signalLists)
+    if not fused:
+        return _emptyResult(store, tokenBudget)
+
+    # Facets only boost candidates; they never generate them. Restricting the
+    # lookup to the fused pool preserves the old global-set intersection while
+    # avoiding materialization of every atom carrying a common entity label.
+    facet = facetSignal(
+        store,
+        {"query": query, "candidateIds": [atomId for atomId, _score in fused]},
+    )
+    boostSet = facet["boostSet"]
+    for atomId in boostSet:
+        signalHits.setdefault(atomId, set()).add("facet")
 
     # 5. Post-fusion facet boost, applied before priors. applyPriors re-sorts, so
     #    the boosted scores feed the ranking that decides the rerank head.
