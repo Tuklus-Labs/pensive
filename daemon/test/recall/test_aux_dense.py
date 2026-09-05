@@ -91,8 +91,11 @@ class FakeIndex:
     def __init__(self, pairs):
         self._pairs = list(pairs)
 
-    def search(self, vec, k):
-        return self._pairs[:k]
+    def search(self, vec, k, allowedIds=None):
+        pairs = self._pairs
+        if allowedIds is not None:
+            pairs = [pair for pair in pairs if pair[0] in allowedIds]
+        return pairs[:k]
 
 
 def fakeAux(pairs, embedder=None):

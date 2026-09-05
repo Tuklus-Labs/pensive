@@ -11,17 +11,16 @@ annotated results to the payload assembler:
 The ordering resolves ambiguities that span the parts, so it is fixed and worth
 stating in one place:
 
-- The project hint drives ``facetSignal``; its ``filterSet`` (when not None)
-  restricts the bm25 and dense candidate lists BEFORE fusion. A degenerate
-  window -- a real project with no live atoms -- yields an empty ``filterSet``,
-  which short-circuits to the low-confidence sentinel rather than an error.
-- The time window (``timeScope``) is applied EXACTLY ONCE, inside ``applyPriors``.
-  It is deliberately NOT also passed to ``facetSignal`` as a ``timeRange``; the
-  window must not be double-applied.
+- Explicit project, agent, narrow-kind, and effective-time constraints are
+  intersected before candidate generation. BM25 applies them in SQL before its
+  LIMIT; dense indexes apply the same allowed-ID set before their top-k.
+- ``timeScope`` also tells ``applyPriors`` to skip normal recency decay. Its
+  inclusive predicate is repeated there as a defensive check over the already
+  scoped candidates.
 - The facet ``boostSet`` is a post-fusion MULTIPLICATIVE boost (``* FACET_BOOST``)
   applied before priors, and its members count as a ``facet`` signal hit.
-- ``kinds`` filters the fused list in one batched SELECT BEFORE rerank, so the
-  rerank head is spent on eligible atoms.
+- A full kind class uses its prebuilt class index. A subset such as only
+  ``narrative`` also supplies an allowed-ID set before dense top-k.
 - ``now`` is sampled ONCE at entry and threaded to both the time prior and the
   trust layer, so every clock-dependent decision in a single call agrees.
 
@@ -39,7 +38,7 @@ on: ``{results, payload, tokensUsed, lowConfidence}``.
 import sys
 import time
 
-from recall.strata import classesForKinds, interleave, splitByClass
+from recall.strata import KIND_CLASSES, classesForKinds, interleave, splitByClass
 from recall.signals import bm25, dense, facetSignal
 from recall.fusion import rrf, applyPriors
 from recall.rerank import rerank
@@ -124,9 +123,24 @@ _SIGNAL_K = 200
 _auxFailures = 0
 
 
-def _auxHits(aux, query, k):
+class _OnceQueryEmbedder:
+    """Share one query embedding across per-class dense searches."""
+
+    def __init__(self, embedder):
+        self._embedder = embedder
+        self._vectors = None
+
+    def embed(self, texts):
+        if self._vectors is None:
+            self._vectors = self._embedder.embed(texts)
+        return self._vectors
+
+
+def _auxHits(aux, query, k, allowedIds=None, classNames=None):
     """Embed the query on the aux model and search its class indexes.
 
+    ``classNames`` selects the active kind classes before any per-index top-k;
+    ``allowedIds`` narrows each selected index when metadata adds a finer scope.
     Any failure returns ``[]``: the aux signal is optional evidence and recall
     must never fail because a remote embedder did. Failures log to stderr,
     throttled to power-of-two occurrences so a dead API cannot flood the journal.
@@ -145,9 +159,69 @@ def _auxHits(aux, query, k):
     if not vecs:
         return []
     hits = []
-    for index in aux.indexes.values():
-        hits.extend(index.search(vecs[0], k))
+    selected = set(classNames) if classNames is not None else None
+    for name, index in aux.indexes.items():
+        if selected is not None and name not in selected:
+            continue
+        if allowedIds is None:
+            hits.extend(index.search(vecs[0], k))
+        else:
+            hits.extend(index.search(vecs[0], k, allowedIds=allowedIds))
     return hits
+
+
+def _scopeAtomSet(store, project, timeScope, kinds, agent):
+    """Live atom IDs satisfying every explicit recall constraint, or None."""
+    clauses = ["a.status = 'live'"]
+    params = []
+    scoped = False
+
+    if project is not None:
+        scoped = True
+        clauses.append("a.project = ?")
+        params.append(project)
+    if timeScope is not None:
+        scoped = True
+        start, end = timeScope
+        clauses.append("COALESCE(a.occurred_at, a.created_at) BETWEEN ? AND ?")
+        params.extend((start, end))
+    if kinds is not None:
+        wantedKinds = tuple(kinds)
+        if not wantedKinds:
+            return set()
+        wantedSet = set(wantedKinds)
+        selectedClassKinds = {
+            kind
+            for _name, classKinds in KIND_CLASSES
+            if wantedSet.intersection(classKinds)
+            for kind in classKinds
+        }
+        # A whole class is already the index's native candidate universe. Only a
+        # narrower or partly unknown set needs an additional allowed-ID mask.
+        if wantedSet != selectedClassKinds:
+            scoped = True
+            ph = ",".join("?" for _ in wantedKinds)
+            clauses.append(f"a.kind IN ({ph})")
+            params.extend(wantedKinds)
+    if agent:
+        wantedAgents = (agent,) if isinstance(agent, str) else tuple(
+            value for value in agent if value)
+        if wantedAgents:
+            scoped = True
+            ph = ",".join("?" for _ in wantedAgents)
+            clauses.append(
+                "a.id IN (SELECT atom_id FROM provenance "
+                f"WHERE agent IN ({ph}))"
+            )
+            params.extend(wantedAgents)
+
+    if not scoped:
+        return None
+    rows = store._conn.execute(
+        "SELECT a.id FROM atoms a WHERE " + " AND ".join(clauses),
+        tuple(params),
+    ).fetchall()
+    return {row[0] for row in rows}
 
 
 def recall(store, indexes, embedder, query, project=None, timeScope=None,
@@ -164,9 +238,11 @@ def recall(store, indexes, embedder, query, project=None, timeScope=None,
     then filled by round-robin across the per-class fused rankings, so the
     cross-encoder scores a fair mix and its scores decide the final order. Options:
 
-    - ``project``: restrict recall to that project's live atoms (facet filter).
+    - ``project``: restrict recall to that project's live atoms before each
+      signal chooses its candidates.
     - ``timeScope`` ``(startUnix, endUnix)``: restrict to atoms whose effective
-      time falls in the inclusive window (applied once, in the priors stage).
+      time falls in the inclusive window before candidate selection. The priors
+      stage repeats the predicate defensively and disables normal recency decay.
     - ``kinds``: restrict to these atom kinds. Stratification runs over only the
       classes overlapping ``kinds`` (a single-class request degrades to today's
       non-stratified behavior).
@@ -207,35 +283,17 @@ def recall(store, indexes, embedder, query, project=None, timeScope=None,
     if not query or not query.strip():
         return _emptyResult(store, tokenBudget)
 
-    # 1. Facet signal: project filterSet + entity boostSet from the query text.
-    #    timeScope is intentionally NOT forwarded here (it belongs to the priors
-    #    stage, applied exactly once).
-    facetHints = {"query": query}
-    if project is not None:
-        facetHints["project"] = project
-    facet = facetSignal(store, facetHints)
-    boostSet = facet["boostSet"]
-    filterSet = facet["filterSet"]
-
-    # A present-but-empty filterSet means the project/window matched no live atom.
-    # Nothing is recallable; return the sentinel, not an error.
+    # Resolve the complete eligible universe before any signal takes its top-k.
+    # None preserves the unscoped fast paths; an empty set short-circuits before
+    # either embedder runs.
+    filterSet = _scopeAtomSet(store, project, timeScope, kinds, agent)
     if filterSet is not None and not filterSet:
         return _emptyResult(store, tokenBudget)
 
-    # Agent is membership, not a kind class. Restrict the universe BEFORE
-    # candidate gen the way project does: a post-filter of the fused top-200
-    # is the Theia-tail bug (gripe: grok rows exist, fused list does not
-    # contain them, filter returns empty).
-    if agent:
-        agentSet = _agentAtomSet(store, agent)
-        if not agentSet:
-            return _emptyResult(store, tokenBudget)
-        if filterSet is None:
-            filterSet = agentSet
-        else:
-            filterSet = filterSet & agentSet
-            if not filterSet:
-                return _emptyResult(store, tokenBudget)
+    # Entity facets are a boost signal. Scope membership comes from the combined
+    # query above so project, time, kinds, and agent share one AND intersection.
+    facet = facetSignal(store, {"query": query})
+    boostSet = facet["boostSet"]
 
     # 2. Per-class candidate generation. classesForKinds(None) is every class;
     #    a kinds subset narrows to the overlapping classes. No class -> sentinel.
@@ -246,15 +304,31 @@ def recall(store, indexes, embedder, query, project=None, timeScope=None,
 
     bmHits = []
     dnHits = []
+    queryEmbedder = _OnceQueryEmbedder(embedder)
     for name, classKinds in classes:
-        bmHits.extend(bm25(store, query, _SIGNAL_K, kinds=classKinds, agent=agent))
+        bmHits.extend(bm25(
+            store, query, _SIGNAL_K, kinds=classKinds, agent=agent,
+            project=project, timeScope=timeScope,
+        ))
         classIndex = indexes.get(name)
         if classIndex is not None:
-            dnHits.extend(dense(classIndex, embedder, query, _SIGNAL_K))
+            if filterSet is None:
+                dnHits.extend(dense(classIndex, queryEmbedder, query, _SIGNAL_K))
+            else:
+                dnHits.extend(dense(
+                    classIndex, queryEmbedder, query, _SIGNAL_K,
+                    allowedIds=filterSet,
+                ))
 
     # Aux dense hits (optional third list). One aux embed per call, guarded:
     # a query-time failure yields [] and the pipeline continues on base signals.
-    oaHits = _auxHits(aux, query, _SIGNAL_K) if aux is not None else []
+    if aux is None:
+        oaHits = []
+    else:
+        oaHits = _auxHits(
+            aux, query, _SIGNAL_K, allowedIds=filterSet,
+            classNames=classNames,
+        )
 
     # signalHits: which of {bm25, dense, facet} hit each atom, drawn from the raw
     # top-200 lists and the boostSet. Trust reads this as explanation evidence.
@@ -271,7 +345,7 @@ def recall(store, indexes, embedder, query, project=None, timeScope=None,
     for atomId in boostSet:
         signalHits.setdefault(atomId, set()).add("facet")
 
-    # 3. The project filterSet restricts the candidate universe BEFORE fusion.
+    # 3. The combined filterSet is also a defensive pre-fusion boundary.
     if filterSet is not None:
         bmHits = [pair for pair in bmHits if pair[0] in filterSet]
         dnHits = [pair for pair in dnHits if pair[0] in filterSet]
@@ -293,8 +367,8 @@ def recall(store, indexes, embedder, query, project=None, timeScope=None,
             for atomId, score in fused
         ]
 
-    # 6. Priors: importance * time decay, OR (under timeScope) a window
-    #    restriction. The window is applied here and ONLY here.
+    # 6. Priors: importance * time decay, OR (under timeScope) a defensive
+    #    repeat of the already-applied eligibility window without recency decay.
     priorHints = {"now": now}
     if timeScope is not None:
         priorHints["timeScope"] = timeScope
@@ -381,27 +455,6 @@ def _filterKinds(store, fused, kinds):
     ).fetchall()
     kindById = {r[0]: r[1] for r in rows}
     return [pair for pair in fused if kindById.get(pair[0]) in kindSet]
-
-
-def _agentAtomSet(store, agent):
-    """Live-or-not atom ids that carry at least one provenance.agent match.
-
-    Stamped-only: NULL rows are not a silent majority. An atom with two
-    provenance rows (heph and grok) is in both sets. Used as a filterSet so
-    candidate generation is restricted, not just the fused tail.
-    """
-    if isinstance(agent, str):
-        wanted = (agent,)
-    else:
-        wanted = tuple(a for a in agent if a)
-    if not wanted:
-        return set()
-    ph = ",".join("?" for _ in wanted)
-    rows = store._conn.execute(
-        f"SELECT DISTINCT atom_id FROM provenance WHERE agent IN ({ph})",
-        wanted,
-    ).fetchall()
-    return {r[0] for r in rows}
 
 
 def _filterAgent(store, fused, agent):

@@ -124,8 +124,8 @@ TRUST_FLOOR = 0.6         # shouldTrust = confidence >= TRUST_FLOOR
 # confidence is capped strictly below TRUST_FLOOR so shouldTrust is always False.
 SUPERSEDED_CONF_CAP = 0.4
 
-# A bulk-imported corpus row corroborated by ONE lexical signal is a grep hit on
-# a file, not a memory. Capped strictly below TRUST_FLOOR so `shouldTrust` and
+# A bulk-imported corpus row found by one signal family lacks corroboration.
+# Cap it strictly below TRUST_FLOOR so `shouldTrust` and
 # `confidence` cannot disagree, mirroring the supersession cap rather than
 # inventing a second mechanism.
 #
@@ -143,9 +143,8 @@ CORPUS_KINDS = frozenset({"document_chunk"})
 # Provenance sources that mean "this row came from an import, not an agent".
 IMPORT_SOURCES = frozenset({"bulk-import"})
 
-# Signals that corroborate a lexical hit. A chunk found by bm25 AND one of these
-# has real evidence behind it and keeps its trust: the corpus is useful, and some
-# answers exist ONLY in chunk form. This is a signal rule, never a kind ban.
+# Non-lexical signal families. Two different families must agree; a dense hit
+# alone does not corroborate itself. The auxiliary 'openai' tag aliases dense.
 CORROBORATING_SIGNALS = frozenset({"dense", "facet"})
 
 
@@ -302,7 +301,7 @@ def _liveEnd(atomId, successorMap, forkedOldIds):
 
 
 def _isUncorroboratedCorpus(kind, sources, signals):
-    """True when a row is imported material found by lexical match alone.
+    """True when imported material has fewer than two signal families.
 
     All three must hold, and each is doing work:
 
@@ -310,8 +309,8 @@ def _isUncorroboratedCorpus(kind, sources, signals):
     * EVERY provenance source is an import -- a row an agent also wrote through
       the emit path is not the 283k-row bulk load, and "one source is an import"
       would condemn those.
-    * no corroborating signal -- dense or facet agreement is real evidence, so
-      this withholds trust from single-signal hits rather than from a kind.
+    * fewer than two independent signal families -- aliases of the same dense
+      signal do not turn one match into corroboration.
 
     A row with NO provenance at all is not treated as corpus: absent provenance
     is unknown, and unknown is not a licence to downgrade something an agent may
@@ -322,7 +321,10 @@ def _isUncorroboratedCorpus(kind, sources, signals):
         return False
     if not sources or not sources <= IMPORT_SOURCES:
         return False
-    return not (signals & CORROBORATING_SIGNALS)
+    families = signals & ({"bm25"} | CORROBORATING_SIGNALS)
+    if "openai" in signals:
+        families = families | {"dense"}
+    return len(families) < 2
 
 
 def assessTrust(reranked, signalHits, Store, now):
@@ -411,7 +413,7 @@ def assessTrust(reranked, signalHits, Store, now):
             why = _buildWhy(signals, gapScore, temporalScore, isTop)
             if _isUncorroboratedCorpus(kind, sourcesById.get(atomId, set()), signals):
                 confidence = min(confidence, UNCORROBORATED_CORPUS_CONF_CAP)
-                why = "imported corpus, lexical match only, uncorroborated"
+                why = "imported corpus, insufficient independent signals, uncorroborated"
             out.append({
                 "atomId": atomId,
                 "score": score,

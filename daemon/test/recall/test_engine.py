@@ -2,9 +2,10 @@
 
 Risk model (what could silently break, and the test that catches it):
 
-- **Pipeline mis-wiring.** A stage skipped or reordered; the time window applied
-  twice (facet + priors); ``now`` sampled more than once; signalHits built wrong
-  so trust's evidence is off. Caught by the full-pipeline tests over real models
+- **Pipeline mis-wiring.** A stage skipped or reordered; the time window omitted
+  from candidate eligibility or recency decay applied inside it; ``now`` sampled
+  more than once; signalHits built wrong so trust's evidence is off. Caught by
+  the full-pipeline tests over real models
   (100-atom ordering, timeScope-restricts, entity-facet-threads-into-why,
   superseded-after-index-build) which exercise every stage end to end.
 - **Payload slop.** Markdown furniture (headers, bullets, bold) or emoji leaking
@@ -203,7 +204,11 @@ def _stub_recall_dependencies(monkeypatch, fused, reranked):
         "boostSet": set(),
         "filterSet": None,
     })
-    monkeypatch.setattr(engine, "bm25", lambda store, query, k, kinds=None, agent=None: [])
+    monkeypatch.setattr(
+        engine, "bm25",
+        lambda store, query, k, kinds=None, agent=None,
+        project=None, timeScope=None: [],
+    )
     monkeypatch.setattr(engine, "dense", lambda index, embedder, query, k: [])
     monkeypatch.setattr(engine, "rrf", lambda hits: list(fused))
     monkeypatch.setattr(engine, "applyPriors", lambda fusedPairs, store, hints: fusedPairs)
@@ -291,7 +296,11 @@ def test_rerank_head_is_interleaved_across_classes(store, monkeypatch):
     seen = {}
     monkeypatch.setattr(engine, "facetSignal",
                         lambda store, hints: {"boostSet": set(), "filterSet": None})
-    monkeypatch.setattr(engine, "bm25", lambda store, query, k, kinds=None, agent=None: [])
+    monkeypatch.setattr(
+        engine, "bm25",
+        lambda store, query, k, kinds=None, agent=None,
+        project=None, timeScope=None: [],
+    )
     monkeypatch.setattr(engine, "dense", lambda index, embedder, query, k: [])
     monkeypatch.setattr(engine, "rrf", lambda hits: list(fused))
     monkeypatch.setattr(engine, "applyPriors",
@@ -388,14 +397,14 @@ def test_recall_reranks_whole_pool_when_pool_is_below_head_cap(
 
 
 # --------------------------------------------------------------------------- #
-# Wire-through: timeScope restricts to the window, applied exactly once        #
+# Wire-through: timeScope eligibility and prior defense use one inclusive rule #
 # --------------------------------------------------------------------------- #
 
 
 def test_timescope_restricts_results_to_the_window(store, embedder, _rerankerWarm):
-    # timeScope is applied ONCE, in the priors stage (never also as a facet
-    # timeRange). Seed topically-identical atoms in and out of the window; only the
-    # in-window atoms may come back.
+    # Candidate generation applies timeScope before top-k; priors repeat the same
+    # inclusive boundary defensively while skipping normal recency decay. Seed
+    # identical atoms in and out of the window; only in-window atoms may return.
     windowStart, windowEnd = 1_000_000_000, 1_100_000_000
     mid = 1_050_000_000
     outTime = 1_500_000_000
@@ -808,8 +817,18 @@ def test_enriched_recall_attaches_location_and_relations(
     mem = _put(store, "we capped the rate limiter at one per second")
     addFacet(store, chunk, "entity", "rate_limiter")
     addFacet(store, mem, "entity", "rate_limiter")
+    # Without dense evidence, the imported-corpus trust cap makes the chunk a
+    # weak handle and enrichment correctly does not run.
+    embedMissing(store, embedder)
     idx = buildClassIndexes(store, MODEL_ID)
     out = recall(store, idx, embedder, "rate limiter cap function",
                  k=3, enrich=True)
+    chunkRows = [row for row in out["results"] if row["atomId"] == chunk]
+    assert len(chunkRows) == 1, (
+        "enriched-recall trusted-chunk setup invariant violated: "
+        f"chunk={chunk} results={out['results']}")
+    assert chunkRows[0]["shouldTrust"] is True, (
+        "enriched-recall trusted-chunk precondition violated: "
+        f"chunk_result={chunkRows[0]}")
     assert "at projects/obol/api/rate.go#L2-2" in out["payload"]
     assert f"relates -> p3://{mem}" in out["payload"]

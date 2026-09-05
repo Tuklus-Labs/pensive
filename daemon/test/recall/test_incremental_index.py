@@ -3,8 +3,8 @@
 THE CLAIM UNDER TEST, stated so a drifted question reads as a wrong sentence:
 
     A just-written atom becomes dense-recallable WITHOUT rebuilding its kind
-    class, and a retired atom stops being recallable WITHOUT the index being
-    told about it.
+    class, and explicit removal makes a retired atom stop being recallable
+    WITHOUT rebuilding the index.
 
 Why this exists. Every emit used to call ``reindex(kinds=...)``, which is
 ``embedMissing`` (90ms scanning 299,728 live atoms to return zero rows on this

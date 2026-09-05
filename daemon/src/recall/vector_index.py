@@ -86,8 +86,8 @@ class VectorIndex(abc.ABC):
         """Populate the index from ``modelId``'s embeddings; return ``self``."""
 
     @abc.abstractmethod
-    def search(self, vec, k):
-        """Return up to ``k`` ``(atomId, score)`` pairs, best score first."""
+    def search(self, vec, k, allowedIds=None):
+        """Return the best ``k`` pairs, optionally restricted to ``allowedIds``."""
 
     @abc.abstractmethod
     def add(self, atomId, vec):
@@ -197,8 +197,10 @@ class FlatIndex(VectorIndex):
         self._atomIds.append(atomId)
         return self
 
-    def search(self, vec, k):
+    def search(self, vec, k, allowedIds=None):
         if self._matrix.shape[0] == 0 or k <= 0:
+            return []
+        if allowedIds is not None and not allowedIds:
             return []
         query = np.asarray(vec, dtype=np.float32)
         norm = float(np.linalg.norm(query))
@@ -207,7 +209,6 @@ class FlatIndex(VectorIndex):
         # Stored rows are unit-normalized; normalizing the query too makes the dot
         # product a true cosine for any caller-supplied vector.
         query = query / norm
-        scores = self._matrix @ query
         # Retired rows are EXCLUDED, not merely scored low. Scoring them -inf was
         # the first attempt and it does not work: when k >= n this method returns
         # every row sorted by score, so a retired atom still comes back, just
@@ -215,13 +216,23 @@ class FlatIndex(VectorIndex):
         # `test_correct_supersedes_and_recall_shows_current_truth` reports, since
         # a corrected fact reappearing at the bottom of the payload is still the
         # corrected fact reappearing.
-        candidates = np.arange(scores.shape[0])
+        candidates = np.arange(self._matrix.shape[0])
         if self._retired:
-            keep = np.ones(scores.shape[0], dtype=bool)
+            keep = np.ones(self._matrix.shape[0], dtype=bool)
             keep[list(self._retired)] = False
             candidates = candidates[keep]
-            if candidates.size == 0:
-                return []
+        if allowedIds is not None:
+            allowed = set(allowedIds)
+            candidates = np.asarray(
+                [pos for pos in candidates if self._atomIds[pos] in allowed],
+                dtype=np.intp,
+            )
+        if candidates.size == 0:
+            return []
+        # Keep the matrix intact: a scoped query selects candidate positions but
+        # does not copy their vectors. Flat search already scans the full matrix;
+        # only the top-k selection is narrowed.
+        scores = self._matrix @ query
         sub = scores[candidates]
         n = sub.shape[0]
         k = min(k, n)

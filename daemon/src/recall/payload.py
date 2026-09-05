@@ -58,13 +58,12 @@ Three tiers:
   Tiers 0+1; Tier 2 is exposed for the Task 12 history/neighborhood view via
   :func:`assembleTier2`.
 
-Budget discipline: tokens are approximated by a deliberately CONSERVATIVE
-heuristic, ``ceil(len(text) / 3)``, which OVERestimates for English -- a violated
-budget (a payload that blows the model's context) is strictly worse than an
-underfilled one, so we round the wrong way on purpose. Entries are atomic: whole
-Tier-1 entries are fit top-down and the tail is dropped; an atom body is NEVER cut
-mid-sentence. If not even the top entry fits, its Tier-0 handle alone is emitted
-(if THAT fits), else the budget sentinel.
+Budget discipline: ``ceil(len(text) / 3)`` is an approximate token estimate,
+not a bound for every tokenizer or language. Every payload fits that estimate
+budget. Trusted bodies are atomic; weak results and bodies that do not fit
+degrade to handles in rank order. If even a handle cannot fit, emit the budget
+sentinel if it fits, otherwise an empty payload. Exact context limits remain
+the consumer's tokenizer contract.
 
 Stdlib only; ``store`` reads go through the store's public accessors.
 """
@@ -125,11 +124,9 @@ _LINE_SEPARATOR = "\n"
 
 
 def estimateTokens(text):
-    """Conservative token estimate: ``ceil(len(text) / CHARS_PER_TOKEN)``.
+    """Approximate tokens: ``ceil(len(text) / CHARS_PER_TOKEN)``.
 
-    The single place the heuristic lives. OVERestimates for English on purpose
-    (see the module docstring): every budget decision rounds toward a shorter
-    payload. ``""`` -> 0.
+    This character heuristic is not an exact tokenizer count. ``""`` -> 0.
     """
     return math.ceil(len(text) / CHARS_PER_TOKEN)
 
@@ -313,7 +310,12 @@ def _fetch(store, atomId):
 
 def tier0Handle(store, result):
     """Tier-0 handle line for a recall result dict (``{atomId, confidence, ...}``)."""
-    return _handleLine(_fetch(store, result["atomId"]), result["confidence"])
+    line = _handleLine(_fetch(store, result["atomId"]), result["confidence"])
+    if result.get("shouldTrust") is False:
+        line += " [untrusted]"
+    if result.get("supersededBy"):
+        line += f", superseded by {HANDLE_SCHEME}{result['supersededBy']}"
+    return _oneLine(line)
 
 
 def tier1Entry(store, result):
@@ -379,11 +381,10 @@ def assemblePayload(store, results, tokenBudget, enricher=None):
 
     ``results`` is the trust-annotated, best-first (reranked-order) list. Two modes:
 
-    - **At least one trusted result** (some ``shouldTrust`` is True): emit Tier-1
-      entries top-down while they fit ``tokenBudget`` by the module heuristic,
-      dropping the tail atomically -- a body is never cut. If not even the top
-      entry fits, fall back to its Tier-0 handle alone, and failing that the budget
-      sentinel. ``lowConf`` is False.
+    - **At least one trusted result** (some ``shouldTrust`` is True): emit trusted
+      results as Tier 1 and weak results as labelled Tier 0, in rank order while
+      they fit. Bodies are never cut. Entries that do not fit degrade to handles,
+      then a fitting sentinel or empty payload. ``lowConf`` is False.
 
     - **No trusted result** (empty, or every ``shouldTrust`` False): emit the
       low-confidence sentinel followed by up to ``MAX_LOW_CONF_HANDLES`` Tier-0
@@ -395,12 +396,16 @@ def assemblePayload(store, results, tokenBudget, enricher=None):
 
     ``tokens`` is ``estimateTokens`` of the FINAL payload string (furniture and
     separators included)."""
+    if tokenBudget < 0:
+        raise ValueError("tokenBudget must be nonnegative")
     if not any(r.get("shouldTrust") for r in results):
         return _lowConfidencePayload(store, results, tokenBudget)
 
     entries = []
     for result in results:
-        if enricher is not None:
+        if not result.get("shouldTrust"):
+            entry = tier0Handle(store, result)
+        elif enricher is not None:
             joined = _ENTRY_SEPARATOR.join(entries) if entries else ""
             used = estimateTokens(joined) if entries else 0
             sep = estimateTokens(_ENTRY_SEPARATOR) if entries else 0
@@ -426,7 +431,12 @@ def assemblePayload(store, results, tokenBudget, enricher=None):
         # Not even the top entry fit whole. Degrade to its handle, then the
         # sentinel -- never a truncated body.
         handle = tier0Handle(store, results[0])
-        payload = handle if estimateTokens(handle) <= tokenBudget else SENTINEL_BUDGET_TOO_SMALL
+        if estimateTokens(handle) <= tokenBudget:
+            payload = handle
+        elif estimateTokens(SENTINEL_BUDGET_TOO_SMALL) <= tokenBudget:
+            payload = SENTINEL_BUDGET_TOO_SMALL
+        else:
+            payload = ""
 
     return payload, estimateTokens(payload), False
 
@@ -466,6 +476,8 @@ def _handleTail(store, fitted, remaining, tokenBudget):
 
 def _lowConfidencePayload(store, results, tokenBudget):
     """Sentinel + up to MAX_LOW_CONF_HANDLES Tier-0 handles (budget permitting)."""
+    if estimateTokens(SENTINEL_LOW_CONFIDENCE) > tokenBudget:
+        return "", 0, True
     lines = [SENTINEL_LOW_CONFIDENCE]
     for result in results[:MAX_LOW_CONF_HANDLES]:
         handle = tier0Handle(store, result)

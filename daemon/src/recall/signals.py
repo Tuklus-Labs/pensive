@@ -244,18 +244,19 @@ def _sanitizeFtsQuery(query, store=None):
     return " OR ".join(quoted)
 
 
-def bm25(store, query, k=_DEFAULT_K, kinds=None, agent=None):
+def bm25(store, query, k=_DEFAULT_K, kinds=None, agent=None, project=None,
+         timeScope=None):
     """Lexical signal: FTS5 BM25 over live atom text -> ``[(atomId, score)]``.
 
     ``score`` is the negated ``bm25()`` cost, so higher = better and the list is
     already best-first. ``kinds`` (when a non-empty iterable) restricts the result
     to atoms of those kinds via an ``AND a.kind IN (...)`` clause, so the engine
     can pull a separate per-class candidate list; ``kinds=None`` is unrestricted
-    (every live atom). ``agent`` (str or sequence) restricts to atoms that carry
-    at least one matching provenance.agent row, so the top-k is drawn FROM that
-    agent's universe rather than post-filtered from a global 200. Returns [] for
-    ``k <= 0`` or a query with no searchable token (parity with the vector-index
-    contract; never raises on raw text).
+    (every live atom). ``agent`` (str or sequence), ``project``, and inclusive
+    ``timeScope`` add bound SQL predicates before ``LIMIT``, so top-k is selected
+    from the requested universe. Returns [] for ``k <= 0`` or a query with no
+    searchable token (parity with the vector-index contract; never raises on raw
+    text).
     """
     if k <= 0:
         return []
@@ -263,7 +264,15 @@ def bm25(store, query, k=_DEFAULT_K, kinds=None, agent=None):
     if match is None:
         return []
     kindClause, kindParams = kindInClause(kinds, alias="a")
-    agentClause, agentParams = "", ()
+    clauses = []
+    scopeParams = []
+    if project is not None:
+        clauses.append("a.project = ?")
+        scopeParams.append(project)
+    if timeScope is not None:
+        start, end = timeScope
+        clauses.append("COALESCE(a.occurred_at, a.created_at) BETWEEN ? AND ?")
+        scopeParams.extend((start, end))
     if agent:
         if isinstance(agent, str):
             wanted = (agent,)
@@ -271,33 +280,35 @@ def bm25(store, query, k=_DEFAULT_K, kinds=None, agent=None):
             wanted = tuple(a for a in agent if a)
         if wanted:
             ph = ",".join("?" for _ in wanted)
-            agentClause = (
-                " AND a.id IN (SELECT atom_id FROM provenance "
+            clauses.append(
+                "a.id IN (SELECT atom_id FROM provenance "
                 f"WHERE agent IN ({ph}))"
             )
-            agentParams = wanted
+            scopeParams.extend(wanted)
+    scopeClause = "".join(f" AND {clause}" for clause in clauses)
     rows = store._conn.execute(
         "SELECT a.id, -bm25(fts) AS score "
         "FROM fts JOIN atoms a ON a.rowid = fts.rowid "
-        "WHERE fts MATCH ? AND a.status = 'live'" + kindClause + agentClause + " "
+        "WHERE fts MATCH ? AND a.status = 'live'" + kindClause + scopeClause + " "
         "ORDER BY bm25(fts) "
         "LIMIT ?",
-        (match, *kindParams, *agentParams, k),
+        (match, *kindParams, *scopeParams, k),
     ).fetchall()
     return [(r[0], r[1]) for r in rows]
 
 
-def dense(index, embedder, query, k=_DEFAULT_K):
+def dense(index, embedder, query, k=_DEFAULT_K, allowedIds=None):
     """Dense signal: embed the query once, delegate to ``index.search(vec, k)``.
 
-    The embedding cost is one ``embed`` call per query; ranking and the
-    live-only candidate universe are the index's responsibility (FlatIndex here,
-    the Task 15 HNSW index later), so this is a thin, index-agnostic seam.
+    ``allowedIds`` is passed to the index before top-k selection. The orchestrator
+    supplies an embedder that shares one query vector across kind classes.
     """
     vecs = embedder.embed([query])
     if not vecs:
         return []
-    return index.search(vecs[0], k)
+    if allowedIds is None:
+        return index.search(vecs[0], k)
+    return index.search(vecs[0], k, allowedIds=allowedIds)
 
 
 def facetSignal(store, hints):
