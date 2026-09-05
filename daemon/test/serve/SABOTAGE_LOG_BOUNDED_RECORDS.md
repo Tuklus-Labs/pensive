@@ -47,4 +47,3 @@ assertions in the structured test file. Generic `mutmut` was not repeated: its
 known Python 3.14 worker path fails on repeated NumPy import even with plugin
 autoload disabled, so it does not produce trustworthy mutation evidence here.
 No live database, service, GPU, or production index was used.
-
