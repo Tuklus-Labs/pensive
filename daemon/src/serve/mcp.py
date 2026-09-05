@@ -51,6 +51,9 @@ from recall.strata import KIND_CLASSES, MEMORY_KINDS
 from recall.vector_index import buildClassIndexes, selectIndex
 from recall.payload import assembleTier2, estimateTokens
 from serve import viz
+from serve.memory_tools import SCHEMAS as MEMORY_SCHEMAS, DESCRIPTIONS as MEMORY_DESCRIPTIONS, runMemoryTool
+from store.feedback import recordRecallReceipt
+from util.ulid import ulid
 from store.store import (
     putAtom,
     correctAtom,
@@ -145,6 +148,9 @@ RECALL_RECORDS_INPUT_SCHEMA = {
         "tokenBudget": {
             "type": "integer", "minimum": 1, "maximum": 8000, "default": 1500,
         },
+        "includeReceipt": {"type": "boolean", "default": False},
+        "taskId": {"type": "string", "minLength": 1, "maxLength": 256, "pattern": r".*\S.*"},
+        "callerAgent": {"type": "string", "minLength": 1, "maxLength": 64, "pattern": r".*\S.*"},
         "agent": {
             "type": ["string", "null"], "minLength": 1, "maxLength": 64,
             "pattern": r".*\S.*",
@@ -221,6 +227,7 @@ RECALL_RECORDS_OUTPUT_SCHEMA = {
     "additionalProperties": False,
     "properties": {
         "schemaVersion": {"type": "integer", "const": 1},
+        "receiptId": {"type": "string", "minLength": 1, "maxLength": 256},
         "query": {"type": "string", "minLength": 1, "maxLength": 8192},
         "project": {"type": ["string", "null"], "minLength": 1, "maxLength": 256},
         "records": {"type": "array", "items": _RECORD_OUTPUT_SCHEMA, "maxItems": 32},
@@ -566,7 +573,7 @@ def _recallKinds(value):
 
 
 def _recallRecordsArgs(args):
-    allowed = {"query", "project", "timeScope", "kinds", "k", "tokenBudget", "agent"}
+    allowed = set(RECALL_RECORDS_INPUT_SCHEMA["properties"])
     unknown = sorted(set(args) - allowed)
     if unknown:
         raise ValueError(f"recall_records: unknown fields: {unknown}")
@@ -581,6 +588,11 @@ def _recallRecordsArgs(args):
         args.get("tokenBudget", 1500), "tokenBudget", 1, 8000
     )
     agent = _sanitizeAgent(args.get("agent"))
+    if type(args.get("includeReceipt", False)) is not bool:
+        raise ValueError("recall_records: includeReceipt must be boolean")
+    for field, maximum in (("taskId", 256), ("callerAgent", 64)):
+        if field in args:
+            _boundedText(args[field], field, 1, maximum)
     return query, project, timeScope, kinds, k, tokenBudget, agent
 
 
@@ -758,16 +770,9 @@ def _resolveAgent(ctx, args=None):
 def _emitProvenance(ctx, args=None):
     """Provenance for one emit: source, plus an agent if one can be determined.
 
-    A caller-supplied ``agent`` wins over the connection's ``?agent=``, which
-    wins over the daemon-wide ``PENSIVE_V3_AGENT``, so several agents sharing one
-    daemon accumulate distinct histories. This mirrors what ``correct`` has
-    always done with its ``provenance`` arg. The Parlor sidecar is the only
-    caller that sets the argument, and it sets it from the machine binding rather
-    than from anything a model said.
-
-    Absent, blank, or wrong-typed still falls back exactly as before, so every
-    existing caller is byte-identical unless its connection declares an agent.
-    An atom stamped "" would look like an answer.
+    Resolve attribution through the same transport-first precedence as other
+    writes. Caller claims and daemon defaults apply only when the transport
+    does not declare an identity; invalid identities remain unattributed.
     """
     prov = {"source": _EMIT_SOURCE}
     agent = _resolveAgent(ctx, args)
@@ -1073,6 +1078,15 @@ def handle_recall(ctx, args):
 
 def handle_recall_records(ctx, args):
     query, project, timeScope, kinds, k, tokenBudget, agent = _recallRecordsArgs(args)
+    receiptId = None
+    caller = None
+    if args.get("includeReceipt"):
+        caller = _resolveAgent(ctx, {"agent": args.get("callerAgent")})
+        if not caller or not args.get("taskId"):
+            raise ValueError("receipt requests require taskId and a resolved callerAgent")
+        receiptId = ulid()
+    elif "taskId" in args or "callerAgent" in args:
+        raise ValueError("taskId/callerAgent require includeReceipt=true")
     recallKw = dict(
         project=project,
         timeScope=timeScope,
@@ -1117,6 +1131,7 @@ def handle_recall_records(ctx, args):
             "estimatedTokens": candidateTokens,
             "lowConfidence": out["lowConfidence"],
             "truncated": candidateTruncated,
+            **({"receiptId": receiptId} if receiptId else {}),
         })
 
     structured = makeStructured(records, tokens, truncated)
@@ -1211,11 +1226,27 @@ def handle_recall_records(ctx, args):
 
     if truncated:
         structured = makeStructured(records, tokens, True)
-    _logReturnedRecall(
-        ctx, out, query, "mcp.recall_records",
-        atomIds=[record["id"] for record in records],
-    )
+    if receiptId:
+        recordRecallReceipt(ctx.store, receiptId=receiptId, query=query,
+            project=project, agent=caller, taskId=args["taskId"],
+            sourceRef="mcp.recall_records", records=[
+                {"id": r["id"], "score": r["score"],
+                 "delivery": "handle" if estimateTokens(r["content"]) < r["estimatedTokens"] else "body"}
+                for r in records])
+        try:
+            viz.emitRecallEvent(ctx, query, [r["id"] for r in records], "mcp.recall_records")
+        except Exception:
+            ctx.recallLogErrors += 1
+    else:
+        _logReturnedRecall(ctx, out, query, "mcp.recall_records",
+            atomIds=[record["id"] for record in records])
     return structured
+
+
+def _handleMemoryTool(ctx, name, args):
+    caller = _resolveAgent(ctx, args) if name != "task_state" else None
+    value = runMemoryTool(ctx.store, name, args, caller)
+    return StructuredResult(value, json.dumps(value, ensure_ascii=False, allow_nan=False))
 
 
 def _supersessionChain(store, atomId):
@@ -1658,6 +1689,9 @@ NATIVE_TOOLS = [
     ),
 ]
 
+NATIVE_TOOLS.extend(Tool(name=name, description=MEMORY_DESCRIPTIONS[name],
+                         inputSchema=schema) for name, schema in MEMORY_SCHEMAS.items())
+
 TOOLS = COMPAT_TOOLS + NATIVE_TOOLS
 
 HANDLERS = {
@@ -1672,6 +1706,9 @@ HANDLERS = {
     # natives
     "recall": handle_recall,
     "recall_records": handle_recall_records,
+    "task_checkpoint": lambda ctx, args: _handleMemoryTool(ctx, "task_checkpoint", args),
+    "task_state": lambda ctx, args: _handleMemoryTool(ctx, "task_state", args),
+    "recall_feedback": lambda ctx, args: _handleMemoryTool(ctx, "recall_feedback", args),
     "history": handle_history,
     "correct": handle_correct,
     "pin": handle_pin,

@@ -216,6 +216,7 @@ def test_recall_records_schemas_are_strict():  # I1, B8, C2
     )
     assert set(inputSchema["properties"]) == {
         "query", "project", "timeScope", "kinds", "k", "tokenBudget", "agent",
+        "includeReceipt", "taskId", "callerAgent",
     }, f"input-field rule violated: properties={sorted(inputSchema['properties'])!r}"
     assert inputSchema["properties"]["query"]["minLength"] == 1, (
         f"query-min rule violated: schema={inputSchema['properties']['query']!r}"

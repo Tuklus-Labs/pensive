@@ -22,12 +22,8 @@ def test_open_creates_schema_at_current_version(tmp_path):
     s = openStore(tmp_path / "mem.db")
     try:
         # Deliberate pin: a schema migration must consciously bump this
-        # assertion (v2 = Task 19 lifecycle: recall_log, proposals,
-        # idx_prov_source_ref; v3 = idx_facets_kv_atom, the covering index that
-        # removes the temp B-tree sort from the unauthenticated L1 /lookup
-        # route -- the LIMIT bounded the response, not the work, and the caller
-        # chose the value being sorted).
-        assert CURRENT_SCHEMA_VERSION == 3
+        # assertion. v4 adds append-only task state and recall feedback history.
+        assert CURRENT_SCHEMA_VERSION == 4
         assert s.schemaVersion() == CURRENT_SCHEMA_VERSION
         assert tableExists(s, "atoms")
         assert tableExists(s, "edges")

@@ -1,11 +1,11 @@
 """Rebuild a fresh canonical store from a JSONL export -- the decades guarantee.
 
 Given the JSONL snapshot :func:`store.export.exportJSONL` writes, ``rebuild``
-reconstructs the canonical tables and retained history. Legacy four-file dumps
-remain readable; format 2 requires the usage and review-history tables too. The
-``embeddings`` and ``fts`` tables are absent from the export on purpose -- the
-fts index regenerates because atoms are inserted through the normal triggers, and
-embeddings are re-derived later by the Phase 2 embedder.
+reconstructs the canonical tables and retained history. Format 2 and legacy
+four-file dumps remain readable; format 3 also restores task and feedback
+history. The ``embeddings`` and ``fts`` tables are absent from the export on
+purpose -- the fts index regenerates because atoms are inserted through the
+normal triggers, and embeddings are re-derived later by the Phase 2 embedder.
 
 Three rules make it safe to lean on for decades:
 
@@ -23,6 +23,7 @@ Three rules make it safe to lean on for decades:
 """
 import hashlib
 import json
+import math
 import os
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -30,7 +31,9 @@ from tempfile import TemporaryDirectory
 from store.store import openStore, CURRENT_SCHEMA_VERSION
 from store.export import (
     _TABLES,
+    _TABLES_V2,
     FORMAT_VERSION,
+    LEGACY_FORMAT_VERSION,
     MANIFEST_NAME,
     PUBLICATION_MARKER,
     _fsyncDirectory,
@@ -40,7 +43,9 @@ __all__ = ["rebuild"]
 
 # (filename, table, columns) in FK-safe insertion order: when each table loads,
 # every foreign key it carries already points at a loaded row.
+_LOAD_ORDER_V2 = tuple((name, table, cols) for name, table, cols, _ in _TABLES_V2)
 _LOAD_ORDER = tuple((name, table, cols) for name, table, cols, _ in _TABLES)
+_V4_TABLES = frozenset(row[1] for row in _TABLES[6:])
 
 
 def _loadOrder(directory):
@@ -48,24 +53,33 @@ def _loadOrder(directory):
         raise ValueError(f"incomplete export publication at {directory}")
     path = directory / MANIFEST_NAME
     if not path.exists():
-        if any((directory / name).exists() for name, _, _ in _LOAD_ORDER[4:]):
+        if any((directory / name).exists() for name, _, _ in _LOAD_ORDER_V2[4:]):
             raise ValueError("incomplete export: history files require a format manifest")
-        return _LOAD_ORDER[:4], None
+        # An older four-file dump may live beside empty files left by a failed
+        # format-3 attempt. Empty files carry no rows and are harmless; any
+        # nonempty v4 file means durable history would be silently discarded.
+        v4Files = [directory / name for name, _, _ in _LOAD_ORDER[6:]
+                   if (directory / name).exists()]
+        if any(path.stat().st_size for path in v4Files):
+            raise ValueError("incomplete export: history files require a format manifest")
+        return _LOAD_ORDER_V2[:4], None
     manifest = json.loads(path.read_text(encoding="utf-8"))
     if not isinstance(manifest, dict):
         raise ValueError("invalid export format manifest")
     version = manifest.get("formatVersion")
-    if type(version) is not int or version != FORMAT_VERSION:
+    if type(version) is not int or version not in (LEGACY_FORMAT_VERSION, FORMAT_VERSION):
         raise ValueError(f"unsupported export format version: {version!r}")
     if manifest.get("format") != "pensive-jsonl":
         raise ValueError("invalid export format name")
     schema = manifest.get("schemaVersion")
-    if type(schema) is not int or not 1 <= schema <= CURRENT_SCHEMA_VERSION:
+    maxSchema = 3 if version == LEGACY_FORMAT_VERSION else CURRENT_SCHEMA_VERSION
+    if type(schema) is not int or not 1 <= schema <= maxSchema:
         raise ValueError(f"unsupported export schema version: {schema!r}")
-    if manifest.get("files") != [row[0] for row in _LOAD_ORDER]:
+    loadOrder = _LOAD_ORDER_V2 if version == LEGACY_FORMAT_VERSION else _LOAD_ORDER
+    if manifest.get("files") != [row[0] for row in loadOrder]:
         raise ValueError("export format manifest has an unexpected table set")
     hashes = manifest.get("sha256")
-    expectedNames = [row[0] for row in _LOAD_ORDER]
+    expectedNames = [row[0] for row in loadOrder]
     if not isinstance(hashes, dict) or set(hashes) != set(expectedNames):
         raise ValueError("export format manifest has an invalid digest set")
     for filename in expectedNames:
@@ -74,7 +88,7 @@ def _loadOrder(directory):
                 or any(ch not in "0123456789abcdef" for ch in digest)):
             raise ValueError(
                 f"export format manifest has an invalid digest for {filename}")
-    return _LOAD_ORDER, hashes
+    return loadOrder, hashes
 
 
 def _readRows(path, expectedDigest=None):
@@ -99,6 +113,99 @@ def _readRows(path, expectedDigest=None):
                 f"expected {expectedDigest}, got {actual}")
 
 
+def _validateExportText(value, field, maximum=None, *, optional=False, allowEmpty=False):
+    if optional and value is None:
+        return
+    if not isinstance(value, str):
+        raise ValueError(f"format 3 {field} must be text")
+    if not allowEmpty and not value.strip():
+        raise ValueError(f"format 3 {field} must be nonblank")
+    if maximum is not None and len(value) > maximum:
+        raise ValueError(f"format 3 {field} exceeds maximum length {maximum}")
+
+
+def _validateExportInteger(value, field, *, minimum=0, optional=False):
+    if optional and value is None:
+        return
+    if type(value) is not int or value < minimum:
+        raise ValueError(
+            f"format 3 {field} must be a nonnegative integer"
+            if minimum == 0
+            else f"format 3 {field} must be an integer >= {minimum}"
+        )
+
+
+def _validateFormat3Row(table, row):
+    if not isinstance(row, dict):
+        raise ValueError(f"format 3 {table} row must be an object")
+    if table == "task_checkpoints":
+        _validateExportText(row.get("id"), "task checkpoint id", 256)
+        _validateExportText(row.get("project"), "checkpoint project", 256)
+        _validateExportText(row.get("agent"), "checkpoint agent", 64)
+        _validateExportText(row.get("task_id"), "checkpoint task_id", 256)
+        _validateExportInteger(row.get("revision"), "checkpoint revision", minimum=1)
+        _validateExportText(row.get("request_id"), "checkpoint request_id", 256)
+        if row.get("state") not in ("active", "blocked", "completed", "abandoned"):
+            raise ValueError(f"format 3 checkpoint state is invalid: {row.get('state')!r}")
+        _validateExportText(row.get("body"), "checkpoint body", 32000, allowEmpty=True)
+        _validateExportText(row.get("source"), "checkpoint source")
+        _validateExportText(row.get("writer_session"), "checkpoint writer_session", optional=True, allowEmpty=True)
+        _validateExportText(row.get("source_ref"), "checkpoint source_ref", optional=True, allowEmpty=True)
+        _validateExportInteger(row.get("recorded_at"), "checkpoint recorded_at")
+        return
+    if table == "recall_receipts":
+        _validateExportText(row.get("id"), "receipt id", 256)
+        _validateExportText(row.get("query"), "receipt query", 8192)
+        _validateExportText(row.get("project"), "receipt project", 256, optional=True)
+        _validateExportText(row.get("agent"), "receipt agent", 64)
+        _validateExportText(row.get("task_id"), "receipt task_id", 256)
+        _validateExportText(row.get("source_ref"), "receipt source_ref", 256)
+        _validateExportInteger(row.get("recorded_at"), "receipt recorded_at")
+        return
+    if table == "recall_exposures":
+        _validateExportText(row.get("receipt_id"), "exposure receipt_id", 256)
+        _validateExportText(row.get("atom_id"), "exposure atom_id", 256)
+        _validateExportInteger(row.get("rank"), "exposure rank", minimum=1)
+        score = row.get("score")
+        if score is not None and (
+            isinstance(score, bool)
+            or not isinstance(score, (int, float))
+            or not math.isfinite(score)
+        ):
+            raise ValueError("format 3 exposure score must be finite or null")
+        if row.get("delivery") not in ("body", "handle"):
+            raise ValueError(f"format 3 exposure delivery is invalid: {row.get('delivery')!r}")
+        return
+    if table == "recall_feedback":
+        for field in ("event_id", "receipt_id", "atom_id", "source", "task_id"):
+            _validateExportText(row.get(field), f"feedback {field}", 256)
+        _validateExportText(row.get("agent"), "feedback agent", 64)
+        if row.get("feedback_type") not in ("shown", "used", "helpful", "irrelevant", "outdated"):
+            raise ValueError(f"format 3 feedback_type is invalid: {row.get('feedback_type')!r}")
+        _validateExportText(row.get("session_id"), "feedback session_id", 256, optional=True)
+        _validateExportText(row.get("source_ref"), "feedback source_ref", 2048, optional=True)
+        _validateExportText(row.get("note"), "feedback note", 2048, optional=True)
+        if row.get("feedback_type") != "shown" and not (row.get("note") or "").strip():
+            raise ValueError("format 3 feedback note is required for non-shown feedback")
+        _validateExportInteger(row.get("recorded_at"), "feedback recorded_at")
+        _validateExportInteger(row.get("processed_at"), "feedback processed_at", optional=True)
+        return
+    if table == "memory_credits":
+        _validateExportText(row.get("atom_id"), "credit atom_id", 256)
+        _validateExportText(row.get("agent"), "credit agent", 64)
+        _validateExportText(row.get("task_id"), "credit task_id", 256)
+        _validateExportText(row.get("feedback_id"), "credit feedback_id", 256)
+        _validateExportInteger(row.get("awarded_at"), "credit awarded_at")
+
+
+def _checkedRows(table, columns, rows):
+    for row in rows:
+        _validateFormat3Row(table, row)
+        if set(row) != set(columns):
+            raise ValueError(f"format 3 {table} row has an unexpected column set")
+        yield row
+
+
 def _insertRows(conn, table, cols, rows):
     sql = (
         f"INSERT INTO {table}({', '.join(cols)}) "
@@ -106,6 +213,72 @@ def _insertRows(conn, table, cols, rows):
     )
     for obj in rows:
         conn.execute(sql, tuple(obj[c] for c in cols))
+
+
+def _validateFormat3Relations(conn, loadOrder):
+    """Reject cross-table scope violations before publishing a v4 restore."""
+    if loadOrder != _LOAD_ORDER:
+        return
+    feedbackMismatch = conn.execute(
+        "SELECT f.event_id FROM recall_feedback AS f "
+        "LEFT JOIN recall_receipts AS r ON r.id = f.receipt_id "
+        "WHERE r.id IS NULL OR f.agent != r.agent OR f.task_id != r.task_id "
+        "LIMIT 1"
+    ).fetchone()
+    if feedbackMismatch is not None:
+        raise ValueError(
+            "format 3 feedback scope does not match its receipt: "
+            f"event_id={feedbackMismatch[0]!r}"
+        )
+    invalidNote = conn.execute(
+        "SELECT event_id FROM recall_feedback "
+        "WHERE feedback_type != 'shown' AND (note IS NULL OR trim(note) = '') "
+        "LIMIT 1"
+    ).fetchone()
+    if invalidNote is not None:
+        raise ValueError(
+            "format 3 feedback note is required for non-shown feedback: "
+            f"event_id={invalidNote[0]!r}"
+        )
+    oversizedReceipt = conn.execute(
+        "SELECT receipt_id, COUNT(*) FROM recall_exposures "
+        "GROUP BY receipt_id HAVING COUNT(*) > 32 LIMIT 1"
+    ).fetchone()
+    if oversizedReceipt is not None:
+        raise ValueError(
+            "format 3 receipt has too many exposures: "
+            f"receipt_id={oversizedReceipt[0]!r} count={oversizedReceipt[1]}"
+        )
+    creditMismatch = conn.execute(
+        "SELECT c.atom_id, c.agent, c.task_id, c.feedback_id "
+        "FROM memory_credits AS c "
+        "LEFT JOIN recall_feedback AS f ON f.event_id = c.feedback_id "
+        "WHERE c.feedback_id IS NULL OR ("
+        "f.event_id IS NULL OR f.feedback_type != 'helpful' OR f.processed_at IS NULL "
+        "OR f.atom_id != c.atom_id OR f.agent != c.agent OR f.task_id != c.task_id) "
+        "LIMIT 1"
+    ).fetchone()
+    if creditMismatch is not None:
+        raise ValueError(
+            "format 3 memory credit does not reference matching helpful feedback: "
+            f"atom_id={creditMismatch[0]!r} agent={creditMismatch[1]!r} "
+            f"task_id={creditMismatch[2]!r} feedback_id={creditMismatch[3]!r}"
+        )
+    missingCredit = conn.execute(
+        "SELECT f.event_id, f.atom_id, f.agent, f.task_id "
+        "FROM recall_feedback AS f "
+        "WHERE f.feedback_type = 'helpful' AND f.processed_at IS NOT NULL "
+        "AND NOT EXISTS ("
+        "SELECT 1 FROM memory_credits AS c "
+        "WHERE c.atom_id = f.atom_id AND c.agent = f.agent AND c.task_id = f.task_id) "
+        "LIMIT 1"
+    ).fetchone()
+    if missingCredit is not None:
+        raise ValueError(
+            "format 3 processed helpful feedback requires a scope credit: "
+            f"event_id={missingCredit[0]!r} atom_id={missingCredit[1]!r} "
+            f"agent={missingCredit[2]!r} task_id={missingCredit[3]!r}"
+        )
 
 
 def _targetExistsError(target):
@@ -204,8 +377,15 @@ def rebuild(fromDir, newDbPath):
                 expected = None if expectedDigests is None else expectedDigests[filename]
                 _insertRows(
                     conn, table, cols,
-                    _readRows(srcDir / filename, expectedDigest=expected),
+                    _checkedRows(
+                        table,
+                        cols,
+                        _readRows(srcDir / filename, expectedDigest=expected),
+                    )
+                    if loadOrder == _LOAD_ORDER and table in _V4_TABLES
+                    else _readRows(srcDir / filename, expectedDigest=expected),
                 )
+            _validateFormat3Relations(conn, loadOrder)
             if expectedDigests is None:
                 _checkLegacySourceUnchanged(srcDir)
             conn.commit()

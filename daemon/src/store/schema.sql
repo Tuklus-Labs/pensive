@@ -91,6 +91,80 @@ CREATE TABLE IF NOT EXISTS supersession_proposals (
 CREATE INDEX IF NOT EXISTS idx_supersession_proposals_status
   ON supersession_proposals(status);
 
+CREATE TABLE IF NOT EXISTS task_checkpoints (
+  id             TEXT PRIMARY KEY,
+  project        TEXT NOT NULL,
+  agent          TEXT NOT NULL,
+  task_id        TEXT NOT NULL,
+  revision       INTEGER NOT NULL CHECK(revision >= 1),
+  request_id     TEXT NOT NULL UNIQUE,
+  state          TEXT NOT NULL CHECK(state IN ('active','blocked','completed','abandoned')),
+  body           TEXT NOT NULL,
+  source         TEXT NOT NULL,
+  writer_session TEXT,
+  source_ref     TEXT,
+  recorded_at    INTEGER NOT NULL,
+  UNIQUE(project, agent, task_id, revision)
+);
+CREATE INDEX IF NOT EXISTS idx_task_checkpoints_scope_revision
+  ON task_checkpoints(project, agent, task_id, revision DESC);
+CREATE INDEX IF NOT EXISTS idx_task_checkpoints_task_agent_project
+  ON task_checkpoints(task_id, agent, project);
+
+CREATE TABLE IF NOT EXISTS recall_receipts (
+  id          TEXT PRIMARY KEY,
+  query       TEXT NOT NULL,
+  project     TEXT,
+  agent       TEXT NOT NULL,
+  task_id     TEXT NOT NULL,
+  source_ref  TEXT NOT NULL,
+  recorded_at INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_recall_receipts_task_agent_time
+  ON recall_receipts(task_id, agent, recorded_at);
+
+CREATE TABLE IF NOT EXISTS recall_exposures (
+  receipt_id TEXT NOT NULL REFERENCES recall_receipts(id),
+  atom_id    TEXT NOT NULL REFERENCES atoms(id),
+  rank       INTEGER NOT NULL CHECK(rank >= 1),
+  score      REAL,
+  delivery   TEXT NOT NULL,
+  PRIMARY KEY(receipt_id, atom_id),
+  UNIQUE(receipt_id, rank)
+);
+CREATE INDEX IF NOT EXISTS idx_recall_exposures_atom
+  ON recall_exposures(atom_id);
+
+CREATE TABLE IF NOT EXISTS recall_feedback (
+  event_id      TEXT PRIMARY KEY,
+  receipt_id    TEXT NOT NULL,
+  atom_id       TEXT NOT NULL,
+  feedback_type TEXT NOT NULL CHECK(feedback_type IN ('shown','used','helpful','irrelevant','outdated')),
+  source        TEXT NOT NULL,
+  agent         TEXT NOT NULL,
+  task_id       TEXT NOT NULL,
+  session_id    TEXT,
+  source_ref    TEXT,
+  note          TEXT,
+  recorded_at   INTEGER NOT NULL,
+  processed_at  INTEGER,
+  FOREIGN KEY(receipt_id, atom_id)
+    REFERENCES recall_exposures(receipt_id, atom_id)
+);
+CREATE INDEX IF NOT EXISTS idx_recall_feedback_pending_type
+  ON recall_feedback(processed_at, feedback_type);
+CREATE INDEX IF NOT EXISTS idx_recall_feedback_receipt
+  ON recall_feedback(receipt_id);
+
+CREATE TABLE IF NOT EXISTS memory_credits (
+  atom_id     TEXT NOT NULL REFERENCES atoms(id),
+  agent       TEXT NOT NULL,
+  task_id     TEXT NOT NULL,
+  feedback_id TEXT NOT NULL REFERENCES recall_feedback(event_id),
+  awarded_at  INTEGER NOT NULL,
+  PRIMARY KEY(atom_id, agent, task_id)
+);
+
 CREATE VIRTUAL TABLE IF NOT EXISTS fts USING fts5(
   text, content='atoms', content_rowid='rowid'
 );

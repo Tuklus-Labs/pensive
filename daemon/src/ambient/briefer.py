@@ -62,12 +62,14 @@ import time
 from recall.payload import estimateTokens, tier0Handle, tier1Entry
 from recall.fusion import importanceFactor, timeFactor
 from recall.strata import MEMORY_KINDS
+from store.checkpoints import getTaskStates
 
 __all__ = [
     "brief",
     "looseHeader",
     "SECTION_PINNED",
     "SECTION_ACTIVE",
+    "SECTION_TASK",
     "PIN_FACET_KEY",
     "LOOSE_TAG_KEY",
     "FOR_TAG_PREFIX",
@@ -93,6 +95,7 @@ FOR_TAG_PREFIX = "for:"
 # Section headers -- lowercase, minimal, the only structure the reader learns.
 SECTION_PINNED = "pinned:"
 SECTION_ACTIVE = "active:"
+SECTION_TASK = "current task state:"
 
 # The warning line written into the brief when the pins alone blow the budget.
 PINS_EXCEED_BUDGET = "pins exceed budget"
@@ -343,12 +346,60 @@ def _fitLoose(store, looseIds, committed, budget, agent):
     return header + _LINE_SEP + _SECTION_SEP.join(selected)
 
 
+def _taskMetadata(checkpoint, *, compact=False):
+    metadata = (
+        f"task {checkpoint['taskId']} revision {checkpoint['revision']} "
+        f"state={checkpoint['state']}"
+    )
+    if compact:
+        return metadata
+    return f"{metadata} project={checkpoint['project']} agent={checkpoint['agent']}"
+
+
+def _fitsTaskBlock(block, committed, budget):
+    return estimateTokens(_SECTION_SEP.join(committed + [block])) <= budget
+
+
+def _renderTaskStateBlock(checkpoints, committed, budget, truncated=False):
+    """Render bounded task heads with metadata and explicit body omissions."""
+    if not checkpoints:
+        return None
+    lines = [SECTION_TASK]
+    omitted = False
+    for index, checkpoint in enumerate(checkpoints):
+        reserveOmission = truncated or index < len(checkpoints) - 1
+        full = _taskMetadata(checkpoint) + _LINE_SEP + checkpoint["body"]
+        fullBlock = _LINE_SEP.join(lines + [full])
+        marker = _LINE_SEP + "[more omitted]" if reserveOmission else ""
+        if _fitsTaskBlock(fullBlock + marker, committed, budget):
+            lines.append(full)
+            continue
+        compact = (
+            _taskMetadata(checkpoint, compact=True)
+            + _LINE_SEP
+            + "[body omitted]"
+        )
+        compactBlock = _LINE_SEP.join(lines + [compact])
+        if _fitsTaskBlock(compactBlock + marker, committed, budget):
+            lines.append(compact)
+            continue
+        omitted = True
+        break
+
+    if truncated or omitted:
+        markerBlock = _LINE_SEP.join(lines + ["[more omitted]"])
+        if _fitsTaskBlock(markerBlock, committed, budget):
+            lines.append("[more omitted]")
+    return _LINE_SEP.join(lines) if len(lines) > 1 else None
+
+
 def brief(store, opts=None):
     """Assemble the session-start working set for ``store`` -> plain-text string.
 
-    ``opts`` is ``{agent, budget=1500}`` (the fixed interface), plus an optional
-    ``now`` (unix seconds) that lets a caller brief "as of" a fixed clock -- it
-    defaults to the wall clock and is the hook tests use for determinism.
+    ``opts`` is ``{agent, budget=1500}`` (the fixed interface), plus optional
+    ``taskId`` and ``project`` for an explicit task view and ``now`` (unix
+    seconds) for a fixed clock. The task view shows current checkpoint heads,
+    suppresses generic active memories, and retains pins and addressed loose ends.
 
     - ``agent``: the starting agent; drives the loose-ends section AND the
       active-thread pool. ``None`` (or blank) is the operator fleet view:
@@ -364,6 +415,8 @@ def brief(store, opts=None):
     """
     opts = opts or {}
     agent = _normalizeBriefAgent(opts.get("agent"))
+    taskId = opts.get("taskId")
+    project = opts.get("project")
     budget = opts.get("budget", DEFAULT_BUDGET)
     now = opts.get("now")
     if now is None:
@@ -375,16 +428,27 @@ def brief(store, opts=None):
     # some agent's loose-ends section, not the ambient active threads). looseIds is
     # a subset of the addressed set, so this also de-dups the current agent's notes.
     exclude = set(pinnedIds) | _addressedIds(store)
-    activeScored = _activeRanked(store, now, exclude, agent=agent)
+    activeScored = None
+    if taskId is None:
+        activeScored = _activeRanked(store, now, exclude, agent=agent)
 
     sections = []
     pinnedBlock = _renderPinned(store, pinnedIds, budget)
     if pinnedBlock:
         sections.append(pinnedBlock)
 
-    activeBlock = _fitActive(store, activeScored, sections, budget)
-    if activeBlock:
-        sections.append(activeBlock)
+    if taskId is not None:
+        taskStates = getTaskStates(
+            store, taskId=taskId, project=project, agent=agent, limit=8)
+        taskBlock = _renderTaskStateBlock(
+            taskStates["checkpoints"], sections, budget,
+            truncated=taskStates["truncated"])
+        if taskBlock:
+            sections.append(taskBlock)
+    else:
+        activeBlock = _fitActive(store, activeScored, sections, budget)
+        if activeBlock:
+            sections.append(activeBlock)
 
     looseBlock = _fitLoose(store, looseIds, sections, budget, agent)
     if looseBlock:

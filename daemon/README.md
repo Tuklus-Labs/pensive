@@ -15,6 +15,9 @@ briefs. This is the natural-language memory service used by agents. The separate
 | Follow a correction | MCP `history` with the atom's ID or displayed `p3://` handle |
 | Correct a fact | MCP `correct` with `oldAtomId` and `newText` |
 | Keep/remove a standing memory | MCP `pin` / `unpin` |
+| Resume one task | MCP `task_state` with its unique `taskId` |
+| Record progress or completion | MCP `task_checkpoint` with `expectedRevision` and a stable `requestId` |
+| Report useful memory | MCP `recall_feedback` with an admitted record's `receiptId` and an evidence note |
 | Use the household shell integration | `pensive-recall` and `engram-emit` in the Engram repository's `tools/` directory |
 
 `recall` defaults to L2: authored `atom`, `narrative` and `snapshot` records.
@@ -53,14 +56,53 @@ the canonical commit; an error after that commit names the committed successor.
 Read that handle before retrying. Legacy supersession forks are exposed by
 history and integrity checks.
 
+Task checkpoints are a separate append-only stream keyed by project, agent and
+task ID. Reads return the latest revision, including completed or abandoned
+states; historical revisions and as-of reads remain available. A stale writer
+receives an error. Reusing the same request ID with the same input returns its
+original result, even if the task has since advanced. Never infer completion of
+the whole task from an assistant turn finishing.
+
+For Codex hooks, a parent and its workers share `session_id`. Verify the supplied
+transcript's `session_meta.payload.id` and matching session ID before using that
+unique task ID. Unknown transcript formats fall back to prompt-only recall.
+Legacy snapshots stay readable; they are not automatically assigned to tasks.
+`/brief?taskId=<id>&project=<project>` shows explicit task state with pins and
+addressed loose ends, replacing the generic active-memory section.
+
+Household CLI examples (substitute the verified task ID and current revision):
+
+```sh
+engram-emit checkpoint --project pensive --task-id TASK_ID --caller codex \
+  --expected-revision 0 --request-id REQUEST_ID --state active \
+  --body 'Validator passes; next run the restore check.'
+pensive-recall --state current --task-id TASK_ID --json
+pensive-recall --query 'Which restore checks are required?' \
+  --task-id TASK_ID --caller codex --receipt --json
+engram-emit feedback --receipt-id RECEIPT_ID --atom-id p3://ATOM_ID \
+  --task-id TASK_ID --caller codex --event-id EVENT_ID --type helpful \
+  --note 'The saved restore check caught a missing history table.'
+```
+
+Receipts describe the final records admitted by the response budget. They keep
+caller identity separate from the recall `agent` author filter. `shown` means
+delivery, `used` needs evidence of use, and `helpful` needs an observed benefit.
+Only helpful feedback can increase importance, once per atom/caller/task and by
+at most .01 up to the ranking ceiling; older values above that ceiling remain
+unchanged. Exposure counts never earn credit. Irrelevant or outdated reports do
+not automatically erase, supersede or globally penalize a memory.
+
 `store/export.py` and `store/rebuild.py` implement portable JSONL snapshots.
 Canonical memories, provenance, relationships and retained usage history belong
 in exports; embeddings and FTS are rebuilt. `store/backup.py` provides the
 SQLite backup path. Verify a restore on a fresh temporary database before
 replacing a working store.
-Format 2 includes per-file SHA-256 digests. Editing its JSONL by hand also
-requires updating those digests; mismatches are rejected. Legacy four-file
-exports remain readable, with no invented usage history.
+Format 3 includes all eleven canonical/history tables with per-file SHA-256
+digests. Schema 4 adds task checkpoints, receipts, exposures, feedback and
+credits without rewriting old memories. Format 2 remains the historical six-file
+format for schema <=3; those and legacy four-file exports remain readable.
+Imported feedback must satisfy the same scope and evidence rules as live writes.
+Restore publishes only after the complete snapshot validates.
 
 ## Code map and tests
 
@@ -72,6 +114,7 @@ exports remain readable, with no invented usage history.
 | `src/ambient/` | Session capture, briefs, deduplication and drift detection |
 | `src/lifecycle/` | Importance accrual, integrity and migration jobs |
 | `test/` | Daemon tests; synthetic fixtures and model-backed integration tests |
+| `eval/agent_outcomes/` | Frozen blind workflow replay, separate from retrieval and latency gates |
 
 From the repository root, run `python3 -m pytest daemon/test/ -q` for the daemon
 and `python3 -m pytest tests/ -q` for the standalone library. Model-backed tests

@@ -359,11 +359,24 @@ def buildApp(ctx):
 
     async def brief_endpoint(request):
         # The Phase 4 session-start working set as a VIEW over the store. GET so a
-        # SessionStart hook can curl it; agent + budget are query params. brief()
-        # performs zero writes, so this handler is read-only like /status.
+        # SessionStart hook can curl it; agent, project, taskId and budget are
+        # query params. brief() performs zero writes, so this handler is read-only
+        # like /status.
         agent = request.query_params.get("agent")
         if isinstance(agent, str):
             agent = agent.strip() or None
+        taskId = request.query_params.get("taskId")
+        if isinstance(taskId, str):
+            taskId = taskId.strip() or None
+        project = request.query_params.get("project")
+        if isinstance(project, str):
+            project = project.strip() or None
+        if taskId is not None and len(taskId) > 256:
+            return JSONResponse(
+                {"error": "taskId exceeds maximum length 256"}, status_code=400)
+        if project is not None and len(project) > 256:
+            return JSONResponse(
+                {"error": "project exceeds maximum length 256"}, status_code=400)
         budgetRaw = request.query_params.get("budget")
         if budgetRaw in (None, ""):
             budget = DEFAULT_BUDGET
@@ -376,8 +389,14 @@ def buildApp(ctx):
             if budget < 1:
                 return JSONResponse(
                     {"error": "budget must be >= 1"}, status_code=400)
-        text = brief(ctx.store, {"agent": agent, "budget": budget})
-        return JSONResponse({"brief": text, "agent": agent, "budget": budget})
+        options = {"agent": agent, "budget": budget}
+        if taskId is not None:
+            options.update({"project": project, "taskId": taskId})
+        text = brief(ctx.store, options)
+        payload = {"brief": text, "agent": agent, "budget": budget}
+        if taskId is not None:
+            payload.update({"project": project, "taskId": taskId})
+        return JSONResponse(payload)
 
     @contextlib.asynccontextmanager
     async def lifespan(_app):

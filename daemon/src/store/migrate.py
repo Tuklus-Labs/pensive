@@ -7,7 +7,79 @@ database recorded at a version newer than this build is refused rather than
 downgraded, because canonical data must never become unrecoverable.
 """
 
-CURRENT_SCHEMA_VERSION = 3
+CURRENT_SCHEMA_VERSION = 4
+
+_V4_DDL = (
+    """CREATE TABLE IF NOT EXISTS task_checkpoints (
+  id             TEXT PRIMARY KEY,
+  project        TEXT NOT NULL,
+  agent          TEXT NOT NULL,
+  task_id        TEXT NOT NULL,
+  revision       INTEGER NOT NULL CHECK(revision >= 1),
+  request_id     TEXT NOT NULL UNIQUE,
+  state          TEXT NOT NULL CHECK(state IN ('active','blocked','completed','abandoned')),
+  body           TEXT NOT NULL,
+  source         TEXT NOT NULL,
+  writer_session TEXT,
+  source_ref     TEXT,
+  recorded_at    INTEGER NOT NULL,
+  UNIQUE(project, agent, task_id, revision)
+)""",
+    """CREATE INDEX IF NOT EXISTS idx_task_checkpoints_scope_revision
+  ON task_checkpoints(project, agent, task_id, revision DESC)""",
+    """CREATE INDEX IF NOT EXISTS idx_task_checkpoints_task_agent_project
+  ON task_checkpoints(task_id, agent, project)""",
+    """CREATE TABLE IF NOT EXISTS recall_receipts (
+  id          TEXT PRIMARY KEY,
+  query       TEXT NOT NULL,
+  project     TEXT,
+  agent       TEXT NOT NULL,
+  task_id     TEXT NOT NULL,
+  source_ref  TEXT NOT NULL,
+  recorded_at INTEGER NOT NULL
+)""",
+    """CREATE INDEX IF NOT EXISTS idx_recall_receipts_task_agent_time
+  ON recall_receipts(task_id, agent, recorded_at)""",
+    """CREATE TABLE IF NOT EXISTS recall_exposures (
+  receipt_id TEXT NOT NULL REFERENCES recall_receipts(id),
+  atom_id    TEXT NOT NULL REFERENCES atoms(id),
+  rank       INTEGER NOT NULL CHECK(rank >= 1),
+  score      REAL,
+  delivery   TEXT NOT NULL,
+  PRIMARY KEY(receipt_id, atom_id),
+  UNIQUE(receipt_id, rank)
+)""",
+    """CREATE INDEX IF NOT EXISTS idx_recall_exposures_atom
+  ON recall_exposures(atom_id)""",
+    """CREATE TABLE IF NOT EXISTS recall_feedback (
+  event_id      TEXT PRIMARY KEY,
+  receipt_id    TEXT NOT NULL,
+  atom_id       TEXT NOT NULL,
+  feedback_type TEXT NOT NULL CHECK(feedback_type IN ('shown','used','helpful','irrelevant','outdated')),
+  source        TEXT NOT NULL,
+  agent         TEXT NOT NULL,
+  task_id       TEXT NOT NULL,
+  session_id    TEXT,
+  source_ref    TEXT,
+  note          TEXT,
+  recorded_at   INTEGER NOT NULL,
+  processed_at  INTEGER,
+  FOREIGN KEY(receipt_id, atom_id)
+    REFERENCES recall_exposures(receipt_id, atom_id)
+)""",
+    """CREATE INDEX IF NOT EXISTS idx_recall_feedback_pending_type
+  ON recall_feedback(processed_at, feedback_type)""",
+    """CREATE INDEX IF NOT EXISTS idx_recall_feedback_receipt
+  ON recall_feedback(receipt_id)""",
+    """CREATE TABLE IF NOT EXISTS memory_credits (
+  atom_id     TEXT NOT NULL REFERENCES atoms(id),
+  agent       TEXT NOT NULL,
+  task_id     TEXT NOT NULL,
+  feedback_id TEXT NOT NULL REFERENCES recall_feedback(event_id),
+  awarded_at  INTEGER NOT NULL,
+  PRIMARY KEY(atom_id, agent, task_id)
+)""",
+)
 
 
 def migrate(store):
@@ -45,6 +117,26 @@ def migrate(store):
         store._setVersion(3)
         version = 3
         dirty = True
+
+    if version < 4:
+        # sqlite3.executescript commits an open transaction before running. Use
+        # individual DDL statements for this step so the schema objects and the
+        # version stamp are one atomic upgrade.
+        try:
+            # The older ladder stamps each version with a normal INSERT. On a
+            # fresh file, that leaves the v3 stamp's transaction open after the
+            # v2/v3 executescript calls; close that completed prefix before
+            # starting the v4 write lock.
+            if store._conn.in_transaction:
+                store._commit()
+            store._conn.execute("BEGIN IMMEDIATE")
+            _upgrade_3_to_4(store)
+            store._setVersion(4)
+            version = 4
+            dirty = True
+        except Exception:
+            store._conn.rollback()
+            raise
 
     if dirty:  # a no-op re-open of an up-to-date db writes nothing
         store._commit()
@@ -115,3 +207,9 @@ def _upgrade_2_to_3(store):
           ON facets(key, value, atom_id);
         """
     )
+
+
+def _upgrade_3_to_4(store):
+    """Create task state and feedback tables without changing old rows."""
+    for ddl in _V4_DDL:
+        store._conn.execute(ddl)

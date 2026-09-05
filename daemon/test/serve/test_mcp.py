@@ -251,7 +251,8 @@ def test_compat_tool_schemas_are_verbatim():
 
 def test_native_tools_present_with_required_fields():
     names = {t.name for t in NATIVE_TOOLS}
-    assert names == {"recall", "history", "correct", "pin", "unpin", "recall_records"}, (
+    assert names == {"recall", "history", "correct", "pin", "unpin", "recall_records",
+                     "task_checkpoint", "task_state", "recall_feedback"}, (
         f"native-tool set rule violated: names={sorted(names)!r}"
     )
     expectedRequired = {
@@ -261,6 +262,9 @@ def test_native_tools_present_with_required_fields():
         "correct": ["oldAtomId", "newText"],
         "pin": ["atomId"],
         "unpin": ["atomId"],
+        "task_checkpoint": ["project", "taskId", "requestId", "expectedRevision", "state", "body"],
+        "task_state": [],
+        "recall_feedback": ["receiptId", "atomId", "eventId", "feedbackType", "taskId"],
     }
     for name, required in expectedRequired.items():
         actual = _tool(NATIVE_TOOLS, name).inputSchema["required"]

@@ -29,8 +29,10 @@ def seed(store):
     return old
 
 
-def test_restore_preserves_usage_and_review_history_and_accrues_once(tmp_path):
-    # E1/E2: processed_at is state, not disposable index data.
+def test_restore_preserves_usage_and_review_history_legacy_usage_is_inert(tmp_path):
+    # E1/E2: processed_at is state, not disposable index data. Legacy exposure
+    # logs remain durable history, but no longer earn importance; only explicit
+    # recall_feedback can create a memory credit in schema v4.
     src = openStore(tmp_path / "source.db")
     dst = None
     try:
@@ -46,11 +48,16 @@ def test_restore_preserves_usage_and_review_history_and_accrues_once(tmp_path):
         before = getAtom(dst, atom)["importance"]
         first = accrueImportance(dst)
         second = accrueImportance(dst)
-        assert first["processed"] == 1 and second["processed"] == 0, (
-            f"E2 only pending usage accrues once: first={first!r}, second={second!r}")
-        assert getAtom(dst, atom)["importance"] == pytest.approx(before + 0.03), (
-            f"E2 restored processed usage must not count twice: before={before}, "
+        assert first["processed"] == 0 and second["processed"] == 0, (
+            f"E2 legacy usage stays inert: first={first!r}, second={second!r}")
+        assert getAtom(dst, atom)["importance"] == pytest.approx(before), (
+            f"E2 legacy exposure does not earn importance: before={before}, "
             f"after={getAtom(dst, atom)['importance']}")
+        assert dst._conn.execute(
+            "SELECT COUNT(*) FROM recall_log"
+        ).fetchone()[0] == len(expected["recall_log"]), (
+            f"E2 legacy exposure history remains durable: expected={expected['recall_log']!r}"
+        )
     finally:
         src.close()
         if dst:

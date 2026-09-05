@@ -143,15 +143,15 @@ def test_log_recall_failure_leaves_recall_response_intact(ctx, monkeypatch):
     assert _recall_log_rows(ctx.store) == []
 
 
-def test_recall_log_rows_feed_importance_accrual_end_to_end(ctx, monkeypatch):
-    atom_id = _put(ctx.store, "retrieval should accrue importance", importance=0.10)
+def test_recall_log_rows_are_exposure_not_helpfulness_end_to_end(ctx, monkeypatch):
+    atom_id = _put(ctx.store, "retrieval alone cannot prove usefulness", importance=0.10)
     monkeypatch.setattr(mcp, "recall", lambda *a, **kw: _recall_result([atom_id]))
 
     text, is_error = dispatch(ctx, "recall", {"query": "importance signal"})
     report = accrueImportance(ctx.store)
 
-    assert is_error is False
-    assert f"p3://{atom_id}" in text
-    assert report == {"processed": 1, "updated": 1, "missingAtoms": 0}
-    assert getAtom(ctx.store, atom_id)["importance"] == pytest.approx(0.11)
-    assert _recall_log_rows(ctx.store)[0][4] is not None
+    assert is_error is False, 'ordinary recall still succeeds'
+    assert f"p3://{atom_id}" in text, 'served handle stays usable'
+    assert report == {"processed": 0, "updated": 0, "missingAtoms": 0}, 'exposure is not helpful feedback'
+    assert getAtom(ctx.store, atom_id)["importance"] == pytest.approx(0.10), 'retrieval cannot inflate importance'
+    assert _recall_log_rows(ctx.store)[0][4] is None, 'legacy telemetry remains historical exposure data'
