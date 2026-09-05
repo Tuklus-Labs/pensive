@@ -8,7 +8,7 @@ Scope: JSONL export format 2, legacy reads and complete history snapshots.
 | State transitions | E2: processed usage remains processed; pending usage accrues once after restore. |
 | Boundaries | E3: legacy four-file dumps remain readable; current empty tables still require their files. |
 | Malformed inputs | E4: missing current-format files and unsupported manifests fail before creating a target. |
-| Concurrency | E5: all tables come from one SQLite read snapshot even when another connection writes. E7: a rebuild racing publication either reads one manifest generation or rejects a digest mismatch; a legacy read rejects a transition to a manifested export before commit. E8: target reservation is atomic against a competing creator. |
+| Concurrency | E5: all tables come from one SQLite read snapshot even when another connection writes. E7: a rebuild racing publication either reads one manifest generation or rejects a digest mismatch; a legacy read rejects a transition to a manifested export before commit. E8: rebuild stays private until an atomic no-overwrite hard link publishes the closed, checkpointed database; a competing creator wins without either file being replaced. |
 | Persistence | E6: staging failure leaves a prior completed dump intact; interrupted publication is visibly incomplete. E9: staged files and publication state are flushed in an order that leaves Linux filesystem interruption fail-closed. Power-loss behavior still depends on filesystem and storage guarantees. |
 | Integration contracts | JSONL columns remain raw schema names; derived vectors/FTS remain rebuildable and excluded; unrelated destination files remain untouched. Format-2 rebuild is read-only on its source directory. Editing a format-2 JSONL file requires updating its manifest digest deliberately. |
 | Regression traps | boundary: E3; concurrency: E5/E7/E8; contract: E1/E4; encoding: Unicode query/source strings in E1; framework: N/A, plain JSONL; io: E6/E9; persistence: E1/E2/E6/E9; resource: table rows are streamed and hashed through the parsing descriptor; state: E2/E7. |
@@ -20,6 +20,11 @@ specific parse or SQLite error before an integrity mismatch. A publication marke
 prevents a partially replaced file set from being mistaken for a legacy dump;
 digests close the race where publication begins after rebuild's initial marker
 check. Existing dump files are replaced only after staging a complete snapshot.
+Rebuild likewise uses private staging under the destination parent. It commits,
+checkpoints and closes SQLite before fsyncing and hard-linking the main database
+into its public name. Build failures remove only the private directory. Once the
+public link exists, later fsync or reopen failures leave it in place for explicit
+operator inspection; no failure path unlinks a public target.
 
 ## Coverage
 
@@ -31,7 +36,7 @@ check. Existing dump files are replaced only after staging a complete snapshot.
 | E5 | `test_export_reads_all_tables_from_one_snapshot` |
 | E6 | `test_staging_failure_preserves_previous_complete_export`, `test_interrupted_publication_is_refused_as_incomplete` |
 | E7 | `test_rebuild_rejects_generation_changed_after_manifest_read`, `test_legacy_rebuild_rechecks_publication_transition_before_commit` |
-| E8 | `test_rebuild_atomically_refuses_competing_target_creator` |
+| E8 | `test_rebuild_atomically_refuses_competing_target_creator`, `test_rebuild_keeps_target_unclaimed_until_atomic_publication`, `test_rebuild_failure_never_exposes_or_cleans_up_the_public_target`, `test_rebuild_postpublication_open_failure_keeps_published_database`, `test_rebuild_refuses_unsafe_fallback_when_hard_links_are_unavailable` |
 | E9 | `test_export_fsyncs_staged_files_marker_and_directories` |
 | Read-only source contract | `test_format2_rebuild_reads_from_read_only_source` |
 
@@ -51,3 +56,17 @@ same result on 2026-09-05:
 | Write into the source export during rebuild | `test_format2_rebuild_reads_from_read_only_source` | 1 / 0 |
 
 Loudness audit: 23 assertions, zero missing rule-naming failure messages.
+
+## Private-publication sabotage pass
+
+Run 2026-09-05 against the four E8 private-publication tests:
+
+| Test | Production mutation and observation | Test mutation and observation | Conclusion |
+|---|---|---|---|
+| `test_rebuild_keeps_target_unclaimed_until_atomic_publication` | Replaced `os.link` with `os.replace`; test failed because publication did not raise. | Replaced byte equality with an existence check; test passed. | The exact-byte assertion detects destination replacement. |
+| `test_rebuild_failure_never_exposes_or_cleans_up_the_public_target` | Built SQLite at the public target; test failed with `observations=[True]`. | Replaced the false-only observation check with truthiness; test passed. | The observation assertion detects public exposure during a failed build. |
+| `test_rebuild_postpublication_open_failure_keeps_published_database` | Deleted the target when public reopen failed; test failed because the target was absent. | Replaced target existence with parent existence; test passed. | The target assertion detects postpublication cleanup. |
+| `test_rebuild_refuses_unsafe_fallback_when_hard_links_are_unavailable` | Fell back to `os.replace` after `os.link` failed; test failed because no error was raised. | Removed the diagnostic match from `pytest.raises`; test passed. | The exception and message checks detect unsafe fallback and unclear failure. |
+
+Loudness audit for the ten added assertions: zero missing rule names or diagnostic
+state. Each test and leading comment maps to E8.

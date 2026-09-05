@@ -17,16 +17,24 @@ Three rules make it safe to lean on for decades:
   * Rows are inserted in FK order so every reference resolves at insert time.
     ``PRAGMA foreign_keys`` is on, so malformed data fails before a trailing
     digest check can hide the specific SQLite error.
-  * ``rebuild`` atomically reserves a new database path and removes the partial
-    file on failure only while that path still names the inode it reserved.
+  * ``rebuild`` constructs and validates a private database, then publishes its
+    closed, checkpointed main file with an atomic no-overwrite hard link. Failed
+    builds never create or clean up through the requested public path.
 """
 import hashlib
 import json
 import os
 from pathlib import Path
+from tempfile import TemporaryDirectory
 
 from store.store import openStore, CURRENT_SCHEMA_VERSION
-from store.export import _TABLES, FORMAT_VERSION, MANIFEST_NAME, PUBLICATION_MARKER
+from store.export import (
+    _TABLES,
+    FORMAT_VERSION,
+    MANIFEST_NAME,
+    PUBLICATION_MARKER,
+    _fsyncDirectory,
+)
 
 __all__ = ["rebuild"]
 
@@ -100,33 +108,45 @@ def _insertRows(conn, table, cols, rows):
         conn.execute(sql, tuple(obj[c] for c in cols))
 
 
-def _reserveTarget(target):
+def _targetExistsError(target):
+    return FileExistsError(
+        f"rebuild target already exists: {target}; refusing to overwrite "
+        "(canonical data must never be clobbered)"
+    )
+
+
+def _checkpointAndClose(store):
+    """Make a staged WAL database self-contained before publishing its main file."""
+    conn = store._conn
     try:
-        descriptor = os.open(target, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-    except FileExistsError:
-        raise FileExistsError(
-            f"rebuild target already exists: {target}; refusing to overwrite "
-            "(canonical data must never be clobbered)"
-        ) from None
+        checkpoint = conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()
+        if checkpoint is None or checkpoint[0] != 0:
+            raise RuntimeError(
+                f"rebuild staging checkpoint did not complete: {checkpoint!r}")
+    finally:
+        store.close()
+
+
+def _fsyncFile(path):
+    descriptor = os.open(path, os.O_RDONLY)
     try:
-        stat = os.fstat(descriptor)
-        return stat.st_dev, stat.st_ino
+        os.fsync(descriptor)
     finally:
         os.close(descriptor)
 
 
-def _removeOwnedTarget(target, identity):
+def _publish(staged, target):
+    """Atomically add ``target`` without replacing any existing directory entry."""
     try:
-        stat = target.stat()
-    except FileNotFoundError:
-        return
-    if (stat.st_dev, stat.st_ino) != identity:
-        return
-    for artifact in (Path(f"{target}-wal"), Path(f"{target}-shm"), target):
-        try:
-            artifact.unlink()
-        except FileNotFoundError:
-            pass
+        os.link(staged, target)
+    except FileExistsError:
+        raise _targetExistsError(target) from None
+    except OSError as exc:
+        raise OSError(
+            f"rebuild cannot publish {target} safely: atomic no-overwrite "
+            f"hard link failed: {exc}"
+        ) from exc
+    _fsyncDirectory(target.parent)
 
 
 def _checkLegacySourceUnchanged(directory):
@@ -146,25 +166,23 @@ def rebuild(fromDir, newDbPath):
     column value is preserved verbatim from the export (ids, timestamps,
     statuses, weights, per-row ``schema_version``).
 
-    Preconditions and cleanup, so the target path is never left in a bad state:
+    Preconditions and publication, so the target path is never left in a bad state:
 
     * If ``newDbPath`` already exists, raises ``FileExistsError`` rather than
       clobbering a possibly-live store.
     * Every file required by the export version must exist (empty files are
       valid). Missing files, unsupported manifests and interrupted publication
       are refused before any database is created.
-    * If the insert pass fails partway, the half-built database is removed and the
-      error re-raised, so a corrected retry is not blocked by our own leftover.
+    * Inserts happen in a private temporary directory under the target's parent.
+      Failure removes only that private directory; the requested target does not
+      exist until the complete, checkpointed database is linked into place.
     """
     srcDir = Path(fromDir)
     target = Path(newDbPath)
-    # Fast refusal for an existing target. _reserveTarget repeats this atomically
-    # after source validation, closing the concurrent-creator gap.
+    # Fast refusal for a common error. _publish repeats the no-overwrite decision
+    # atomically after the private build, closing the concurrent-creator gap.
     if target.exists():
-        raise FileExistsError(
-            f"rebuild target already exists: {target}; refusing to overwrite "
-            "(canonical data must never be clobbered)"
-        )
+        raise _targetExistsError(target)
 
     # Require a COMPLETE export before creating anything, so a truncated dump can
     # never produce a store silently missing a whole canonical table.
@@ -176,25 +194,31 @@ def rebuild(fromDir, newDbPath):
             "refusing to rebuild a partial store"
         )
 
-    identity = _reserveTarget(target)
-    store = None
-    try:
-        store = openStore(target)
-        conn = store._conn
-        for filename, table, cols in loadOrder:
-            expected = None if expectedDigests is None else expectedDigests[filename]
-            _insertRows(
-                conn, table, cols,
-                _readRows(srcDir / filename, expectedDigest=expected),
-            )
-        if expectedDigests is None:
-            _checkLegacySourceUnchanged(srcDir)
-        conn.commit()
-    except BaseException:
-        if store is not None:
+    with TemporaryDirectory(
+            prefix=f".{target.name}.pensive-rebuild-", dir=target.parent) as temporary:
+        staged = Path(temporary) / "store.db"
+        store = openStore(staged)
+        try:
+            conn = store._conn
+            for filename, table, cols in loadOrder:
+                expected = None if expectedDigests is None else expectedDigests[filename]
+                _insertRows(
+                    conn, table, cols,
+                    _readRows(srcDir / filename, expectedDigest=expected),
+                )
+            if expectedDigests is None:
+                _checkLegacySourceUnchanged(srcDir)
+            conn.commit()
+        except BaseException:
             store._conn.rollback()
-            # Close SQLite before removing the inode this call reserved.
             store.close()
-        _removeOwnedTarget(target, identity)
-        raise
-    return store
+            raise
+
+        _checkpointAndClose(store)
+        os.chmod(staged, 0o600)
+        _fsyncFile(staged)
+        _publish(staged, target)
+
+    # Publication transfers ownership to the public path. A reopen failure must
+    # be reported without deleting or replacing the complete database now there.
+    return openStore(target)

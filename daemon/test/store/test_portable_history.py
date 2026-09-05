@@ -1,5 +1,7 @@
 """Regressions for RISK_MODEL_PORTABLE_HISTORY.md."""
+import errno
 import json
+from pathlib import Path
 import stat
 import threading
 
@@ -339,6 +341,139 @@ def test_rebuild_atomically_refuses_competing_target_creator(
             f"rows={rows!r} competitor={competitor!r}")
     finally:
         existing.close()
+
+
+def test_rebuild_keeps_target_unclaimed_until_atomic_publication(
+        tmp_path, monkeypatch):
+    # E8: a legitimate creator can claim the destination while the private build
+    # is in progress. Publication must refuse it without changing its bytes.
+    src = openStore(tmp_path / "source.db")
+    try:
+        seed(src)
+        directory = tmp_path / "dump"
+        exporter.exportJSONL(src, directory)
+    finally:
+        src.close()
+
+    target = tmp_path / "claimed-during-build.db"
+    competitor = b"independent creator\n"
+    originalInsertRows = rebuilder._insertRows
+    claimed = []
+
+    def claimDuringBuild(conn, table, cols, rows):
+        if not claimed:
+            with target.open("xb") as handle:
+                handle.write(competitor)
+            claimed.append(True)
+        return originalInsertRows(conn, table, cols, rows)
+
+    monkeypatch.setattr(rebuilder, "_insertRows", claimDuringBuild)
+    with pytest.raises(FileExistsError, match="refusing to overwrite"):
+        rebuilder.rebuild(directory, target)
+
+    assert claimed == [True], (
+        f"E8 competing creator must claim an initially free target: claimed={claimed!r}")
+    actual = target.read_bytes()
+    assert actual == competitor, (
+        "E8 failed publication must not alter a competing creator's file: "
+        f"actual={actual!r} expected={competitor!r}")
+
+
+def test_rebuild_failure_never_exposes_or_cleans_up_the_public_target(
+        tmp_path, monkeypatch):
+    # E8: invalid source rows fail inside private staging. The public path and
+    # SQLite sidecars must never appear, and TemporaryDirectory removes staging.
+    src = openStore(tmp_path / "source.db")
+    try:
+        seed(src)
+        directory = tmp_path / "dump"
+        exporter.exportJSONL(src, directory)
+    finally:
+        src.close()
+
+    target = tmp_path / "failed.db"
+    observations = []
+
+    def failDuringBuild(conn, table, cols, rows):
+        observations.append(target.exists())
+        raise ValueError("injected private build failure")
+
+    monkeypatch.setattr(rebuilder, "_insertRows", failDuringBuild)
+    with pytest.raises(ValueError, match="private build failure"):
+        rebuilder.rebuild(directory, target)
+
+    assert observations == [False], (
+        f"E8 public target must remain absent during build: observations={observations!r}")
+    assert not target.exists() and not Path(f"{target}-wal").exists(), (
+        f"E8 failed private build must not expose a target or WAL: target={target}")
+    assert not Path(f"{target}-shm").exists(), (
+        f"E8 failed private build must not expose shared-memory state: target={target}")
+    staging = list(tmp_path.glob(f".{target.name}.pensive-rebuild-*"))
+    assert staging == [], (
+        f"E8 failed private build must clean private staging: staging={staging!r}")
+
+
+def test_rebuild_postpublication_open_failure_keeps_published_database(
+        tmp_path, monkeypatch):
+    # E8: after an atomic publication succeeds, a caller-side reopen failure must
+    # never be treated as permission to delete the now-public canonical file.
+    src = openStore(tmp_path / "source.db")
+    try:
+        atom = seed(src)
+        directory = tmp_path / "dump"
+        exporter.exportJSONL(src, directory)
+    finally:
+        src.close()
+
+    target = tmp_path / "published.db"
+    originalOpenStore = rebuilder.openStore
+
+    def failPublicOpen(path):
+        if Path(path) == target:
+            raise OSError("injected postpublication open failure")
+        return originalOpenStore(path)
+
+    monkeypatch.setattr(rebuilder, "openStore", failPublicOpen)
+    with pytest.raises(OSError, match="postpublication open failure"):
+        rebuilder.rebuild(directory, target)
+
+    assert target.exists(), (
+        f"E8 a published database must survive reopen failure: target={target}")
+    restored = originalOpenStore(target)
+    try:
+        body = getAtom(restored, atom)["text"]
+        assert body == "remember why", (
+            f"E8 published database must be complete before public reopen: body={body!r}")
+    finally:
+        restored.close()
+
+
+def test_rebuild_refuses_unsafe_fallback_when_hard_links_are_unavailable(
+        tmp_path, monkeypatch):
+    # E8: filesystems without hard-link publication fail clearly. Rebuild must
+    # not substitute a replacing rename or copy into the public destination.
+    src = openStore(tmp_path / "source.db")
+    try:
+        seed(src)
+        directory = tmp_path / "dump"
+        exporter.exportJSONL(src, directory)
+    finally:
+        src.close()
+
+    target = tmp_path / "unsupported-link.db"
+
+    def unsupportedLink(_source, _target):
+        raise OSError(errno.EOPNOTSUPP, "hard links unavailable")
+
+    monkeypatch.setattr(rebuilder.os, "link", unsupportedLink)
+    with pytest.raises(OSError, match="atomic no-overwrite hard link failed"):
+        rebuilder.rebuild(directory, target)
+
+    assert not target.exists(), (
+        f"E8 unsupported publication must leave target absent: target={target}")
+    staging = list(tmp_path.glob(f".{target.name}.pensive-rebuild-*"))
+    assert staging == [], (
+        f"E8 unsupported publication must clean private staging: staging={staging!r}")
 
 
 def test_format2_rebuild_reads_from_read_only_source(tmp_path):
