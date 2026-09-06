@@ -48,7 +48,7 @@ from mcp.types import CallToolResult, TextContent, Tool
 from recall.engine import recall, DEFAULT_TIER, TIERS
 from recall.embedder import embedMissing, embedOne, blobToVec
 from recall.strata import KIND_CLASSES, MEMORY_KINDS
-from recall.vector_index import buildClassIndexes, selectIndex
+from recall.vector_index import buildClassIndexes, selectIndex, FlatIndex, exactSearchLimit
 from recall.payload import assembleTier2, estimateTokens
 from serve import viz
 from serve.memory_tools import SCHEMAS as MEMORY_SCHEMAS, DESCRIPTIONS as MEMORY_DESCRIPTIONS, runMemoryTool
@@ -267,7 +267,8 @@ class ServeContext:
     """
 
     def __init__(self, store, embedder, modelId, agent=None,
-                 defaultK=10, defaultTokenBudget=1500, aux=None):
+                 defaultK=10, defaultTokenBudget=1500, aux=None,
+                 indexCacheDir=None):
         self.store = store
         self.embedder = embedder
         self.modelId = modelId
@@ -276,6 +277,7 @@ class ServeContext:
         self.defaultTokenBudget = defaultTokenBudget
         self.indexes = {}
         self.aux = aux
+        self.indexCacheDir = indexCacheDir
         self.recallLogErrors = 0
         self.reindex()
 
@@ -318,8 +320,13 @@ class ServeContext:
             if kind not in classKinds:
                 continue
             index = self.indexes.get(name)
-            if index is None:
-                self.indexes[name] = selectIndex(self.store, self.modelId, classKinds)
+            if index is None or (
+                isinstance(index, FlatIndex) and len(index) >= exactSearchLimit(classKinds)
+            ):
+                # Bound physical rows during long-running sessions, including
+                # retired slots. Rebuilding compacts or promotes this class.
+                self.indexes[name] = selectIndex(
+                    self.store, self.modelId, classKinds, **self._indexCacheOptions())
             else:
                 index.add(atomId, vec)
         if self.aux is not None:
@@ -363,13 +370,18 @@ class ServeContext:
         if self.aux is not None:
             self.aux.reindex(self.store, kinds)
         if kinds is None:
-            self.indexes = buildClassIndexes(self.store, self.modelId)
+            self.indexes = buildClassIndexes(
+                self.store, self.modelId, **self._indexCacheOptions())
             return
         wanted = set(kinds)
         for name, classKinds in KIND_CLASSES:
             if wanted.intersection(classKinds):
-                self.indexes[name] = selectIndex(self.store, self.modelId,
-                                                 classKinds)
+                self.indexes[name] = selectIndex(
+                    self.store, self.modelId, classKinds, **self._indexCacheOptions())
+
+    def _indexCacheOptions(self):
+        cacheDir = getattr(self, "indexCacheDir", None)
+        return {"cacheDir": cacheDir} if cacheDir is not None else {}
 
 
 # --------------------------------------------------------------------------- #

@@ -1,17 +1,9 @@
-"""The resident MCP daemon: load the models once, serve over localhost.
+"""The resident local MCP/HTTP service for Pensive.
 
-Phase 3's "make it servable" host. One long-lived process loads the store, the
-embedder, the cross-encoder reranker, and the dense index ONCE at startup, then
-serves the :mod:`serve.mcp` tool surface over MCP Streamable-HTTP bound to
-127.0.0.1 only. This is the same SDK transport the production pensive server uses
-for its network mode, on a DIFFERENT port and WITHOUT the tailnet bearer gate --
-localhost-only means no external reachability, so there is no DIY auth to get
-wrong (a web exposure, which this is not, would sit behind Authelia forward-auth).
-
-It is deliberately a NEW process on a NEW port, off to the side: it never touches
-the running production MCP server or any live session config. Wiring an agent to
-it is the Gary-gated cutover (Task 22), not this task. Emits land in the v3 store
-ONLY.
+Startup opens the canonical SQLite store, loads the embedding model and builds
+or restores one index per memory class. The cross-encoder stays lazy unless an
+operator explicitly requests preload. Requests use the resident models and
+indexes; canonical writes retain provenance and correction history.
 
 Configuration (all env, documented so nothing is a mystery):
 
@@ -22,6 +14,12 @@ Configuration (all env, documented so nothing is a mystery):
 - ``PENSIVE_V3_MODEL``  -- embedding model id. Default ``BAAI/bge-small-en-v1.5``.
 - ``PENSIVE_V3_AGENT``  -- agent name stamped into emit provenance. Default unset
   (NULL agent).
+- ``PENSIVE_V3_INDEX_CACHE_DIR`` -- private derived HNSW snapshots. Defaults to
+  ``index-cache`` beside the store; an empty value disables snapshots.
+- ``PENSIVE_V3_BLAS_THREADS`` -- process-local BLAS budget, default 4; 0 disables
+  the cap. This does not change the caller's environment or other processes.
+- ``PENSIVE_V3_PRELOAD_RERANKER`` -- set to 1 to preload the optional cross-encoder.
+  Served L2/L3 do not use it, so normal startup leaves it lazy.
 - ``PENSIVE_V3_OPENAI_MODEL`` -- aux dense model id (e.g.
   ``text-embedding-3-large``). Default unset = feature off, recall byte-identical
   to the two-signal engine. When set, its backfilled vectors (see
@@ -63,10 +61,25 @@ _DEFAULT_PORT = 5999
 _DEFAULT_MODEL = "BAAI/bge-small-en-v1.5"
 # Bind localhost ONLY -- never an external interface (the brief's hard rule).
 _HOST = "127.0.0.1"
+_blasLimits = None
 
 
 def _log(msg):
     print(f"[{SERVER_NAME}] {msg}", file=sys.stderr, flush=True)
+
+
+def configureBlasThreads():
+    """Avoid oversubscribing the small matrix scans used by exact memory recall."""
+    global _blasLimits
+    try:
+        count = int(os.environ.get("PENSIVE_V3_BLAS_THREADS", "4"))
+    except ValueError:
+        count = 4
+    if count <= 0:
+        return 0
+    from threadpoolctl import threadpool_limits
+    _blasLimits = threadpool_limits(limits=count, user_api="blas")
+    return count
 
 
 def _setProcTitle():
@@ -102,6 +115,11 @@ def buildContext():
     storePath.parent.mkdir(parents=True, exist_ok=True)
     modelId = os.environ.get("PENSIVE_V3_MODEL", _DEFAULT_MODEL)
     agent = os.environ.get("PENSIVE_V3_AGENT") or None
+    cacheSetting = os.environ.get("PENSIVE_V3_INDEX_CACHE_DIR")
+    indexCacheDir = (
+        storePath.parent / "index-cache" if cacheSetting is None
+        else Path(cacheSetting) if cacheSetting else None
+    )
 
     _log(f"opening store {storePath}")
     store = openStore(storePath)
@@ -117,8 +135,9 @@ def buildContext():
     # is the honest answer; the model id is identical in both cases by design.
     _log(f"embedder runtime: {type(embedder).__name__} on {embedder.device}")
 
-    _log("warming cross-encoder reranker")
-    _warmReranker()
+    if os.environ.get("PENSIVE_V3_PRELOAD_RERANKER") == "1":
+        _log("warming cross-encoder reranker")
+        _warmReranker()
 
     # Aux dense signal (optional): construction failure means feature-off, never
     # a dead daemon -- recall must come up on base signals no matter what.
@@ -134,8 +153,13 @@ def buildContext():
             _log(f"aux dense signal DISABLED ({exc}); serving base signals only")
             aux = None
 
+    # Models may load additional numerical libraries. Apply the process-local
+    # limit after those imports and before exact matrix scans become active.
+    blasThreads = configureBlasThreads()
+    _log(f"BLAS thread budget: {blasThreads or 'unchanged'}")
     _log("embedding backlog + building dense index")
-    ctx = ServeContext(store, embedder, modelId, agent=agent, aux=aux)
+    ctx = ServeContext(store, embedder, modelId, agent=agent, aux=aux,
+                       indexCacheDir=indexCacheDir)
     _log("context ready")
     return ctx
 

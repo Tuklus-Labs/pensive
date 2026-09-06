@@ -127,3 +127,30 @@ client-observed latency/quality gate; historical green reports do not certify a
 new checkout or a loaded machine. The original v3 design lives in
 `../docs/superpowers/specs/2026-07-02-pensive-v3-design.md`; later evidence documents
 explain revisions, including explicit retractions.
+
+## Index reproducibility and startup
+
+The complete authored-memory class uses exact Flat search through 32,000 rows.
+Larger classes use HNSW with serial construction and explicit search expansion.
+The daemon promotes or compacts an exact index when a write reaches its physical
+row limit, so a long-running process cannot silently grow an unbounded scan.
+This threshold and the four-worker BLAS budget were measured on the current
+384-dimensional BGE corpus; other models and hosts need their own measurements.
+
+The daemon caches complete HNSW builds in a private `index-cache` directory next
+to its database. Fingerprints cover ordered IDs, embedding bytes, model, kinds
+and index settings. It verifies the native file digest and loaded shape/key set
+before use. Memory-only writes leave an unchanged document index reusable;
+changed document vectors require a new deterministic build. Cache failures fall
+back to rebuilding, and canonical exports do not depend on these derived files.
+Two valid snapshots are retained per namespace. Corrupt or unrelated files are
+preserved for inspection.
+
+Set `PENSIVE_V3_INDEX_CACHE_DIR` to override the directory, or to an empty value
+to disable snapshots. `PENSIVE_V3_BLAS_THREADS` controls this daemon's BLAS pools
+(default 4, zero leaves them unchanged). The optional cross-encoder can be
+preloaded with `PENSIVE_V3_PRELOAD_RERANKER=1`; ordinary served L2/L3 keep it lazy.
+
+A new task can discover related past work with
+`pensive-recall --state recent --project pensive --agent codex --json`, then
+inspect the selected task ID. A prior task's checkpoint remains its own history.

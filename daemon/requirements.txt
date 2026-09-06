@@ -4,6 +4,7 @@
 torch
 sentence-transformers
 numpy
+threadpoolctl>=3
 usearch>=2.25
 mcp
 starlette
