@@ -36,6 +36,11 @@ import numpy as np
 from usearch.index import Index
 
 from recall.embedder import blobToVec
+from recall.index_cache import (
+    indexFingerprint,
+    loadIndexSnapshot,
+    saveIndexSnapshot,
+)
 from recall.vector_index import VectorIndex
 
 __all__ = ["HnswIndex"]
@@ -50,6 +55,65 @@ __all__ = ["HnswIndex"]
 # 0.291/0.342/1.212/5.706/10.442ms. This measures cardinality cost on one
 # synthetic process, not a serving SLA. The unscoped path remains ANN.
 _SCOPED_VECTOR_BATCH = 4096
+
+# These parameters are part of recall quality, not incidental library defaults.
+# USearch's threads=0 means every available core; parallel insertion makes graph
+# topology depend on scheduler interleaving, so rebuilding unchanged canonical
+# rows on restart can return a different candidate pool. One insertion worker
+# preserves the ORDER BY atom_id sequence above. Wider search recovers more of
+# the exact top candidates without changing graph construction breadth.
+_HNSW_CONNECTIVITY = 16
+_HNSW_EXPANSION_ADD = 128
+_HNSW_EXPANSION_SEARCH = 1024
+_HNSW_ADD_THREADS = 1
+_HNSW_CACHE_PARAMETERS = {
+    "version": 1,
+    "metric": "cos",
+    "dtype": "f32",
+    "construction": {
+        "connectivity": _HNSW_CONNECTIVITY,
+        "expansion_add": _HNSW_EXPANSION_ADD,
+        "threads": _HNSW_ADD_THREADS,
+    },
+    "search": {"expansion_search": _HNSW_EXPANSION_SEARCH},
+}
+
+
+def _newIndex(ndim):
+    return Index(
+        ndim=ndim,
+        metric="cos",
+        dtype="f32",
+        connectivity=_HNSW_CONNECTIVITY,
+        expansion_add=_HNSW_EXPANSION_ADD,
+        expansion_search=_HNSW_EXPANSION_SEARCH,
+    )
+
+
+def _buildIndex(matrix):
+    index = _newIndex(matrix.shape[1])
+    index.add(
+        np.arange(matrix.shape[0], dtype=np.int64),
+        matrix,
+        threads=_HNSW_ADD_THREADS,
+    )
+    return index
+
+
+def _loadIndex(path, count, ndim):
+    index = _newIndex(ndim)
+    index.load(path)
+    index.expansion_search = _HNSW_EXPANSION_SEARCH
+    if index.size != count or index.ndim != ndim:
+        raise ValueError(
+            "cached HNSW shape does not match canonical rows: "
+            f"size={index.size}/{count} ndim={index.ndim}/{ndim}"
+        )
+    keys = np.asarray(index.keys, dtype=np.uint64)
+    expected = np.arange(count, dtype=np.uint64)
+    if not np.array_equal(keys, expected):
+        raise ValueError("cached HNSW keys are not the canonical 0..n-1 range")
+    return index
 
 
 class HnswIndex(VectorIndex):
@@ -72,7 +136,7 @@ class HnswIndex(VectorIndex):
         # read back; retirement has to be remembered explicitly.
         self._retiredIds = set()
 
-    def build(self, store, modelId, kinds=None):
+    def build(self, store, modelId, kinds=None, cacheDir=None):
         # EXACTLY FlatIndex.build's query: same LIVE filter, same model, same
         # optional kinds restriction, same ORDER BY -- the flat and HNSW indexes
         # for a given class must load one identical candidate universe.
@@ -91,16 +155,34 @@ class HnswIndex(VectorIndex):
         if not rows:
             self._index = None
             return self
+        ndim = blobToVec(rows[0][1]).shape[0]
+        namespace = fingerprint = None
+        if cacheDir is not None:
+            try:
+                namespace, fingerprint = indexFingerprint(
+                    rows, modelId, kinds, _HNSW_CACHE_PARAMETERS)
+                cached = loadIndexSnapshot(
+                    cacheDir,
+                    namespace,
+                    fingerprint,
+                    lambda path: _loadIndex(path, len(rows), ndim),
+                )
+            except Exception:
+                cached = None
+            if cached is not None:
+                self._index = cached
+                return self
         # np.stack copies the read-only frombuffer views into one owned, writable
         # (n, dim) float32 array -- what usearch.add wants.
         matrix = np.stack([blobToVec(r[1]) for r in rows]).astype(
             np.float32, copy=False
         )
-        index = Index(ndim=matrix.shape[1], metric="cos", dtype="f32")
         # Keys 0..n-1 index straight into self._atomIds; the add order matches the
         # ORDER BY atom_id row order.
-        index.add(np.arange(len(self._atomIds), dtype=np.int64), matrix)
+        index = _buildIndex(matrix)
         self._index = index
+        if cacheDir is not None and namespace is not None:
+            saveIndexSnapshot(cacheDir, namespace, fingerprint, index)
         return self
 
     def remove(self, atomId):
@@ -129,14 +211,14 @@ class HnswIndex(VectorIndex):
         if self._index is None:
             # build() leaves _index None on an empty store because usearch needs
             # a positive ndim to construct. The first added vector supplies it.
-            self._index = Index(ndim=row.shape[0], metric="cos", dtype="f32")
+            self._index = _newIndex(row.shape[0])
         key = len(self._atomIds)
         # The key must equal the position this atom takes in _atomIds, because
         # search maps a usearch key straight back through _atomIds[key]. Appending
         # keeps that correspondence, and ULIDs are monotonic so a newly written
         # atom also sorts last under build()'s ORDER BY atom_id: the append lands
         # where a rebuild would have put it.
-        self._index.add(key, row)
+        self._index.add(key, row, threads=_HNSW_ADD_THREADS)
         self._atomIds.append(atomId)
         return self
 

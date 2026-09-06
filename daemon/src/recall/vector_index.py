@@ -18,16 +18,13 @@ import abc
 import numpy as np
 
 from recall.embedder import blobToVec
-from recall.strata import KIND_CLASSES, kindInClause
+from recall.strata import KIND_CLASSES, MEMORY_KINDS, kindInClause
 
 __all__ = ["VectorIndex", "FlatIndex", "selectIndex", "buildClassIndexes",
-           "HNSW_THRESHOLD"]
+           "exactSearchLimit", "HNSW_THRESHOLD", "EXACT_MEMORY_FLAT_MAX"]
 
-# Above this many embedded LIVE atoms, the exact flat scan's O(n)-per-query cost
-# stops being free and :func:`selectIndex` switches to the approximate HNSW index.
-# The plan's default; a named constant so a change is loud and tests can pin it.
-# Serving today is far below it (shadow scale), so the switch is a scale path, not
-# a behavior change now.
+# Outside the bounded complete-memory exception below, populations at or above
+# this size use approximate HNSW. A named constant keeps the switch testable.
 # Lowered from 200,000 on 2026-08-13, on a measurement the original number could
 # not have accounted for.
 #
@@ -53,6 +50,28 @@ __all__ = ["VectorIndex", "FlatIndex", "selectIndex", "buildClassIndexes",
 # cache footprint small enough not to evict anything. The deciding factor is
 # FOOTPRINT, not search latency, which is the correction this constant encodes.
 HNSW_THRESHOLD = 5_000
+
+# Exact memory retrieval measured better than HNSW at the current 21,252-vector
+# population without a latency penalty: L2 R@10/MRR rose from .831/.507 to
+# .877/.534, while in-process p95 fell from 27-30ms to 26.7ms. Keep the exception
+# bounded so memory growth cannot turn a small exact scan into an unbounded serve
+# path. Unscoped, mixed-kind, narrow-subset, and code indexes still follow
+# HNSW_THRESHOLD.
+EXACT_MEMORY_FLAT_MAX = 32_000
+
+
+def _isCompleteMemoryClass(kinds):
+    return (
+        kinds is not None
+        and frozenset(kinds) == frozenset(MEMORY_KINDS)
+    )
+
+
+def exactSearchLimit(kinds):
+    """Maximum inclusive Flat rows for selection and incremental maintenance."""
+    if _isCompleteMemoryClass(kinds):
+        return EXACT_MEMORY_FLAT_MAX
+    return HNSW_THRESHOLD - 1
 
 
 class VectorIndex(abc.ABC):
@@ -137,6 +156,10 @@ class FlatIndex(VectorIndex):
         # Row positions retired since the last build. A rebuild loads live atoms
         # only, so it starts empty again.
         self._retired = set()
+
+    def __len__(self):
+        """Physical rows, including retired rows that remain allocated."""
+        return len(self._atomIds)
 
     def build(self, store, modelId, kinds=None):
         kindClause, kindParams = kindInClause(kinds, alias="a")
@@ -266,38 +289,38 @@ def _countEmbeddedLive(store, modelId, kinds=None):
     ).fetchone()[0]
 
 
-def selectIndex(store, modelId, kinds=None):
+def selectIndex(store, modelId, kinds=None, cacheDir=None):
     """Build and return the right ``VectorIndex`` for this population's size.
 
-    Below :data:`HNSW_THRESHOLD` embedded live atoms (of ``kinds``, if given), an
-    exact ``FlatIndex``; at or above it, the approximate ``HnswIndex``. The
-    threshold is set by CACHE FOOTPRINT rather than by search latency -- see the
-    constant, where the measurement is recorded. Returns the
-    index already BUILT. ``kinds`` scopes the index to one kind-class so a caller
-    can hold one index per population; ``kinds=None`` preserves the original
-    single-index contract (every live embedded atom). The count is taken over the
-    SAME ``kinds``, so a small minority class rides the exact flat scan even when
-    the whole store is past the threshold. ``HnswIndex`` is imported lazily so that
-    importing this module (and using ``FlatIndex`` at shadow scale) never requires
-    usearch.
+    The complete memory class uses exact ``FlatIndex`` through
+    :data:`EXACT_MEMORY_FLAT_MAX`; measured quality and latency justify that
+    bounded exception. Every other scope uses the general size policy: Flat below
+    :data:`HNSW_THRESHOLD`, approximate ``HnswIndex`` at or above it.
+
+    ``kinds=None`` preserves the unscoped contract. Mixed-kind and narrow-subset
+    calls do not inherit the memory exception. The count uses the same kind scope
+    as the build. ``HnswIndex`` remains a lazy import, so a Flat-only process does
+    not require usearch.
     """
-    if _countEmbeddedLive(store, modelId, kinds) >= HNSW_THRESHOLD:
-        from recall.hnsw_index import HnswIndex
+    if kinds is not None:
+        kinds = tuple(kinds)
+    count = _countEmbeddedLive(store, modelId, kinds)
+    limit = exactSearchLimit(kinds)
+    if count <= limit:
+        return FlatIndex().build(store, modelId, kinds)
+    from recall.hnsw_index import HnswIndex
 
-        return HnswIndex().build(store, modelId, kinds)
-    return FlatIndex().build(store, modelId, kinds)
+    return HnswIndex().build(store, modelId, kinds, cacheDir=cacheDir)
 
 
-def buildClassIndexes(store, modelId):
+def buildClassIndexes(store, modelId, cacheDir=None):
     """One built ``VectorIndex`` per kind-class in ``KIND_CLASSES``, keyed by name.
 
-    ``{"memory": <index>, "code": <index>}`` today. Each class picks flat vs HNSW
-    independently by its own live-embedded count, so the small memory population
-    gets an exact scan while the large code population gets the approximate graph.
-    An empty class (no live embedded atoms of its kinds) yields an empty but valid
-    index whose ``search`` returns ``[]``.
+    ``{"memory": <index>, "code": <index>}`` today. The bounded memory class uses
+    exact search; the large code class uses HNSW. An empty class yields an empty
+    valid index whose ``search`` returns ``[]``.
     """
     return {
-        name: selectIndex(store, modelId, kinds)
+        name: selectIndex(store, modelId, kinds, cacheDir=cacheDir)
         for name, kinds in KIND_CLASSES
     }
