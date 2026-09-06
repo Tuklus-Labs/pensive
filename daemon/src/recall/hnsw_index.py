@@ -30,6 +30,7 @@ atomId`` lookup (``self._atomIds[key]`` is the atom for usearch key ``key``), in
 the same ``ORDER BY atom_id`` order the rows were read.
 """
 import heapq
+import logging
 
 import numpy as np
 
@@ -182,7 +183,11 @@ class HnswIndex(VectorIndex):
         index = _buildIndex(matrix)
         self._index = index
         if cacheDir is not None and namespace is not None:
-            saveIndexSnapshot(cacheDir, namespace, fingerprint, index)
+            try:
+                saveIndexSnapshot(cacheDir, namespace, fingerprint, index)
+            except Exception:
+                logging.getLogger(__name__).warning(
+                    "Index snapshot write failed; the built index remains available")
         return self
 
     def remove(self, atomId):
