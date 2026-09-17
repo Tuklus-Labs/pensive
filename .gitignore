@@ -15,3 +15,6 @@ dell_ingest.pkl
 *.db
 CLAUDE.md
 .claude/worktrees/
+# A stray node_modules tree was committed here once and had to be cut out of
+# history. Vendored dependencies do not belong in this repo.
+node_modules/

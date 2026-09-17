@@ -7,7 +7,7 @@ name = "pypensive"
 version = "0.2.0"
 description = "Spreading activation retrieval for document collections"
 readme = "README.md"
-license = "MIT"
+license = "Apache-2.0"
 requires-python = ">=3.10"
 # PENPY-P9-MIN-4: declared floors below match what the test suite has
 # actually run against. We pin lower bounds only -- no upper caps -- so
