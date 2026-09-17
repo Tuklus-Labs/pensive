@@ -1,5 +1,11 @@
 # Boundary Evaluation Checklist
 
+> **Note:** the graph and case files referenced below are not distributed with
+> this repository. They were derived from a private personal corpus, so the
+> fixtures stay local and the query terms appear here as `vendor-a` and
+> `vendor-b`. The methodology and the numbers reproduce against any corpus
+> you build yourself with `pensive ingest`.
+
 Goal: decide whether boundary-analysis signals in Pensive are worth keeping,
 calibrating, and eventually exporting to NSSIO.
 
