@@ -1,5 +1,9 @@
 # Goal: make Pensive attribution free rather than remembered
 
+> Historical record, written 2026-08-12. It describes the project as it stood then and is kept
+> for provenance. Current behavior is documented in [README.md](README.md) and
+> [daemon/README.md](daemon/README.md).
+
 Opened 2026-08-12 by Heph (opus-5) under `/goal`. Gary: "Keep going... Be a part
 of the ecosystem."
 

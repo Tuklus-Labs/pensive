@@ -9,19 +9,19 @@
 Date: 2026-04-07
 
 Graph:
-`/home/aegis/Projects/pensive/dell_ingest.pkl`
+`~/Projects/pensive/dell_ingest.pkl`
 
 Candidate mining output:
-`/home/aegis/Projects/pensive/research/dell-real-graph-mined-candidates.json`
+`~/Projects/pensive/research/dell-real-graph-mined-candidates.json`
 
 Expanded cases:
-`/home/aegis/Projects/pensive/research/dell-real-graph-expanded-cases.json`
+`~/Projects/pensive/research/dell-real-graph-expanded-cases.json`
 
 Mining command:
 
 ```bash
 python bench_boundary.py \
-  --graph /home/aegis/Projects/pensive/dell_ingest.pkl \
+  --graph ~/Projects/pensive/dell_ingest.pkl \
   --mine-candidates \
   --max-queries 20 \
   --max-candidates 10 \
@@ -32,8 +32,8 @@ Benchmark command:
 
 ```bash
 python bench_boundary.py \
-  --graph /home/aegis/Projects/pensive/dell_ingest.pkl \
-  --cases /home/aegis/Projects/pensive/research/dell-real-graph-expanded-cases.json \
+  --graph ~/Projects/pensive/dell_ingest.pkl \
+  --cases ~/Projects/pensive/research/dell-real-graph-expanded-cases.json \
   --json
 ```
 

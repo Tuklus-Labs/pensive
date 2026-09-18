@@ -1,7 +1,7 @@
 # Task state and schema v4 sabotage log
 
 The focused store and export tests ran with the isolated interpreter at
-`/home/aegis/Documents/Codex/2026-09-05/fi/work/text-test-runtime/bin/python`.
+`~/Documents/Codex/2026-09-05/fi/work/text-test-runtime/bin/python`.
 Each production mutation below was applied to the working tree, run, observed
 as a failure, and restored before the next check.
 

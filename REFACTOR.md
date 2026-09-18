@@ -1,5 +1,9 @@
 # pensive Refactoring Targets
 
+> Historical record, written 2026-06-12. It describes the project as it stood then and is kept
+> for provenance. Current behavior is documented in [README.md](README.md) and
+> [daemon/README.md](daemon/README.md).
+
 Real, citable targets found by reading the source. Pensive is a hardened, 9-audit-pass engine, so most of these are duplication and ergonomics, not correctness bugs. Ordered by payoff. None of them should touch the `_compile()` concurrency contract without the care STYLE.md demands.
 
 **Status (2026-06-12): all 7 landed** on `refactor/penpy-backlog`, full suite 245 passed in 96s.

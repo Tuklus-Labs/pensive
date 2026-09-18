@@ -58,7 +58,7 @@ on representative failure modes?
 python bench_boundary.py
 python bench_boundary.py --json
 python bench_boundary.py --graph /path/to/graph.pkl --cases /path/to/cases.json
-python bench_boundary.py --graph /home/aegis/Projects/pensive/dell_ingest.pkl --cases /home/aegis/Projects/pensive/research/dell-real-graph-cases.json
+python bench_boundary.py --graph ~/Projects/pensive/dell_ingest.pkl --cases ~/Projects/pensive/research/dell-real-graph-cases.json
 pytest -q tests/test_boundary.py tests/test_boundary_bench.py
 ```
 

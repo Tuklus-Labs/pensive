@@ -1,5 +1,9 @@
 # Layer 4: the store holds case law, and the statutes had to move out
 
+> Historical record, written 2026-08-13. It describes the project as it stood then and is kept
+> for provenance. Current behavior is documented in [README.md](README.md) and
+> [daemon/README.md](daemon/README.md).
+
 Measured 2026-08-13 against the live store, read-only. Companion to
 `LAYER5-EVIDENCE.md`. Same rule: ground truth before design.
 

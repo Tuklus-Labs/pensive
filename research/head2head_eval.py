@@ -22,21 +22,22 @@ entity in the question). Known biases stated in the results header.
 import json
 import random
 import re
+import os
 import sys
 import time
 from collections import defaultdict
 
 import numpy as np
 
-sys.path.insert(0, '/home/aegis/Projects/pensive/src')
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'src'))
 
 from pensive import SpreadingActivation
 from pensive.mega_extract import MegaExtractor
 from pensive.patterns import REAL_DATA_PATTERNS
 from pensive.ingestion.parsers.chatgpt import ChatGPTParser
 
-OUT = '/tmp/claude-1000/-home-aegis/dcde850d-4f3c-453b-9a16-4fb8bfc9c044/scratchpad/head2head_results.json'
-EXPORT = '/home/aegis/Projects/chatgpt-export'
+OUT = os.environ.get('HEAD2HEAD_OUT', os.path.join(os.path.dirname(os.path.abspath(__file__)), 'head2head_results.json'))
+EXPORT = os.environ.get('CHATGPT_EXPORT', os.path.expanduser('~/chatgpt-export'))
 N_QUERIES = 1500
 TOP_K = 20
 rng = random.Random(42)

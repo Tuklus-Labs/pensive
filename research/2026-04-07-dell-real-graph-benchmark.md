@@ -9,17 +9,17 @@
 Date: 2026-04-07
 
 Graph:
-`/home/aegis/Projects/pensive/dell_ingest.pkl`
+`~/Projects/pensive/dell_ingest.pkl`
 
 Cases:
-`/home/aegis/Projects/pensive/research/dell-real-graph-cases.json`
+`~/Projects/pensive/research/dell-real-graph-cases.json`
 
 Run command:
 
 ```bash
 python bench_boundary.py \
-  --graph /home/aegis/Projects/pensive/dell_ingest.pkl \
-  --cases /home/aegis/Projects/pensive/research/dell-real-graph-cases.json \
+  --graph ~/Projects/pensive/dell_ingest.pkl \
+  --cases ~/Projects/pensive/research/dell-real-graph-cases.json \
   --json
 ```
 

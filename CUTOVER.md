@@ -1,5 +1,9 @@
 # Pensive v2 -> v3 cutover runbook
 
+> Historical record, written 2026-07-03. It describes the project as it stood then and is kept
+> for provenance. Current behavior is documented in [README.md](README.md) and
+> [daemon/README.md](daemon/README.md).
+
 State as of 2026-07-03 (Phase A complete, flip pending canary):
 
 | thing | state |
@@ -49,7 +53,7 @@ after more legacy writes ingests only the new rows.
 
 `systemctl --user enable --now pensive-embed pensive-vector engram engram-cpp-encoder`,
 re-register the stdio MCP server (`claude mcp add pensive -- python3
-/home/aegis/Projects/Engram/tools/pensive-mcp-server`), and the legacy
+~/Projects/Engram/tools/pensive-mcp-server`), and the legacy
 stack is primary again. The v3 daemon can keep running in parallel
 harmlessly. Atoms emitted into v3 between flip and rollback would need
 re-emitting or a reverse-export — rollback fast if rolling back.

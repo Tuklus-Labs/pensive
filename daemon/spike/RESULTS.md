@@ -172,7 +172,7 @@ from the read-only source with:
 ```bash
 python3 - <<'PY'
 import json
-src = "/home/aegis/Projects/Engram-tsp/bench/snapshot_meta.jsonl"
+src = "~/Projects/Engram-tsp/bench/snapshot_meta.jsonl"
 rows = []
 with open(src) as fh:
     for line in fh:

@@ -1,5 +1,9 @@
 # L2: three numbers, and which of them may be quoted
 
+> Historical record, written 2026-08-13. It describes the project as it stood then and is kept
+> for provenance. Current behavior is documented in [README.md](README.md) and
+> [daemon/README.md](daemon/README.md).
+
 Written 2026-08-13, mid-campaign. Companion to the LAYER3/4/5 evidence docs.
 L2 is the one tier missing its budget, and I have misread its own measurements
 three times tonight. This is the reconciliation.

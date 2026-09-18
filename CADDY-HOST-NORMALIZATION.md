@@ -1,5 +1,9 @@
 # Caddy: normalize Host on the pensive-shep block
 
+> Historical record, written 2026-08-13. It describes the project as it stood then and is kept
+> for provenance. Current behavior is documented in [README.md](README.md) and
+> [daemon/README.md](daemon/README.md).
+
 One line, operator-authorized (`/etc/*` is a Guardian-gated path, so this is Gary's
 to apply, not mine). It lets the daemon go back to loopback-only defaults.
 

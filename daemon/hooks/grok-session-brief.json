@@ -5,7 +5,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "/home/aegis/Projects/pensive/daemon/hooks/session-brief-v3-grok.sh",
+            "command": "$HOME/Projects/pensive/daemon/hooks/session-brief-v3-grok.sh",
             "timeout": 8
           }
         ]
@@ -16,7 +16,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "/home/aegis/Projects/pensive/daemon/hooks/session-brief-v3-grok.sh",
+            "command": "$HOME/Projects/pensive/daemon/hooks/session-brief-v3-grok.sh",
             "timeout": 8
           }
         ]

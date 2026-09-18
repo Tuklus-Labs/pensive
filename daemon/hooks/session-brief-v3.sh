@@ -12,7 +12,7 @@
 #       "SessionStart": [
 #         { "hooks": [
 #             { "type": "command",
-#               "command": "/home/aegis/Projects/pensive/daemon/hooks/session-brief-v3.sh" }
+#               "command": "~/Projects/pensive/daemon/hooks/session-brief-v3.sh" }
 #         ] }
 #       ]
 #     }

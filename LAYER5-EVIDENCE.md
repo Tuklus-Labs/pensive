@@ -1,5 +1,9 @@
 # Layer 5: what the store actually says, before anyone designs anything
 
+> Historical record, written 2026-08-13. It describes the project as it stood then and is kept
+> for provenance. Current behavior is documented in [README.md](README.md) and
+> [daemon/README.md](daemon/README.md).
+
 Measured 2026-08-13 against the live store (read-only). This exists because I
 filed Layer 5 as a finding and got two things wrong in the filing. Ground truth
 first, design second.

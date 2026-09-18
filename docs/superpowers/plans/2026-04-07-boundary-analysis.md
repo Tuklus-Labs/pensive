@@ -108,7 +108,7 @@ class TestBoundaryAnalysisDataclass:
 
 - [ ] **Step 2: Run test to verify it fails**
 
-Run: `cd /home/aegis/Projects/pensive && python -m pytest tests/test_boundary.py -v`
+Run: `cd ~/Projects/pensive && python -m pytest tests/test_boundary.py -v`
 Expected: FAIL with `ModuleNotFoundError: No module named 'pensive.boundary'`
 
 - [ ] **Step 3: Write minimal implementation**
@@ -177,7 +177,7 @@ class BoundaryAnalysis:
 
 - [ ] **Step 4: Run test to verify it passes**
 
-Run: `cd /home/aegis/Projects/pensive && python -m pytest tests/test_boundary.py::TestBoundaryAnalysisDataclass -v`
+Run: `cd ~/Projects/pensive && python -m pytest tests/test_boundary.py::TestBoundaryAnalysisDataclass -v`
 Expected: PASS (all 5 tests)
 
 - [ ] **Step 5: Commit**
@@ -243,7 +243,7 @@ class TestFrequencyBands:
 
 - [ ] **Step 2: Run test to verify it fails**
 
-Run: `cd /home/aegis/Projects/pensive && python -m pytest tests/test_boundary.py::TestFrequencyBands -v`
+Run: `cd ~/Projects/pensive && python -m pytest tests/test_boundary.py::TestFrequencyBands -v`
 Expected: FAIL with `ImportError: cannot import name 'FrequencyBands'`
 
 - [ ] **Step 3: Write implementation**
@@ -322,7 +322,7 @@ class FrequencyBands:
 
 - [ ] **Step 4: Run test to verify it passes**
 
-Run: `cd /home/aegis/Projects/pensive && python -m pytest tests/test_boundary.py::TestFrequencyBands -v`
+Run: `cd ~/Projects/pensive && python -m pytest tests/test_boundary.py::TestFrequencyBands -v`
 Expected: PASS (all 5 tests)
 
 - [ ] **Step 5: Commit**
@@ -429,7 +429,7 @@ class TestAnalyzeBoundary:
 
 - [ ] **Step 2: Run test to verify it fails**
 
-Run: `cd /home/aegis/Projects/pensive && python -m pytest tests/test_boundary.py::TestAnalyzeBoundary -v`
+Run: `cd ~/Projects/pensive && python -m pytest tests/test_boundary.py::TestAnalyzeBoundary -v`
 Expected: FAIL with `ImportError: cannot import name 'analyze_boundary'`
 
 - [ ] **Step 3: Write implementation**
@@ -638,7 +638,7 @@ def _get_entity_neighbors_by_idx(sa: 'SpreadingActivation', value_idx: int) -> s
 
 - [ ] **Step 4: Run test to verify it passes**
 
-Run: `cd /home/aegis/Projects/pensive && python -m pytest tests/test_boundary.py::TestAnalyzeBoundary -v`
+Run: `cd ~/Projects/pensive && python -m pytest tests/test_boundary.py::TestAnalyzeBoundary -v`
 Expected: PASS (all 6 tests)
 
 - [ ] **Step 5: Commit**
@@ -696,7 +696,7 @@ class TestQueryAnalyzed:
 
 - [ ] **Step 2: Run test to verify it fails**
 
-Run: `cd /home/aegis/Projects/pensive && python -m pytest tests/test_boundary.py::TestQueryAnalyzed -v`
+Run: `cd ~/Projects/pensive && python -m pytest tests/test_boundary.py::TestQueryAnalyzed -v`
 Expected: FAIL with `AttributeError: 'SpreadingActivation' object has no attribute 'query_analyzed'`
 
 - [ ] **Step 3: Add `query_analyzed` method to SpreadingActivation**
@@ -721,12 +721,12 @@ In `src/pensive/spreading.py`, add this method after the `query_with_doc_ids` me
 
 - [ ] **Step 4: Run test to verify it passes**
 
-Run: `cd /home/aegis/Projects/pensive && python -m pytest tests/test_boundary.py::TestQueryAnalyzed -v`
+Run: `cd ~/Projects/pensive && python -m pytest tests/test_boundary.py::TestQueryAnalyzed -v`
 Expected: PASS (all 4 tests)
 
 - [ ] **Step 5: Run full test suite to confirm no regressions**
 
-Run: `cd /home/aegis/Projects/pensive && python -m pytest tests/ -v`
+Run: `cd ~/Projects/pensive && python -m pytest tests/ -v`
 Expected: All existing tests pass, all new tests pass.
 
 - [ ] **Step 6: Commit**
@@ -811,7 +811,7 @@ class TestContextDetection:
 
 - [ ] **Step 2: Run all tests**
 
-Run: `cd /home/aegis/Projects/pensive && python -m pytest tests/test_boundary.py -v`
+Run: `cd ~/Projects/pensive && python -m pytest tests/test_boundary.py -v`
 Expected: All pass.
 
 - [ ] **Step 3: Commit**
@@ -842,7 +842,7 @@ from .boundary import BoundaryAnalysis, AnalyzedResult, FrequencyBands, analyze_
 
 - [ ] **Step 3: Run full test suite**
 
-Run: `cd /home/aegis/Projects/pensive && python -m pytest tests/ -v`
+Run: `cd ~/Projects/pensive && python -m pytest tests/ -v`
 Expected: All pass.
 
 - [ ] **Step 4: Commit**

@@ -6,7 +6,7 @@ mutated. Every run used the CPU-only targeted command:
 
 ```text
 HIP_VISIBLE_DEVICES='' ROCR_VISIBLE_DEVICES='' CUDA_VISIBLE_DEVICES='' \
-/home/aegis/Documents/Codex/2026-09-05/fi/work/text-test-runtime/bin/python \
+~/Documents/Codex/2026-09-05/fi/work/text-test-runtime/bin/python \
 -m pytest -q <exact selected test> --tb=short
 ```
 

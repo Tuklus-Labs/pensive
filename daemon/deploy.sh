@@ -92,7 +92,7 @@ say "gate"
 # RUN IT FROM ITS OWN DIRECTORY. tiergate's --src defaults to the RELATIVE
 # "../../src" and it writes .gate-evidence relative to cwd, so both paths are
 # only correct when cwd is gate/tiergate. Invoked from daemon/ (the first
-# version of this script) --src resolved to /home/aegis/Projects/src, and the
+# version of this script) --src resolved to ~/Projects/src, and the
 # gate refused with "cannot resolve artifact sha ... refusing to certify an
 # unidentified artifact" rather than measuring an artifact it could not name.
 # That refusal is the instrument behaving correctly; the bug was here.

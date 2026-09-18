@@ -25,7 +25,7 @@
 
 **Store facts the tasks rely on** (verified 2026-07-09):
 - Ref roots in the store: `projects/<name>/...` (root `~/Projects/`), `reference-library/...` (root `~/Projects/Aegis/AEGIS/docs/reference-library/`), `kv_cache/vector_meta.db#rowid=N` (broken), `claude-home/...` (`~/.claude/`), `codex-home/...` (`~/.codex/`).
-- Retired db: `~/Projects/Aegis/AEGIS/Pensive/kv_cache/vector_meta.db`, table `meta(rowid, summary, ...)`; 3,894 of its rows have summaries like `[files] file /home/aegis/Projects/mission-control/dashboard_metrics.go Created dashboard_metrics.go`; the other rows are `[claude] ...` reasoning text (no path; report, don't guess).
+- Retired db: `~/Projects/Aegis/AEGIS/Pensive/kv_cache/vector_meta.db`, table `meta(rowid, summary, ...)`; 3,894 of its rows have summaries like `[files] file ~/Projects/mission-control/dashboard_metrics.go Created dashboard_metrics.go`; the other rows are `[claude] ...` reasoning text (no path; report, don't guess).
 - Duplicate reflib: 16,362 chunks under `reference-library/<f>#cN` (project NULL) vs 16,393 under `projects/Aegis/AEGIS/docs/reference-library/<f>#cN` (project `Aegis`).
 - `supersede(store, oldId, newId, provInput)` marks old superseded + writes edge and provenance atomically. `provInput = {"source": ..., "agent"?: ..., "sessionId"?: ..., "sourceRef"?: ...}`.
 
@@ -62,10 +62,10 @@ from repair_lib import parseFilesSummary, abspathToRef, refToProject
 
 
 def test_parseFilesSummary_extracts_path():
-    s = ("[files] file /home/aegis/Projects/mission-control/dashboard_metrics.go "
+    s = ("[files] file ~/Projects/mission-control/dashboard_metrics.go "
          "Created dashboard_metrics.go")
     assert parseFilesSummary(s) == \
-        "/home/aegis/Projects/mission-control/dashboard_metrics.go"
+        "~/Projects/mission-control/dashboard_metrics.go"
 
 
 def test_parseFilesSummary_rejects_non_files_summaries():
@@ -81,21 +81,21 @@ def test_parseFilesSummary_rejects_relative_path():
 
 def test_abspathToRef_projects_root():
     ref, project = abspathToRef(
-        "/home/aegis/Projects/mission-control/dashboard_metrics.go")
+        "~/Projects/mission-control/dashboard_metrics.go")
     assert ref == "projects/mission-control/dashboard_metrics.go"
     assert project == "mission-control"
 
 
 def test_abspathToRef_claude_and_codex_home():
-    assert abspathToRef("/home/aegis/.claude/hooks/emit.py") == \
+    assert abspathToRef("~/.claude/hooks/emit.py") == \
         ("claude-home/hooks/emit.py", None)
-    assert abspathToRef("/home/aegis/.codex/config.toml") == \
+    assert abspathToRef("~/.codex/config.toml") == \
         ("codex-home/config.toml", None)
 
 
 def test_abspathToRef_unknown_root_returns_none():
     assert abspathToRef("/etc/passwd") is None
-    assert abspathToRef("/home/aegis/Downloads/x.bin") is None
+    assert abspathToRef("~/Downloads/x.bin") is None
 
 
 def test_refToProject_variants():
@@ -125,9 +125,9 @@ refs. Anything that does not parse returns None: the repair tool reports those
 rows, it never guesses.
 
 Ref convention (matches the existing import waves):
-  /home/aegis/Projects/<name>/<rest>  ->  projects/<name>/<rest>, project <name>
-  /home/aegis/.claude/<rest>          ->  claude-home/<rest>, no project
-  /home/aegis/.codex/<rest>           ->  codex-home/<rest>, no project
+  ~/Projects/<name>/<rest>  ->  projects/<name>/<rest>, project <name>
+  ~/.claude/<rest>          ->  claude-home/<rest>, no project
+  ~/.codex/<rest>           ->  codex-home/<rest>, no project
 Reference-library refs map to project Aegis (the library lives inside the Aegis
 repo at AEGIS/docs/reference-library/).
 """
@@ -143,9 +143,9 @@ _FILES_RE = re.compile(r"^\[files\] file (\S+)")
 # (prefix, refRoot, projectSegment) -- projectSegment True means the first
 # path segment under the prefix is the project name.
 _ROOTS = (
-    ("/home/aegis/Projects/", "projects/", True),
-    ("/home/aegis/.claude/", "claude-home/", False),
-    ("/home/aegis/.codex/", "codex-home/", False),
+    ("~/Projects/", "projects/", True),
+    ("~/.claude/", "claude-home/", False),
+    ("~/.codex/", "codex-home/", False),
 )
 
 
@@ -280,7 +280,7 @@ def _makeOldDb(tmp_path, rows):
 def test_repairs_ref_and_backfills_project(store, tmp_path):
     aid = _putChunk(store, "chunk body", "kv_cache/vector_meta.db#rowid=7")
     old = _makeOldDb(tmp_path, [
-        (7, "[files] file /home/aegis/Projects/obol/api/rate.go Created rate.go"),
+        (7, "[files] file ~/Projects/obol/api/rate.go Created rate.go"),
     ])
     report = repairKvCacheRefs(store, old)
     assert report["rewritten"] == 1
@@ -307,7 +307,7 @@ def test_non_files_summary_reported_not_guessed(store, tmp_path):
 
 def test_missing_rowid_reported(store, tmp_path):
     _putChunk(store, "body", "kv_cache/vector_meta.db#rowid=999")
-    old = _makeOldDb(tmp_path, [(1, "[files] file /home/aegis/Projects/x/y.go z")])
+    old = _makeOldDb(tmp_path, [(1, "[files] file ~/Projects/x/y.go z")])
     report = repairKvCacheRefs(store, old)
     assert report["rowidMissing"] == 1
     assert report["rewritten"] == 0
@@ -317,7 +317,7 @@ def test_existing_project_not_overwritten(store, tmp_path):
     aid = _putChunk(store, "body", "kv_cache/vector_meta.db#rowid=7",
                     project="keep-me")
     old = _makeOldDb(tmp_path, [
-        (7, "[files] file /home/aegis/Projects/obol/api/rate.go Created"),
+        (7, "[files] file ~/Projects/obol/api/rate.go Created"),
     ])
     report = repairKvCacheRefs(store, old)
     assert report["rewritten"] == 1
@@ -329,7 +329,7 @@ def test_existing_project_not_overwritten(store, tmp_path):
 def test_idempotent_second_run_is_noop(store, tmp_path):
     _putChunk(store, "body", "kv_cache/vector_meta.db#rowid=7")
     old = _makeOldDb(tmp_path, [
-        (7, "[files] file /home/aegis/Projects/obol/api/rate.go Created"),
+        (7, "[files] file ~/Projects/obol/api/rate.go Created"),
     ])
     repairKvCacheRefs(store, old)
     second = repairKvCacheRefs(store, old)

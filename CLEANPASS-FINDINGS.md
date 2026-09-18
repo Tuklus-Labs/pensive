@@ -1,5 +1,9 @@
 # Clean pass 2 triage: NOT CLEAN, counter stays 0
 
+> Historical record, written 2026-08-14. It describes the project as it stood then and is kept
+> for provenance. Current behavior is documented in [README.md](README.md) and
+> [daemon/README.md](daemon/README.md).
+
 Strategies: adversarial (612 attacks) + integration/dependency (41 checks).
 Different from pass 1 (static, contract, coverage) as the protocol requires.
 

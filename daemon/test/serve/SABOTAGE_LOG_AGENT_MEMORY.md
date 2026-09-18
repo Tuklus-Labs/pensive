@@ -5,7 +5,7 @@ runtime, and reversed before the final suite. The targeted runner was:
 
 ```text
 HIP_VISIBLE_DEVICES='' ROCR_VISIBLE_DEVICES='' CUDA_VISIBLE_DEVICES='' \
-/home/aegis/Documents/Codex/2026-09-05/fi/work/text-test-runtime/bin/python \
+~/Documents/Codex/2026-09-05/fi/work/text-test-runtime/bin/python \
 -m pytest -q daemon/test/serve/test_agent_memory_corrections.py -k '<selector>'
 ```
 

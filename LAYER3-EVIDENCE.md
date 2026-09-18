@@ -1,5 +1,9 @@
 # Layer 3: what semantic adjacency has to work with
 
+> Historical record, written 2026-08-13. It describes the project as it stood then and is kept
+> for provenance. Current behavior is documented in [README.md](README.md) and
+> [daemon/README.md](daemon/README.md).
+
 Measured 2026-08-13 against the live store, read-only. Third of the evidence set
 with `LAYER4-EVIDENCE.md` and `LAYER5-EVIDENCE.md`.
 
