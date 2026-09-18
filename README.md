@@ -93,8 +93,9 @@ pip install pypensive[full]      # + L2 semantic search, BM25, hybrid retrieval
 
 The wheel on PyPI labelled 0.2.0 was built from 0.1.1 sources (its
 `__version__` says so) and lacks `compact()`, the boundary-analysis module,
-`regex_guard` and the CLI's `--analyze`. Until a corrected release lands,
-install from this repository to get what this README describes:
+`regex_guard` and the CLI's `--analyze`. The corrected release is 0.2.1;
+until it is on PyPI, install from this repository to get what this README
+describes:
 
 ```bash
 pip install "pypensive @ git+https://github.com/Tuklus-Labs/pensive"

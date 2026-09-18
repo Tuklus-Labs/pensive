@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "pypensive"
-version = "0.2.0"
+version = "0.2.1"
 description = "Spreading activation retrieval for document collections"
 readme = "README.md"
 license = "Apache-2.0"
@@ -49,16 +49,29 @@ packages = ["src/pensive"]
 # checkpoint shapes explicitly. Also belt-and-braces exclude the
 # repo's local virtualenv, build/test caches, and __pycache__ trees
 # in case hatch's default include logic ever changes.
+# The repository also carries the agent-memory daemon (daemon/), design
+# records and research; none of that is the pypensive library. The sdist is
+# the library, its tests, its release guard and its own documents, nothing
+# else, so a `pip download --no-binary` never pulls the daemon tree in.
 [tool.hatch.build.targets.sdist]
+only-include = [
+  "src/pensive",
+  "tests",
+  "tools",
+  "pyproject.toml",
+  "README.md",
+  "CONTRIBUTING.md",
+  "RELEASE.md",
+  "STYLE.md",
+  "LICENSE",
+  "NOTICE",
+  "docs/SECURITY.md",
+]
 exclude = [
   "*.db",
   "*.faiss",
   "*.pkl",
-  "/venv",
-  "/dist",
-  "/build",
   "/.pytest_cache",
   "**/__pycache__",
-  "/research",
-  "/dell_ingest.pkl",
+  "tests/fixtures",
 ]

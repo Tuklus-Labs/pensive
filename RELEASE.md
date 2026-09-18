@@ -17,10 +17,10 @@ have already happened:
 The wheel on PyPI labelled `pypensive-0.2.0` (uploaded 2026-04-06) is the
 stale wheel described above: its `pensive/__init__.py` reports `0.1.1`, it
 carries no `boundary*.py`, `regex_guard.py` or `compact()`, and its metadata
-still says MIT. The next release must go out as a new version number, built
-from a clean tree by the steps below, with the license metadata reading
-Apache-2.0. Do not re-upload 0.2.0; PyPI will refuse the filename and the
-label would stay misleading anyway.
+still says MIT. The correction is 0.2.1: same library source as the tree
+labelled 0.2.0, built from a clean tree by the steps below, with the license
+metadata reading Apache-2.0. Do not re-upload 0.2.0; PyPI will refuse the
+filename and the label would stay misleading anyway.
 
 ## Pre-release
 
