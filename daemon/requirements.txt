@@ -1,6 +1,11 @@
-# System Python 3.14 is assumed. torch must be the ROCm build on this box:
-# pip's default CUDA wheel will not serve the 7900 XTX. This file documents
-# daemon rebuildability; it is not an isolation venv mandate.
+# Developed and run on Python 3.14. torch's CPU wheel is enough to serve the
+# default bge-small model; pick the ROCm or CUDA build only if you want GPU
+# embedding. This file documents daemon rebuildability; it is not an isolation
+# venv mandate.
+#
+# Optional: onnxruntime, only when PENSIVE_V3_ONNX_MODEL points at an ONNX
+# export of the embedding model. Optional: openai, only when
+# PENSIVE_V3_OPENAI_MODEL is set.
 torch
 sentence-transformers
 numpy

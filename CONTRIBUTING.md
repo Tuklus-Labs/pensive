@@ -3,8 +3,8 @@
 ## Dev environment
 
 ```
-git clone https://github.com/<owner>/pypensive
-cd pypensive
+git clone https://github.com/Tuklus-Labs/pensive
+cd pensive
 python -m venv venv
 source venv/bin/activate
 pip install -e ".[dev,full]"
@@ -17,9 +17,17 @@ activation tests still pass but the hybrid retrieval tests skip.
 
 ## Running tests
 
+Two suites live in this repository. The library suite:
+
 ```
 pytest tests/
 ```
+
+The daemon under `daemon/` has its own suite, run from the repository root
+with `python3 -m pytest daemon/test/ -q`; it needs the daemon's dependencies
+(`daemon/requirements.txt`) and, for the model-backed tests, an importable
+`sentence_transformers`. Contributions to the daemon are gated on that suite,
+not this one.
 
 A clean run takes ~80-100s and covers the spreading-activation engine,
 the pickle-signing layer, the boundary-analysis diagnostics, the
@@ -100,7 +108,7 @@ the pattern.
 
 ## Submitting changes
 
-- Branch from `research/boundary-analysis` (the current dev branch).
+- Branch from `main`.
 - One logical change per commit. If a single bugfix touches code and
   tests, group them; if it touches three unrelated bugs, split.
 - Commit messages: imperative mood, < 72 char subject, body explains

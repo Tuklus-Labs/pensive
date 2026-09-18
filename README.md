@@ -1,12 +1,82 @@
 # Pensive
 
-Pensive's agent-memory service lives in [`daemon/`](daemon/README.md). It stores
-memories with provenance and correction history, and retrieves them using
-natural-language queries through MCP and HTTP.
+Agent memory. A local daemon keeps memories as provenance-tracked atoms in
+SQLite, retrieves them by natural-language query over MCP and HTTP, records
+corrections without losing the original text, and serves session briefs and
+task checkpoints. The same repository ships `pypensive`, a standalone
+spreading-activation retrieval library with an entity-exact query API.
 
-This repository also contains the independently packaged `pypensive` retrieval
-library described below. Its entity-exact query API is a different entry point
-from the agent-memory service.
+| Path | What it is | Docs |
+|---|---|---|
+| `daemon/` | The agent-memory service: store, recall, MCP/HTTP serving, briefs | [daemon/README.md](daemon/README.md) |
+| `src/pensive/` | `pypensive`, the retrieval library on PyPI | [below](#retrieval-library) |
+
+## Agent memory daemon
+
+Developed and run on Python 3.14; older interpreters are untested. CPU is
+enough: the default embedding model is small and torch's CPU build serves it.
+
+```bash
+pip install -r daemon/requirements.txt
+cd daemon/src
+PENSIVE_V3_STORE=~/.local/share/pensive-v3/pensive.db python3 -m serve.daemon
+```
+
+The daemon binds `127.0.0.1` only, on `PENSIVE_V3_PORT` (default 5999). It
+creates the store and its parent directories if they are missing, downloads
+`BAAI/bge-small-en-v1.5` from Hugging Face on first start unless
+`PENSIVE_V3_ONNX_MODEL` points at an ONNX export of that model, and builds one
+vector index per memory class. Every `PENSIVE_V3_*` variable is listed in
+[daemon/README.md](daemon/README.md#running-the-daemon).
+
+Register it with any MCP client that speaks Streamable HTTP. For Claude Code:
+
+```bash
+claude mcp add --transport http pensive http://127.0.0.1:5999/mcp
+```
+
+What the MCP surface offers, in one line each (arguments and semantics are in
+the daemon README):
+
+- **Write:** `engram_emit_atom` (structured insight: shape, approach, outcome,
+  reason, principle), `engram_emit_discovery` and `engram_emit_failure`
+  (shorthands), `engram_emit_narrative` (prose fragment), `engram_emit_snapshot`
+  (working state for compaction recovery).
+- **Read:** `recall` (ranked, trust-annotated plain text), `recall_records`
+  (typed records with provenance, scores and receipts), `history` (one atom's
+  neighborhood and correction chain), `pensive_analytics` (store counts).
+- **Maintain:** `correct` (write a successor, retire the predecessor, keep
+  both readable), `pin` / `unpin`.
+- **Tasks:** `task_checkpoint` and `task_state` (append-only task state with
+  compare-and-swap revisions), `recall_feedback` (report shown, used, helpful,
+  irrelevant or outdated results against a recall receipt).
+- **Compat:** `pensive_recall`, the pre-v3 recall shape, kept for callers that
+  never upgraded.
+
+HTTP: `GET /recall?q=...`, `GET /get?id=...&full=1`, `GET /lookup`,
+`GET /brief`, `GET /status`, `GET /viz` (a live event view), and two guarded
+write routes, `POST /tee/emit` and `POST /shadow/recall`, that require a
+loopback secret. Details in the daemon README; the threat model is in
+[docs/SECURITY.md](docs/SECURITY.md).
+
+## Repository map
+
+- `daemon/` the service, its tests (`daemon/test/`), eval harness and deploy
+  script. The deploy script and the hooks under `daemon/hooks/` are the
+  publisher's own wiring, shipped as worked examples rather than installers.
+- `src/pensive/`, `tests/`, `tools/` the `pypensive` library, its suite and
+  the release guard. `STYLE.md`, `CONTRIBUTING.md`, `RELEASE.md` and
+  `docs/SECURITY.md` are written for this package first.
+- `research/` benchmarks and experiments. The graphs and case files they ran
+  against were built from a private corpus and are not shipped; the write-ups
+  say so at the top.
+- `docs/superpowers/` dated design specs and implementation plans.
+- Top-level campaign records (`CUTOVER.md`, `V3.1-CAMPAIGN.md`,
+  `V3.1-AGENT-GRIPES.md`, `L2-EVIDENCE.md`, `LAYER3-EVIDENCE.md`,
+  `LAYER4-EVIDENCE.md`, `LAYER5-EVIDENCE.md`, `CLEANPASS-FINDINGS.md`,
+  `REFACTOR.md`, `ATTRIBUTION-GOAL.md`, `CADDY-HOST-NORMALIZATION.md`) are
+  working documents from the daemon's development. Each is dated in its
+  header and describes the project as it stood then, not now.
 
 ## Retrieval library
 
@@ -19,6 +89,15 @@ Pensive builds a sparse entity graph from your documents using regex-based extra
 ```bash
 pip install pypensive            # Core SA engine (numpy + scipy only)
 pip install pypensive[full]      # + L2 semantic search, BM25, hybrid retrieval
+```
+
+The wheel on PyPI labelled 0.2.0 was built from 0.1.1 sources (its
+`__version__` says so) and lacks `compact()`, the boundary-analysis module,
+`regex_guard` and the CLI's `--analyze`. Until a corrected release lands,
+install from this repository to get what this README describes:
+
+```bash
+pip install "pypensive @ git+https://github.com/Tuklus-Labs/pensive"
 ```
 
 ## Quickstart

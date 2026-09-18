@@ -6,7 +6,7 @@ recall and canonical-store contracts are summarized in
 [`daemon/README.md`](daemon/README.md). Library-specific rules about entity-exact
 queries, graph buffers and pickle persistence do not describe the v3 daemon.
 
-Pensive (`pypensive` on PyPI) is the spreading-activation retrieval core: a sparse bipartite entity-graph that answers entity-exact queries in sub-millisecond time at 50M+ documents, and the engine the wider AEGIS Engram/memory layer leans on for recall. The library is published; downstream callers `pip install pypensive` and trust the contract. The graph is also the substrate cognitive subsystems query when they reconstruct what the system knows. That makes correctness load-bearing in ways a one-off script never is.
+Pensive (`pypensive` on PyPI) is the spreading-activation retrieval core: a sparse bipartite entity-graph that answers entity-exact queries in sub-millisecond time at 50M+ documents. An earlier generation of the memory layer leaned on it for recall; the v3 daemon under `daemon/` does not import it. The library is published; downstream callers `pip install pypensive` and trust the contract. That makes correctness load-bearing in ways a one-off script never is.
 
 The failure modes that actually hurt here, grounded in this code:
 
@@ -16,7 +16,7 @@ The failure modes that actually hurt here, grounded in this code:
 - **Unbounded RSS in a long-lived daemon.** The graph is append-only (`add_documents()` never compacts). A consumer that ingests forever grows linearly. Documented and accepted, but a "small" change that adds a per-query cache without an eviction bound turns a known cost into an OOM.
 - **A query contract people misread.** `query()` is entity-exact, not natural language. Code or docs that imply otherwise generate confident garbage and erode trust in the whole engine.
 
-This document is the engineering standard a pensive change must meet to land. Heph reads this on SessionStart when working under `/home/aegis/Projects/pensive` and refuses to help violate hard rules without explicit override.
+This document is the engineering standard a pensive change must meet to land. Agents working in this checkout load it at session start and do not help weaken a hard rule without an explicit, logged override.
 
 ## Core Principles
 
@@ -84,11 +84,11 @@ This document is the engineering standard a pensive change must meet to land. He
 
 ## Enforcement
 
-- **Heph on SessionStart.** Heph loads this file when working under `/home/aegis/Projects/pensive` and will refuse to help weaken a Hard Rule (pickle gate, concurrency publish, config guards) without an explicit, logged override.
+- **Agents at session start.** Coding agents working in this checkout load this file and refuse to help weaken a Hard Rule (pickle gate, concurrency publish, config guards) without an explicit, logged override.
 - **`pytest tests/`** is the gate. Green-by-memory is not green; read the tally.
 - **`tools/check_wheel_version.py`** guards the stale-wheel release trap (RELEASE.md); run it before any build claims to ship 0.2.0.
 - **Audit-pass discipline.** The `PENPY-*` tag (numbered `PENPY-PN-*` from pass 5 on) plus matching `test_passN_*` pairing is the project's own CI-of-record for hardening. New guards join it.
-- **`aegis-audit src/pensive`** and **`aegis-async-audit`** for a broader code-intelligence pass when touching the hybrid or concurrency paths.
+- **A broader static pass** (your linter plus an async- and thread-safety review) when touching the hybrid or concurrency paths.
 
 ## Operational SLAs
 
@@ -105,4 +105,4 @@ This is a published library and a recall-critical engine, so the budgets sit abo
 
 The bar moves up, never down. Every audit pass (P1 through P9) tightened this engine and left a tagged test behind; that is the direction. When a change makes the concurrency story simpler-looking but you cannot map each removed line to the hazard it defended, you are not simplifying, you are removing a guard whose cost someone already paid. When in doubt about the pickle gate or the publish race: do the safe thing, write the test, and leave the next person a tag explaining why. Being slower and correct beats being clever and silently wrong, because here "silently wrong" means corrupted recall in a memory system that is supposed to remember.
 
-Last revised: 2026-06-12 (REFACTOR-1..7 sweep). Owner: Gary + Heph.
+Last revised: 2026-09-18 (public-release doc audit; substance unchanged since the 2026-06-12 REFACTOR-1..7 sweep). Owner: Gary + Heph.
