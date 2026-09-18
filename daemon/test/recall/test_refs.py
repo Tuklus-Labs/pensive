@@ -129,7 +129,7 @@ def test_absolute_rest_cannot_reach_secrets():
     # absolute rest turns a planted sourceRef into a read of any file the
     # daemon user can open.
     assert refToPath(
-        "claude-home//home/aegis/.ssh/id_ed25519", home=_HOME) is None
+        "claude-home//home/user/.ssh/id_ed25519", home=_HOME) is None
 
 
 def test_symlink_out_of_root_rejected(tmp_path):

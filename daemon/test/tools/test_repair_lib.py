@@ -10,12 +10,15 @@ if str(_DAEMON / "tools") not in sys.path:
 
 from repair_lib import parseFilesSummary, abspathToRef, refToProject
 
+# The account the fixture rows were written under; not this machine's.
+HOME = "/home/user"
+
 
 def test_parseFilesSummary_extracts_path():
-    s = ("[files] file /home/aegis/Projects/mission-control/dashboard_metrics.go "
+    s = ("[files] file /home/user/Projects/mission-control/dashboard_metrics.go "
          "Created dashboard_metrics.go")
     assert parseFilesSummary(s) == \
-        "/home/aegis/Projects/mission-control/dashboard_metrics.go"
+        "/home/user/Projects/mission-control/dashboard_metrics.go"
 
 
 def test_parseFilesSummary_rejects_non_files_summaries():
@@ -30,26 +33,25 @@ def test_parseFilesSummary_rejects_relative_path():
 
 
 def test_abspathToRef_projects_root():
-    ref, project = abspathToRef(
-        "/home/aegis/Projects/mission-control/dashboard_metrics.go")
+    ref, project = abspathToRef("/home/user/Projects/mission-control/dashboard_metrics.go", home=HOME)
     assert ref == "projects/mission-control/dashboard_metrics.go"
     assert project == "mission-control"
 
 
 def test_abspathToRef_claude_and_codex_home():
-    assert abspathToRef("/home/aegis/.claude/hooks/emit.py") == \
+    assert abspathToRef("/home/user/.claude/hooks/emit.py", home=HOME) == \
         ("claude-home/hooks/emit.py", None)
-    assert abspathToRef("/home/aegis/.codex/config.toml") == \
+    assert abspathToRef("/home/user/.codex/config.toml", home=HOME) == \
         ("codex-home/config.toml", None)
 
 
 def test_abspathToRef_unknown_root_returns_none():
-    assert abspathToRef("/etc/passwd") is None
-    assert abspathToRef("/home/aegis/Downloads/x.bin") is None
+    assert abspathToRef("/etc/passwd", home=HOME) is None
+    assert abspathToRef("/home/user/Downloads/x.bin", home=HOME) is None
 
 
 def test_abspathToRef_bare_file_under_projects_returns_none_project():
-    result = abspathToRef("/home/aegis/Projects/barefile.go")
+    result = abspathToRef("/home/user/Projects/barefile.go", home=HOME)
     assert result is not None
     ref, project = result
     assert ref == "projects/barefile.go"

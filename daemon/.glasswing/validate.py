@@ -9,7 +9,7 @@ import tempfile
 import traceback
 from pathlib import Path
 
-SRC = Path("/home/aegis/Projects/pensive/daemon/src")
+SRC = Path(__file__).resolve().parents[1] / "src"
 sys.path.insert(0, str(SRC))
 
 import numpy as np
@@ -98,13 +98,13 @@ def main():
         section("refs.absolute_rest")
         home = Path("/fake/home")
         escaped = refToPath("projects//etc/passwd", home=home)
-        escaped2 = refToPath("claude-home//home/aegis/.keys", home=home)
+        escaped2 = refToPath("claude-home//home/user/.keys", home=home)
         escaped3 = refToPath("codex-home//tmp/glasswing-secret.txt", home=home)
         dotted = refToPath("projects/../../etc/passwd", home=home)
         record(
             "refToPath absolute rest escapes root",
-            escaped == Path("/etc/passwd") and escaped2 == Path("/home/aegis/.keys"),
-            f"projects//etc/passwd -> {escaped!s}; claude-home//home/aegis/.keys -> {escaped2!s}; "
+            escaped == Path("/etc/passwd") and escaped2 == Path("/home/user/.keys"),
+            f"projects//etc/passwd -> {escaped!s}; claude-home//home/user/.keys -> {escaped2!s}; "
             f"codex-home//tmp/... -> {escaped3!s}; dotted .. still {dotted}",
         )
 

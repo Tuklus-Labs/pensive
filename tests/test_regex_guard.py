@@ -32,7 +32,7 @@ TORTURE = [
     'Dr. Smith met Employee Jones at Project Alpha (Core Engineering)',
     'ACME-1234 prod-web-01 eu-west-1 badge 12345 the Phoenix initiative',
     'Boeing Industries Seattle Office North Star Alice Johnson',
-    'https://x.io/a?b=c /home/aegis/x.txt ~/notes.md /usr/lib/y',
+    'https://x.io/a?b=c /home/user/x.txt ~/notes.md /usr/lib/y',
     'İstanbul ß café naïve → 90% 45% -> 72% 120 --> 212tok/s',
     'edge$5 x$6M mid$word 7900xtx 7900 XTX 7900\tXTX',
     'word\nJan 1, 2020\nword',

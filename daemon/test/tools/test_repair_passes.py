@@ -16,6 +16,12 @@ from store.store import openStore, putAtom
 from util.ulid import ulid
 
 
+@pytest.fixture(autouse=True)
+def _repair_home(monkeypatch):
+    # Fixture rows name the account that wrote the legacy store, not this one.
+    monkeypatch.setenv("PENSIVE_REPAIR_HOME", "/home/user")
+
+
 @pytest.fixture
 def store(tmp_path):
     s = openStore(tmp_path / "mem.db")
@@ -47,7 +53,7 @@ def _makeOldDb(tmp_path, rows):
 def test_repairs_ref_and_backfills_project(store, tmp_path):
     aid = _putChunk(store, "chunk body", "kv_cache/vector_meta.db#rowid=7")
     old = _makeOldDb(tmp_path, [
-        (7, "[files] file /home/aegis/Projects/obol/api/rate.go Created rate.go"),
+        (7, "[files] file /home/user/Projects/obol/api/rate.go Created rate.go"),
     ])
     report = repairKvCacheRefs(store, old)
     assert report["rewritten"] == 1
@@ -85,7 +91,7 @@ def test_null_summary_reported_not_crashed(store, tmp_path):
 
 def test_missing_rowid_reported(store, tmp_path):
     _putChunk(store, "body", "kv_cache/vector_meta.db#rowid=999")
-    old = _makeOldDb(tmp_path, [(1, "[files] file /home/aegis/Projects/x/y.go z")])
+    old = _makeOldDb(tmp_path, [(1, "[files] file /home/user/Projects/x/y.go z")])
     report = repairKvCacheRefs(store, old)
     assert report["rowidMissing"] == 1
     assert report["rewritten"] == 0
@@ -95,7 +101,7 @@ def test_existing_project_not_overwritten(store, tmp_path):
     aid = _putChunk(store, "body", "kv_cache/vector_meta.db#rowid=7",
                     project="keep-me")
     old = _makeOldDb(tmp_path, [
-        (7, "[files] file /home/aegis/Projects/obol/api/rate.go Created"),
+        (7, "[files] file /home/user/Projects/obol/api/rate.go Created"),
     ])
     report = repairKvCacheRefs(store, old)
     assert report["rewritten"] == 1
@@ -107,7 +113,7 @@ def test_existing_project_not_overwritten(store, tmp_path):
 def test_idempotent_second_run_is_noop(store, tmp_path):
     _putChunk(store, "body", "kv_cache/vector_meta.db#rowid=7")
     old = _makeOldDb(tmp_path, [
-        (7, "[files] file /home/aegis/Projects/obol/api/rate.go Created"),
+        (7, "[files] file /home/user/Projects/obol/api/rate.go Created"),
     ])
     repairKvCacheRefs(store, old)
     second = repairKvCacheRefs(store, old)
